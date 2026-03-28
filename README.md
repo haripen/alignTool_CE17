@@ -120,9 +120,10 @@ to align any channel from OTB4, C3D, or TSV onto the common time axis.
 
 ## Notes
 
-- The repo includes a vendored copy of `otb_4_file_io.py` under `vendor/` so the review tool can follow OTB4 metadata locally.
-- The vendored `otb_4_file_io.py` is a local derivative. It should not currently be assumed to be drop-in compatible with `hdsemg-pipe`, `hdsemg-shared`, or other downstream tools unless revalidated there.
+- The repo includes a vendored copy of [`otb_4_file_io.py`](https://github.com/johanneskasser/hdsemg-shared/blob/main/src/hdsemg_shared/fileio/file_io.py) by @johanneskasser under `vendor/` so the review tool can follow OTB4 metadata locally.
+- The vendored `otb_4_file_io.py` is a local derivative. It should not currently be assumed to be drop-in compatible with [`hdsemg-pipe`](https://github.com/johanneskasser/hdsemg-pipe), [`hdsemg-shared`](https://github.com/johanneskasser/hdsemg-shared), or other downstream tools unless revalidated there.
 - Review and export logic now assumes:
   - generalized OTB4/C3D sync repair is the default path
   - late-start C3D is a special case, detected from strong TSV/C3D raw agreement plus a large negative raw lag
   - per-device OTB4 gap zones are transferred into both the aligned base `.mat` and `_4pipe.mat`
+- The exported `_4pipe.mat` with companion `_4pipe.json` should be the entry point for use with [`hdsemg-pipe`](https://github.com/johanneskasser/hdsemg-pipe), but this is not yet tested.
