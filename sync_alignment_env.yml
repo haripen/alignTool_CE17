@@ -1,0 +1,11 @@
+name: sync-alignment
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - numpy
+  - pandas
+  - scipy
+  - pyside6
+  - pyqtgraph
+  - ezc3d
