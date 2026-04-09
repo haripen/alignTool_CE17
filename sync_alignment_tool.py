@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import gc
+import html
 import json
 import os
 import re
@@ -14,6 +15,7 @@ import uuid
 import zipfile
 from dataclasses import dataclass
 from datetime import datetime
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -61,6 +63,16 @@ def _parse_timestamp_from_name(path: Path) -> Optional[datetime]:
         return None
     try:
         return datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S")
+    except Exception:
+        return None
+
+
+def _filename_clock_offset_sec(path: Path) -> Optional[float]:
+    ts = _parse_timestamp_from_name(path)
+    if ts is None:
+        return None
+    try:
+        return float(path.stat().st_mtime - ts.timestamp())
     except Exception:
         return None
 
@@ -388,6 +400,45 @@ def _best_edge_alignment_summary(
         "max_abs_ms": None,
         "matched_count": 0,
     }
+
+
+def _repair_application_block_reason(
+    base_summary: Dict[str, Any],
+    selected_row: Dict[str, Any],
+    *,
+    sample_count: int,
+) -> Optional[str]:
+    zones = selected_row.get("zones") or []
+    if not zones:
+        return None
+    base_mean = base_summary.get("mean_abs_ms")
+    base_max = base_summary.get("max_abs_ms")
+    if not isinstance(base_mean, (int, float)) or not isinstance(base_max, (int, float)):
+        return None
+    base_skip_total = int(base_summary.get("otb4_skip") or 0) + int(base_summary.get("c3d_skip") or 0)
+    sel_summary = selected_row.get("summary") or {}
+    selected_skip_total = int(sel_summary.get("otb4_skip") or 0) + int(sel_summary.get("c3d_skip") or 0)
+    base_matched = int(base_summary.get("matched_count") or 0)
+    selected_matched = int(sel_summary.get("matched_count") or 0)
+    samples_added = int(selected_row.get("samples_added") or 0)
+    insertion_limit = max(50, int(max(0, sample_count) * 0.005))
+
+    excellent_base = float(base_mean) <= 3.0 and float(base_max) <= 10.0
+    strong_base = float(base_mean) <= 8.0 and float(base_max) <= 20.0
+
+    reasons: List[str] = []
+    if strong_base and selected_skip_total > base_skip_total:
+        reasons.append(f"base sync is already strong ({base_mean:.3f}/{base_max:.3f} ms) and repair requires more skipped pulses")
+    if strong_base and selected_matched < base_matched:
+        reasons.append(f"base sync is already strong and repair reduces matched spikes ({selected_matched} < {base_matched})")
+    if strong_base and samples_added > insertion_limit:
+        reasons.append(f"base sync is already strong and repair inserts {samples_added} samples (> {insertion_limit})")
+    if excellent_base and samples_added > 0:
+        reasons.append(f"base sync is already excellent ({base_mean:.3f}/{base_max:.3f} ms) so no gap insertion is needed")
+
+    if reasons:
+        return "; ".join(reasons)
+    return None
 
 
 def _repair_info_for_match(match: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -1499,6 +1550,175 @@ def _read_tsv_table(path: Path) -> Tuple[List[str], pd.DataFrame]:
     return cols, df
 
 
+def _tsv_channel_base_name(name: str) -> str:
+    text = str(name).strip()
+    for suffix in ("[raw]", "[offset]", "[sync]"):
+        if text.lower().endswith(suffix.lower()):
+            return text[: -len(suffix)].strip()
+    return text
+
+
+def _find_tsv_raw_offset_pair(columns: Sequence[str]) -> Tuple[Optional[str], Optional[str]]:
+    raw_map = {_tsv_channel_base_name(col).lower(): str(col) for col in columns if str(col).lower().endswith("[raw]")}
+    offset_map = {_tsv_channel_base_name(col).lower(): str(col) for col in columns if str(col).lower().endswith("[offset]")}
+    for key, raw_col in raw_map.items():
+        offset_col = offset_map.get(key)
+        if offset_col:
+            return raw_col, offset_col
+    raw_col = next((str(col) for col in columns if str(col).lower().endswith("[raw]")), None)
+    offset_col = next((str(col) for col in columns if str(col).lower().endswith("[offset]")), None)
+    return raw_col, offset_col
+
+
+def _tsv_numeric_column(df: pd.DataFrame, column: str) -> np.ndarray:
+    if column not in df.columns:
+        return np.asarray([], dtype=float)
+    return pd.to_numeric(df[column], errors="coerce").to_numpy(dtype=float)
+
+
+def _finite_count(values: np.ndarray) -> int:
+    return int(np.sum(np.isfinite(np.asarray(values, dtype=float))))
+
+
+def _fit_tsv_performed_model(desired: np.ndarray, offset: np.ndarray, performed: np.ndarray) -> Optional[Dict[str, Any]]:
+    desired = np.asarray(desired, dtype=float)
+    offset = np.asarray(offset, dtype=float)
+    performed = np.asarray(performed, dtype=float)
+    best: Optional[Dict[str, Any]] = None
+    max_lag = max(0, min(12, len(performed) - 2))
+    for lag in range(max_lag + 1):
+        x_des = desired[:-lag] if lag else desired
+        x_off = offset[:-lag] if lag else offset
+        y = performed[lag:] if lag else performed
+        mask = np.isfinite(x_des) & np.isfinite(x_off) & np.isfinite(y)
+        if int(np.sum(mask)) < 10:
+            continue
+        A = np.column_stack([x_des[mask], x_off[mask], np.ones(int(np.sum(mask)), dtype=float)])
+        coef, *_ = np.linalg.lstsq(A, y[mask], rcond=None)
+        pred = A @ coef
+        rmse = float(np.sqrt(np.mean((y[mask] - pred) ** 2)))
+        cur = {
+            "lag": int(lag),
+            "coef": [float(v) for v in coef],
+            "rmse": rmse,
+            "sample_count": int(np.sum(mask)),
+        }
+        if best is None or rmse < float(best["rmse"]):
+            best = cur
+    return best
+
+
+def _tsv_desired_signature(df: pd.DataFrame) -> Tuple[float, float]:
+    desired = _tsv_numeric_column(df, "desired")
+    desired = desired[np.isfinite(desired)]
+    if desired.size == 0:
+        return 0.0, 0.0
+    return float(np.median(desired)), float(np.max(desired) - np.min(desired))
+
+
+def _nearby_tsv_reference_dirs(path: Path) -> List[Path]:
+    dirs: List[Path] = [path.parent]
+    for ancestor in list(path.parents)[:4]:
+        try:
+            children = list(ancestor.iterdir())
+        except Exception:
+            children = []
+        for child in children:
+            if child.is_dir() and child.name.lower() == "biofeedbackapp":
+                dirs.append(child)
+    ordered: List[Path] = []
+    seen: set[str] = set()
+    for item in dirs:
+        key = str(item.resolve())
+        if key not in seen:
+            seen.add(key)
+            ordered.append(item)
+    return ordered
+
+
+@lru_cache(maxsize=256)
+def _best_tsv_performed_model(path_str: str) -> Optional[Dict[str, Any]]:
+    path = Path(path_str)
+    if not path.exists():
+        return None
+    _cols, target_df = _read_tsv_table(path)
+    raw_col, offset_col = _find_tsv_raw_offset_pair(list(target_df.columns))
+    if offset_col is None:
+        return None
+    target_sig = _tsv_desired_signature(target_df)
+    best: Optional[Dict[str, Any]] = None
+    for ref_dir in _nearby_tsv_reference_dirs(path):
+        for candidate in sorted(ref_dir.glob("*.tsv")):
+            if candidate == path:
+                continue
+            try:
+                _ref_cols, ref_df = _read_tsv_table(candidate)
+            except Exception:
+                continue
+            if "performed" not in ref_df.columns or "desired" not in ref_df.columns:
+                continue
+            cand_raw_col, cand_offset_col = _find_tsv_raw_offset_pair(list(ref_df.columns))
+            if cand_offset_col is None:
+                continue
+            if raw_col and cand_raw_col and _tsv_channel_base_name(cand_raw_col).lower() != _tsv_channel_base_name(raw_col).lower():
+                continue
+            if _tsv_channel_base_name(cand_offset_col).lower() != _tsv_channel_base_name(offset_col).lower():
+                continue
+            performed = _tsv_numeric_column(ref_df, "performed")
+            if _finite_count(performed) < 10:
+                continue
+            model = _fit_tsv_performed_model(
+                _tsv_numeric_column(ref_df, "desired"),
+                _tsv_numeric_column(ref_df, cand_offset_col),
+                performed,
+            )
+            if model is None:
+                continue
+            cand_sig = _tsv_desired_signature(ref_df)
+            similarity = abs(cand_sig[0] - target_sig[0]) + 0.5 * abs(cand_sig[1] - target_sig[1])
+            choice = {
+                **model,
+                "offset_col": offset_col,
+                "similarity": float(similarity),
+                "reference_path": str(candidate),
+            }
+            if best is None:
+                best = choice
+                continue
+            best_key = (float(best["similarity"]), float(best["rmse"]))
+            cur_key = (float(choice["similarity"]), float(choice["rmse"]))
+            if cur_key < best_key:
+                best = choice
+    return best
+
+
+def _synth_tsv_performed_values(path: Path, df: pd.DataFrame) -> Optional[np.ndarray]:
+    model = _best_tsv_performed_model(str(path))
+    if not model:
+        return None
+    offset_col = str(model.get("offset_col") or "")
+    if not offset_col or offset_col not in df.columns or "desired" not in df.columns:
+        return None
+    desired = _tsv_numeric_column(df, "desired")
+    offset = _tsv_numeric_column(df, offset_col)
+    lag = int(model.get("lag") or 0)
+    coef = np.asarray(model.get("coef") or [], dtype=float)
+    if coef.size != 3:
+        return None
+    usable = len(df) - lag if lag else len(df)
+    if usable <= 0:
+        return None
+    out = np.full(len(df), np.nan, dtype=float)
+    A = np.column_stack([desired[:usable], offset[:usable], np.ones(usable, dtype=float)])
+    pred = A @ coef
+    if lag:
+        out[lag:] = pred
+        out[:lag] = float(pred[0])
+    else:
+        out[:] = pred
+    return out
+
+
 def _extract_tsv_record(path: Path) -> SyncRecord:
     cols, df = _read_tsv_table(path)
     ts = _parse_timestamp_from_name(path)
@@ -1791,6 +2011,13 @@ def _apply_otb4_repairs(matches: List[Dict[str, Any]], log_lines: List[str]) -> 
                 }
                 if _summary_key(union_summary) < _summary_key(selected["summary"]):
                     selected = union_row
+        repair_block_reason = _repair_application_block_reason(
+            base_summary,
+            selected,
+            sample_count=int(match["otb4"].get("sample_count") or 0),
+        )
+        if repair_block_reason:
+            selected = option_rows[0]
         shift = float(_match_plot_shifts(match).get("otb4", 0.0))
         repair = {
             "applied": bool(selected["zones"]),
@@ -1817,6 +2044,7 @@ def _apply_otb4_repairs(matches: List[Dict[str, Any]], log_lines: List[str]) -> 
             "selected_matched_count": selected["summary"].get("matched_count"),
             "component_devices": [str(comp.get("device") or "") for comp in selected.get("components") or []],
             "component_subtitles": [str(comp.get("subtitle") or "") for comp in selected.get("components") or []],
+            "block_reason": repair_block_reason,
         }
         match.setdefault("alignment", {})["otb4_repair"] = repair
         if not repair["applied"]:
@@ -1831,6 +2059,11 @@ def _apply_otb4_repairs(matches: List[Dict[str, Any]], log_lines: List[str]) -> 
                 f"with {len(candidates[0].get('zones') or [])} zones and +{repair['samples_added']} samples, but kept mean_abs {candidates[0].get('mean_abs_ms')} ms "
                 f"vs base {base_mean_ms} ms so it was not applied."
             )
+            if repair_block_reason:
+                match["otb4"].setdefault("notes", []).append(f"OTB4 repair blocked: {repair_block_reason}.")
+                log_lines.append(
+                    f"[repair] match {match['match_id']:03d}: blocked repair candidate because {repair_block_reason}."
+                )
             continue
         match["otb4"]["edge_times_sec"] = list(repair["repaired_edge_times_sec"])
         match["otb4"]["edge_count"] = len(match["otb4"]["edge_times_sec"])
@@ -1880,7 +2113,7 @@ def _apply_otb4_repairs(matches: List[Dict[str, Any]], log_lines: List[str]) -> 
         )
 
 
-def _pair_records(left: List[SyncRecord], right: List[SyncRecord], skip_penalty: float = 0.03) -> List[Tuple[SyncRecord, SyncRecord, float]]:
+def _pair_records(left: List[SyncRecord], right: List[SyncRecord], skip_penalty: float = 0.25) -> List[Tuple[SyncRecord, SyncRecord, float]]:
     if not left or not right:
         return []
     n_left = len(left)
@@ -1888,22 +2121,10 @@ def _pair_records(left: List[SyncRecord], right: List[SyncRecord], skip_penalty:
     cost = np.full((n_left, n_right), 1e6, dtype=float)
     for i, a in enumerate(left):
         for j, b in enumerate(right):
-            if not a.intervals_sec or not b.intervals_sec:
+            cur_cost = _pair_cost_value(a.intervals_sec, b.intervals_sec, weak_pair_cost=float(skip_penalty))
+            if cur_cost is None:
                 continue
-            aa = np.asarray(a.intervals_sec, dtype=float)
-            bb = np.asarray(b.intervals_sec, dtype=float)
-            n = min(len(aa), len(bb))
-            if n == 0:
-                continue
-            aa = aa[:n]
-            bb = bb[:n]
-            ma = np.median(aa) if np.median(aa) > 0 else 1.0
-            mb = np.median(bb) if np.median(bb) > 0 else 1.0
-            aa = aa / ma
-            bb = bb / mb
-            base = float(np.sqrt(np.mean((aa - bb) ** 2)))
-            base += 0.01 * abs(len(a.intervals_sec) - len(b.intervals_sec))
-            cost[i, j] = base
+            cost[i, j] = float(cur_cost)
 
     # Preserve acquisition order: files were recorded sequentially, so pairings should not cross in time.
     dp = np.full((n_left + 1, n_right + 1), np.inf, dtype=float)
@@ -1976,6 +2197,47 @@ def _iter_source_files(folder: Path, suffix: str, excluded_dir_names: Optional[S
     return results
 
 
+def _pair_cost_value(
+    left_intervals: Sequence[float],
+    right_intervals: Sequence[float],
+    *,
+    weak_pair_cost: float = 0.25,
+) -> Optional[float]:
+    if not left_intervals or not right_intervals:
+        if not left_intervals and not right_intervals:
+            return float(weak_pair_cost)
+        return None
+    aa = np.asarray(left_intervals, dtype=float)
+    bb = np.asarray(right_intervals, dtype=float)
+    n = min(len(aa), len(bb))
+    if n == 0:
+        return None
+    aa = aa[:n]
+    bb = bb[:n]
+    ma = np.median(aa) if np.median(aa) > 0 else 1.0
+    mb = np.median(bb) if np.median(bb) > 0 else 1.0
+    aa = aa / ma
+    bb = bb / mb
+    base = float(np.sqrt(np.mean((aa - bb) ** 2)))
+    base += 0.01 * abs(len(left_intervals) - len(right_intervals))
+    return base
+
+
+def _infer_root_filename_clock_offset_sec(folder: Path) -> Optional[float]:
+    samples: List[float] = []
+    for suffix in (".tsv", ".otb4"):
+        for path in _iter_source_files(folder, suffix, excluded_dir_names=("matched", "accepted", "__pycache__", ".git")):
+            delta = _filename_clock_offset_sec(path)
+            if delta is None:
+                continue
+            # Keep only plausible timezone-like offsets and ignore small write delays.
+            if abs(delta) <= 18.0 * 3600.0:
+                samples.append(float(delta))
+    if not samples:
+        return None
+    return float(np.median(np.asarray(samples, dtype=float)))
+
+
 def _auto_accept_match(match: Dict[str, Any]) -> bool:
     alignment = match.get("alignment") or {}
     raw_quality = alignment.get("raw_alignment_quality")
@@ -2023,14 +2285,20 @@ def _apply_review_defaults(match: Dict[str, Any]) -> None:
     match["accepted"] = review["final_accept"]
 
 
-def _match_tsv_records(matches: List[Dict[str, Any]], tsv_records: List[SyncRecord], log_lines: List[str]) -> List[Dict[str, Any]]:
+def _match_tsv_records(
+    matches: List[Dict[str, Any]],
+    tsv_records: List[SyncRecord],
+    log_lines: List[str],
+    *,
+    filename_clock_offset_sec: float = 0.0,
+) -> List[Dict[str, Any]]:
     candidates: List[SyncRecord] = [
         rec
         for rec in tsv_records
         if rec.first_ts is not None
         and rec.last_ts is not None
         and rec.duration_sec is not None
-        and rec.duration_sec >= 55.0
+        and rec.duration_sec >= 5.0
         and (rec.sync_present or any(str(c).lower().endswith("[raw]") for c in (rec.channel_names or [])))
     ]
     used: set[str] = set()
@@ -2041,18 +2309,21 @@ def _match_tsv_records(matches: List[Dict[str, Any]], tsv_records: List[SyncReco
         otb_dt = _parse_record_dt(match["otb4"].get("timestamp"))
         if otb_dt is None:
             continue
-        otb_end = otb_dt.timestamp()
+        otb_end = otb_dt.timestamp() + float(filename_clock_offset_sec or 0.0)
         otb_duration = float(match["otb4"].get("sample_count", 0) or 0.0) / float(match["otb4"].get("sample_rate") or 1.0)
         otb_start = otb_end - otb_duration
-        pair_span = float(
-            max(match["otb4"]["edge_times_sec"][-1], match["c3d"]["edge_times_sec"][-1])
-            - min(match["otb4"]["edge_times_sec"][0], match["c3d"]["edge_times_sec"][0])
-        )
+        c3d_duration = float(match["c3d"].get("sample_count", 0) or 0.0) / float(match["c3d"].get("sample_rate") or 1.0)
+        otb_edges = list(match["otb4"].get("edge_times_sec") or [])
+        c3d_edges = list(match["c3d"].get("edge_times_sec") or [])
+        if otb_edges and c3d_edges:
+            pair_span = float(max(otb_edges[-1], c3d_edges[-1]) - min(otb_edges[0], c3d_edges[0]))
+        else:
+            pair_span = float(max(otb_duration, c3d_duration))
         template_ref = []
-        n_ref = min(len(match["otb4"]["edge_times_sec"]), len(match["c3d"]["edge_times_sec"]))
+        n_ref = min(len(otb_edges), len(c3d_edges))
         if n_ref >= 2:
-            otb_rel = np.asarray(match["otb4"]["edge_times_sec"][:n_ref], dtype=float)
-            c3d_rel = np.asarray(match["c3d"]["edge_times_sec"][:n_ref], dtype=float)
+            otb_rel = np.asarray(otb_edges[:n_ref], dtype=float)
+            c3d_rel = np.asarray(c3d_edges[:n_ref], dtype=float)
             template_ref = (((otb_rel - otb_rel[0]) + (c3d_rel - c3d_rel[0])) / 2.0).tolist()
 
         best: Optional[Tuple[float, SyncRecord, float, Dict[str, Any], Dict[str, Any], Dict[str, Any]]] = None
@@ -2065,10 +2336,10 @@ def _match_tsv_records(matches: List[Dict[str, Any]], tsv_records: List[SyncReco
             name_dt = _parse_record_dt(rec.timestamp)
             if last_ts is None:
                 continue
-            name_ts = name_dt.timestamp() if name_dt is not None else None
+            name_ts = (name_dt.timestamp() + float(filename_clock_offset_sec or 0.0)) if name_dt is not None else None
             if name_ts is not None and abs(name_ts - otb_start) > 180.0 and abs(last_ts - otb_end) > 180.0:
                 continue
-            end_anchor = name_dt.timestamp() if name_dt is not None else otb_end
+            end_anchor = name_ts if name_ts is not None else otb_end
             start_anchor = end_anchor - (rec.duration_sec or 0.0)
             start_delta = abs((first_ts if first_ts is not None else start_anchor) - otb_start)
             end_delta = abs(last_ts - otb_end)
@@ -2244,10 +2515,224 @@ def _match_tsv_records(matches: List[Dict[str, Any]], tsv_records: List[SyncReco
     return matched_tsv
 
 
+def _build_pair_match_from_records(
+    otb4_record: Dict[str, Any],
+    c3d_record: Dict[str, Any],
+    *,
+    match_id: int,
+) -> Dict[str, Any]:
+    pair_cost = _pair_cost_value(
+        otb4_record.get("intervals_sec") or [],
+        c3d_record.get("intervals_sec") or [],
+        weak_pair_cost=0.25,
+    )
+    if pair_cost is None:
+        pair_cost = 1.0
+    certainty = _summarize_pair_cost(float(pair_cost))
+    otb_edges = list(otb4_record.get("edge_times_sec") or [])
+    c3d_edges = list(c3d_record.get("edge_times_sec") or [])
+    overlap_start = 0.0
+    overlap_end = 0.0
+    if otb_edges and c3d_edges:
+        overlap_start = max(float(otb_edges[0]), float(c3d_edges[0]))
+        overlap_end = min(float(otb_edges[-1]), float(c3d_edges[-1]))
+    alignment = {
+        "sync_channel": "shared TTL",
+        "overlap_start_sec": overlap_start,
+        "overlap_end_sec": overlap_end,
+    }
+    triplet = _triplet_spike_agreement([otb4_record, c3d_record])
+    alignment["sync_triplet_quality"] = triplet["quality"]
+    alignment["sync_triplet_spike_mean_abs_ms"] = triplet["mean_abs_delta_ms"]
+    alignment["sync_triplet_spike_max_abs_ms"] = triplet["max_abs_delta_ms"]
+    alignment["sync_triplet_spike_count"] = triplet["spike_count"]
+    alignment["sync_triplet_pairwise"] = triplet["pairwise"]
+    return {
+        "match_id": int(match_id),
+        "certainty": certainty,
+        "pair_cost": float(pair_cost),
+        "otb4": dict(otb4_record),
+        "c3d": dict(c3d_record),
+        "tsv": None,
+        "alignment": alignment,
+    }
+
+
+def _evaluate_manual_tsv_selection(
+    match: Dict[str, Any],
+    tsv_record: Dict[str, Any],
+    *,
+    filename_clock_offset_sec: float,
+) -> Optional[Dict[str, Any]]:
+    otb_dt = _parse_record_dt((match.get("otb4") or {}).get("timestamp"))
+    if otb_dt is None:
+        return None
+    otb_end = otb_dt.timestamp() + float(filename_clock_offset_sec or 0.0)
+    otb_duration = float((match.get("otb4") or {}).get("sample_count", 0) or 0.0) / float((match.get("otb4") or {}).get("sample_rate") or 1.0)
+    otb_start = otb_end - otb_duration
+    c3d_duration = float((match.get("c3d") or {}).get("sample_count", 0) or 0.0) / float((match.get("c3d") or {}).get("sample_rate") or 1.0)
+    otb_edges = list((match.get("otb4") or {}).get("edge_times_sec") or [])
+    c3d_edges = list((match.get("c3d") or {}).get("edge_times_sec") or [])
+    if otb_edges and c3d_edges:
+        pair_span = float(max(otb_edges[-1], c3d_edges[-1]) - min(otb_edges[0], c3d_edges[0]))
+    else:
+        pair_span = float(max(otb_duration, c3d_duration))
+    template_ref: List[float] = []
+    n_ref = min(len(otb_edges), len(c3d_edges))
+    if n_ref >= 2:
+        otb_rel = np.asarray(otb_edges[:n_ref], dtype=float)
+        c3d_rel = np.asarray(c3d_edges[:n_ref], dtype=float)
+        template_ref = (((otb_rel - otb_rel[0]) + (c3d_rel - c3d_rel[0])) / 2.0).tolist()
+
+    rec_json = dict(tsv_record)
+    last_ts = rec_json.get("last_ts")
+    first_ts = rec_json.get("first_ts")
+    duration_sec = rec_json.get("duration_sec")
+    if last_ts is None or duration_sec is None:
+        return None
+    name_dt = _parse_record_dt(rec_json.get("timestamp"))
+    name_ts = (name_dt.timestamp() + float(filename_clock_offset_sec or 0.0)) if name_dt is not None else None
+    end_anchor = name_ts if name_ts is not None else otb_end
+    start_anchor = end_anchor - float(duration_sec or 0.0)
+    start_delta = abs((float(first_ts) if first_ts is not None else start_anchor) - otb_start)
+    end_delta = abs(float(last_ts) - otb_end)
+    filename_delta = abs(end_anchor - otb_start) if name_dt is not None else 0.0
+    duration_penalty = 0.1 * abs(float(duration_sec or 0.0) - pair_span)
+
+    raw_result = _best_tsv_raw_alignment(rec_json, match["c3d"])
+    raw_corr = raw_result.get("corr")
+
+    if rec_json.get("sync_present") and rec_json.get("sync_channel") and template_ref:
+        try:
+            _cols, df = _read_tsv_table(Path(rec_json["path"]))
+            x = pd.to_numeric(df[rec_json["sync_channel"]], errors="coerce").to_numpy(dtype=float)
+            t_rel = pd.to_numeric(df["t_rel"], errors="coerce").to_numpy(dtype=float)
+            refined_peaks = _detect_tsv_spikes_with_template(x, t_rel, np.diff(template_ref))
+            if len(refined_peaks) >= 2:
+                rec_json["edge_times_sec"] = [float(v) for v in refined_peaks]
+                rec_json["edge_count"] = len(refined_peaks)
+                rec_json["intervals_sec"] = [float(v) for v in np.diff(refined_peaks).tolist()]
+        except Exception:
+            pass
+
+    temp_match = {
+        **match,
+        "tsv": rec_json,
+        "alignment": {
+            **(match.get("alignment") or {}),
+            "raw_alignment_lag_sec": raw_result.get("lag_sec"),
+            "raw_alignment_corr": raw_result.get("corr"),
+            "raw_alignment_quality": raw_result.get("quality"),
+        },
+    }
+    edge_align = _select_otb4_c3d_edge_alignment(temp_match)
+    temp_match["alignment"]["sync_edge_skips"] = {
+        "otb4": int(edge_align.get("otb4_skip") or 0),
+        "c3d": int(edge_align.get("c3d_skip") or 0),
+        "tsv": 0,
+    }
+    temp_match["alignment"]["otb4_c3d_edge_alignment"] = edge_align
+    temp_match["alignment"]["raw_alignment_quality"] = _effective_raw_quality(raw_result, edge_align)
+    dedicated = _dedicated_sync_agreement(temp_match)
+    corr_mag = abs(float(raw_corr)) if isinstance(raw_corr, (int, float)) else 0.0
+    raw_penalty = (1.0 - corr_mag) * 40.0 + 0.15 * abs(float(raw_result.get("lag_sec") or 0.0))
+    sync_penalty = 0.5
+    if rec_json.get("sync_present") and rec_json.get("sync_channel"):
+        mean_abs = dedicated.get("mean_abs_delta_ms")
+        if mean_abs is None:
+            sync_penalty = 1.5
+        else:
+            sync_penalty = min(float(mean_abs) / 200.0, 3.0)
+    score = start_delta + end_delta + duration_penalty + 0.01 * filename_delta + raw_penalty + sync_penalty
+    return {
+        "rec_json": rec_json,
+        "raw_result": raw_result,
+        "dedicated": dedicated,
+        "score": float(score),
+        "filename_delta": float(filename_delta),
+        "otb_end": float(otb_end),
+        "otb_start": float(otb_start),
+        "start_delta": float(start_delta),
+        "end_delta": float(end_delta),
+    }
+
+
+def _apply_manual_tsv_selection(
+    match: Dict[str, Any],
+    tsv_record: Dict[str, Any],
+    *,
+    filename_clock_offset_sec: float,
+) -> bool:
+    evaluated = _evaluate_manual_tsv_selection(match, tsv_record, filename_clock_offset_sec=filename_clock_offset_sec)
+    if evaluated is None:
+        return False
+    rec_json = evaluated["rec_json"]
+    raw_result = evaluated["raw_result"]
+    dedicated = evaluated["dedicated"]
+    score = evaluated["score"]
+    filename_delta = evaluated["filename_delta"]
+    otb_end = evaluated["otb_end"]
+    otb_start = evaluated["otb_start"]
+    rec_last_ts = rec_json.get("last_ts")
+    rec_first_ts = rec_json.get("first_ts")
+    match["tsv"] = rec_json
+    alignment = match.setdefault("alignment", {})
+    alignment["manual_selection"] = True
+    alignment["tsv_match_status"] = "manual"
+    alignment["tsv_skip_reason"] = "Manual TSV/OTB4 selection pending user review."
+    alignment["tsv_start_ts"] = rec_first_ts
+    alignment["tsv_end_ts"] = rec_last_ts
+    alignment["tsv_duration_sec"] = rec_json.get("duration_sec")
+    alignment["tsv_end_minus_otb_sec"] = round(float(rec_last_ts) - otb_end, 6) if rec_last_ts is not None else None
+    alignment["tsv_start_minus_otb_start_sec"] = round(float(rec_first_ts) - otb_start, 6) if rec_first_ts is not None else None
+    alignment["tsv_score"] = round(float(score), 6)
+    alignment["tsv_alignment_basis"] = "manual_selection"
+    alignment["raw_alignment_corr"] = raw_result.get("corr")
+    alignment["raw_alignment_lag_sec"] = raw_result.get("lag_sec")
+    alignment["raw_alignment_samples"] = raw_result.get("samples")
+    alignment["raw_label_match_tsv"] = raw_result.get("tsv_channel")
+    alignment["raw_label_match_c3d"] = raw_result.get("c3d_channel")
+    alignment["raw_label_match_c3d_kind"] = raw_result.get("c3d_kind")
+    alignment["raw_label_based"] = raw_result.get("label_matched")
+    final_edge_align = _select_otb4_c3d_edge_alignment(match)
+    alignment["sync_edge_skips"] = {
+        "otb4": int(final_edge_align.get("otb4_skip") or 0),
+        "c3d": int(final_edge_align.get("c3d_skip") or 0),
+        "tsv": 0,
+    }
+    alignment["otb4_c3d_edge_alignment"] = final_edge_align
+    alignment["raw_alignment_quality"] = _effective_raw_quality(raw_result, final_edge_align)
+    dedicated = _dedicated_sync_agreement(match)
+    alignment["dedicated_sync_quality"] = dedicated.get("quality")
+    alignment["dedicated_sync_pair_quality"] = dedicated.get("pair_quality")
+    alignment["dedicated_sync_mean_abs_ms"] = dedicated.get("mean_abs_delta_ms")
+    alignment["dedicated_sync_max_abs_ms"] = dedicated.get("max_abs_delta_ms")
+    alignment["dedicated_sync_spike_count"] = dedicated.get("spike_count")
+    alignment["dedicated_sync_pairwise"] = dedicated.get("pairwise")
+    alignment["plot_time_shifts_sec"] = _match_plot_shifts(match)
+    alignment["inner_merge"] = _build_inner_merge_alignment(match)
+    alignment["sync_triplet_quality"] = alignment["dedicated_sync_quality"]
+    alignment["sync_triplet_spike_mean_abs_ms"] = alignment["dedicated_sync_mean_abs_ms"]
+    alignment["sync_triplet_spike_max_abs_ms"] = alignment["dedicated_sync_max_abs_ms"]
+    alignment["sync_triplet_spike_count"] = alignment["dedicated_sync_spike_count"]
+    alignment["sync_triplet_pairwise"] = alignment["dedicated_sync_pairwise"]
+    alignment["sync_triplet_waveform_quality"] = alignment["raw_alignment_quality"]
+    alignment["sync_triplet_raw_corr_c3d_tsv"] = raw_result.get("corr")
+    alignment["sync_triplet_waveform_pairwise"] = {
+        "c3d_vs_tsv_raw": {"corr": raw_result.get("corr"), "lag_sec": raw_result.get("lag_sec")}
+    }
+    return True
+
+
 def analyze_folder(folder: Path) -> Dict[str, Any]:
     folder = folder.resolve()
     log_lines: List[str] = []
     log_lines.append(f"[{_now_iso()}] Scan start: {folder}")
+    filename_clock_offset_sec = _infer_root_filename_clock_offset_sec(folder) or 0.0
+    log_lines.append(
+        f"[timing] filename clock offset={filename_clock_offset_sec:.3f}s ({filename_clock_offset_sec / 3600.0:.6f}h) "
+        f"derived from file modification times."
+    )
 
     otb4_records: List[SyncRecord] = []
     c3d_records: List[SyncRecord] = []
@@ -2287,7 +2772,7 @@ def analyze_folder(folder: Path) -> Dict[str, Any]:
     otb4_to_c3d = _pair_records(otb4_records, c3d_records)
     otb4_to_c3d.sort(key=lambda t: t[0].path)
 
-    certain_matches: List[Dict[str, Any]] = []
+    pair_matches: List[Dict[str, Any]] = []
     pair_id = 1
     for otb, c3d, cost in otb4_to_c3d:
         certainty = _summarize_pair_cost(cost)
@@ -2313,30 +2798,34 @@ def analyze_folder(folder: Path) -> Dict[str, Any]:
             f"cost={cost:.6f} certainty={certainty} spikes={triplet['quality']} "
             f"mean_abs={triplet['mean_abs_delta_ms']}ms max_abs={triplet['max_abs_delta_ms']}ms"
         )
-        if certainty != "uncertain":
-            certain_matches.append(
-                {
-                    "match_id": pair_id,
-                    "certainty": certainty,
-                    "pair_cost": cost,
-                    "otb4": otb.to_json(),
-                    "c3d": c3d.to_json(),
-                    "tsv": None,
-                    "alignment": alignment,
-                }
-            )
-        else:
-            unmatched.append({"kind": "otb4_c3d_pair", "otb4": otb.path, "c3d": c3d.path, "cost": cost})
+        pair_matches.append(
+            {
+                "match_id": pair_id,
+                "certainty": certainty,
+                "pair_cost": cost,
+                "otb4": otb.to_json(),
+                "c3d": c3d.to_json(),
+                "tsv": None,
+                "alignment": alignment,
+            }
+        )
         pair_id += 1
 
-    _apply_otb4_repairs(certain_matches, log_lines)
-    matched_tsv = _match_tsv_records(certain_matches, tsv_records, log_lines)
-    certain_matches.sort(key=_c3d_review_sort_key)
-    for idx, match in enumerate(certain_matches, start=1):
+    _apply_otb4_repairs(pair_matches, log_lines)
+    matched_tsv = _match_tsv_records(
+        pair_matches,
+        tsv_records,
+        log_lines,
+        filename_clock_offset_sec=filename_clock_offset_sec,
+    )
+    pair_matches.sort(key=_c3d_review_sort_key)
+    for idx, match in enumerate(pair_matches, start=1):
         match["match_id"] = idx
         _apply_review_defaults(match)
-    certain_triplets = [match for match in certain_matches if match.get("tsv")]
-    pair_only_matches = [match for match in certain_matches if not match.get("tsv")]
+    certain_triplets = [match for match in pair_matches if match.get("tsv")]
+    pair_only_matches = [match for match in pair_matches if not match.get("tsv")]
+    used_otb_paths = {str((match.get("otb4") or {}).get("path") or "") for match in pair_matches}
+    used_c3d_paths = {str((match.get("c3d") or {}).get("path") or "") for match in pair_matches}
     startup_messages: List[str] = []
     if pair_only_matches:
         startup_messages.append(
@@ -2360,10 +2849,12 @@ def analyze_folder(folder: Path) -> Dict[str, Any]:
         "otb4_count": len(otb4_records),
         "c3d_count": len(c3d_records),
         "tsv_count": len(tsv_records),
-        "certain_pair_count": len(certain_matches),
+        "pair_count": len(pair_matches),
+        "certain_pair_count": sum(1 for match in pair_matches if match.get("certainty") == "certain"),
         "certain_tsv_count": len(matched_tsv),
         "certain_triplet_count": len(certain_triplets),
         "auto_accept_count": sum(1 for match in certain_triplets if (match.get("review") or {}).get("auto_accept")),
+        "filename_clock_offset_sec": round(float(filename_clock_offset_sec), 6),
     }
     log_lines.append(f"[summary] {json.dumps(summary, ensure_ascii=False)}")
     log_lines.append(f"[{_now_iso()}] Scan complete.")
@@ -2371,12 +2862,20 @@ def analyze_folder(folder: Path) -> Dict[str, Any]:
         "source_root": str(folder),
         "created_at": _now_iso(),
         "summary": summary,
-        "matches": certain_matches,
+        "matches": pair_matches,
         "triplet_matches": certain_triplets,
         "pair_only_matches": pair_only_matches,
         "tsv_candidates": matched_tsv,
         "unmatched": unmatched,
         "startup_messages": startup_messages,
+        "filename_clock_offset_sec": round(float(filename_clock_offset_sec), 6),
+        "source_records": {
+            "otb4": [rec.to_json() for rec in otb4_records],
+            "c3d": [rec.to_json() for rec in c3d_records],
+            "tsv": [rec.to_json() for rec in tsv_records],
+        },
+        "unmatched_c3d_records": [rec.to_json() for rec in c3d_records if str(rec.path) not in used_c3d_paths],
+        "unmatched_otb4_records": [rec.to_json() for rec in otb4_records if str(rec.path) not in used_otb_paths],
     }
     return {"mapping": mapping, "log_lines": log_lines}
 
@@ -2662,6 +3161,9 @@ def export_results(source_folder: Path, export_dir: Path, mapping: Dict[str, Any
         "tsv_candidates": mapping.get("tsv_candidates", []),
         "unmatched": mapping.get("unmatched", []),
         "startup_messages": list(mapping.get("startup_messages", [])),
+        "source_records": mapping.get("source_records", {}),
+        "unmatched_c3d_records": mapping.get("unmatched_c3d_records", []),
+        "unmatched_otb4_records": mapping.get("unmatched_otb4_records", []),
     }
 
     for match in mapping["matches"]:
@@ -2674,6 +3176,8 @@ def export_results(source_folder: Path, export_dir: Path, mapping: Dict[str, Any
         else:
             safe_mapping["pair_only_matches"].append(out_match)
 
+    _ensure_unique_source_assignments(safe_mapping["matches"])
+    _refresh_mapping_summary(safe_mapping)
     safe_mapping["saved_at"] = saved_stamp
     safe_mapping["export_root"] = str(export_dir)
     _write_repair_jsons(export_dir, safe_mapping)
@@ -2691,7 +3195,9 @@ def run_scan(folder: Path, export_dir: Optional[Path] = None) -> Tuple[Path, Pat
 # ---------------- Viewer ----------------
 def _load_mapping(mapping_path: Path) -> Dict[str, Any]:
     with open(mapping_path, "r", encoding="utf-8") as f:
-        return json.load(f)
+        mapping = json.load(f)
+    mapping["export_root"] = str(mapping_path.parent.resolve())
+    return mapping
 
 
 def _load_otb4_channel(path: Path, channel_name: str, repair_zones: Optional[Sequence[Tuple[int, int]]] = None) -> Tuple[np.ndarray, np.ndarray]:
@@ -2766,7 +3272,19 @@ def _load_c3d_point_channel(path: Path, channel_name: str) -> Tuple[np.ndarray, 
 
 def _load_tsv_channel(path: Path, channel_name: str) -> Tuple[np.ndarray, np.ndarray]:
     df = pd.read_csv(path, sep="\t", decimal=",", encoding="utf-8-sig")
-    x = pd.to_numeric(df[channel_name], errors="coerce").to_numpy(dtype=float)
+    if channel_name in df.columns:
+        x = pd.to_numeric(df[channel_name], errors="coerce").to_numpy(dtype=float)
+    elif channel_name.strip().lower() == "performed":
+        synth = _synth_tsv_performed_values(path, df)
+        if synth is None:
+            raise KeyError(f"Missing TSV channel: {channel_name}")
+        x = np.asarray(synth, dtype=float)
+    else:
+        raise KeyError(f"Missing TSV channel: {channel_name}")
+    if channel_name.strip().lower() == "performed" and not np.any(np.isfinite(x)):
+        synth = _synth_tsv_performed_values(path, df)
+        if synth is not None and np.any(np.isfinite(synth)):
+            x = np.asarray(synth, dtype=float)
     med = np.nanmedian(x) if np.any(np.isfinite(x)) else 0.0
     x = np.nan_to_num(x, nan=med)
     if "t_rel" in df.columns:
@@ -3276,6 +3794,10 @@ def _resample_to_target_time(target_t: np.ndarray, source_t: np.ndarray, source_
 def _preferred_tsv_path_columns(record: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
     names = record.get("channel_names") or []
     performed = next((c for c in names if c.strip().lower() == "performed"), None)
+    if performed is None:
+        raw_col, offset_col = _find_tsv_raw_offset_pair([str(c) for c in names])
+        if raw_col and offset_col:
+            performed = "performed"
     original = next((c for c in names if c.strip().lower() == "desired"), None)
     return performed, original
 
@@ -3562,6 +4084,24 @@ def _series_color(spec: Dict[str, Any]) -> str:
     return {"otb4": "#00A6D6", "c3d": "#7F7F7F", "tsv": "#8E7DBE"}.get(spec["source"], "#444444")
 
 
+def _overlay_series_color(spec: Dict[str, Any], idx: int, total: int) -> str:
+    if total <= 1:
+        return _series_color(spec)
+    palette = [
+        "#0B84A5",
+        "#F28E2B",
+        "#59A14F",
+        "#E15759",
+        "#4E79A7",
+        "#EDC948",
+        "#B07AA1",
+        "#76B7B2",
+        "#FF9DA7",
+        "#9C755F",
+    ]
+    return palette[idx % len(palette)]
+
+
 def _raw_overlay_summary(match: Dict[str, Any]) -> str:
     alignment = match.get("alignment") or {}
     raw_tsv = alignment.get("raw_label_match_tsv") or "missing"
@@ -3630,6 +4170,92 @@ def _raw_status_text(match: Dict[str, Any]) -> str:
     if isinstance(corr, (int, float)):
         return f"Raw overlay {alignment.get('raw_alignment_quality')} | corr {corr:.6f} | lag {alignment.get('raw_alignment_lag_sec'):.3f}s | plotted [0,1]"
     return "Raw overlay unavailable."
+
+
+def _match_files_line(match: Dict[str, Any]) -> str:
+    return (
+        "Merged files: "
+        f"OTB4={Path(str((match.get('otb4') or {}).get('path') or '')).name or 'missing'} | "
+        f"C3D={Path(str((match.get('c3d') or {}).get('path') or '')).name or 'missing'} | "
+        f"TSV={Path(str((match.get('tsv') or {}).get('path') or '')).name if match.get('tsv') else 'missing'}"
+    )
+
+
+def _pairwise_sync_metric_text(dedicated: Dict[str, Any], plotted_sources: Sequence[str]) -> str:
+    pairwise = dedicated.get("pairwise") or {}
+    labels: List[str] = []
+    for idx, left in enumerate(plotted_sources):
+        for right in plotted_sources[idx + 1:]:
+            info = pairwise.get(f"{left}_vs_{right}") or pairwise.get(f"{right}_vs_{left}") or {}
+            if not info:
+                continue
+            labels.append(
+                f"{left.upper()}/{right.upper()} {int(info.get('matched_spikes_50ms') or 0)}/{int(info.get('count') or 0)}<=50ms"
+            )
+    return " | ".join(labels)
+
+
+def _plot_source_files_text(match: Dict[str, Any], row_role: str, series_specs: Sequence[Dict[str, Any]]) -> str:
+    if row_role == "sync":
+        source_order = [source for source in ("otb4", "c3d", "tsv") if match.get(source) and any(spec.get("source") == source for spec in series_specs)]
+    elif row_role == "raw":
+        source_order = [source for source in ("c3d", "tsv") if match.get(source) and any(spec.get("source") == source for spec in series_specs)]
+    else:
+        source_order = []
+        for spec in series_specs:
+            source = str(spec.get("source") or "")
+            if source in {"otb4", "c3d", "tsv"} and source not in source_order and match.get(source):
+                source_order.append(source)
+    if not source_order:
+        return "Files in this plot: none"
+    parts = [f"{source.upper()}={Path(str((match.get(source) or {}).get('path') or '')).name}" for source in source_order]
+    return "Files in this plot: " + " | ".join(parts)
+
+
+def _sync_plot_metric_text(match: Dict[str, Any], series_specs: Sequence[Dict[str, Any]]) -> str:
+    dedicated = _dedicated_sync_agreement(match)
+    plotted_sources = [str(spec.get("source") or "") for spec in series_specs if spec.get("kind") == "sync"]
+    plotted_sources = [source for idx, source in enumerate(plotted_sources) if source and source not in plotted_sources[:idx]]
+    parts = [f"Sync evidence: {dedicated.get('quality') or 'missing'}"]
+    mean_abs = dedicated.get("mean_abs_delta_ms")
+    max_abs = dedicated.get("max_abs_delta_ms")
+    spike_count = dedicated.get("spike_count")
+    if isinstance(mean_abs, (int, float)):
+        parts.append(f"mean={float(mean_abs):.3f} ms")
+    if isinstance(max_abs, (int, float)):
+        parts.append(f"max={float(max_abs):.3f} ms")
+    if isinstance(spike_count, (int, float)):
+        parts.append(f"n={int(spike_count)}")
+    pair_text = _pairwise_sync_metric_text(dedicated, plotted_sources)
+    if pair_text:
+        parts.append(pair_text)
+    return " | ".join(parts)
+
+
+def _raw_plot_metric_text(match: Dict[str, Any]) -> str:
+    alignment = match.get("alignment") or {}
+    corr = alignment.get("raw_alignment_corr")
+    lag_sec = alignment.get("raw_alignment_lag_sec")
+    quality = alignment.get("raw_alignment_quality") or "missing"
+    if not isinstance(corr, (int, float)) or not isinstance(lag_sec, (int, float)):
+        return "Raw evidence: unavailable"
+    return (
+        "Raw evidence: "
+        f"{quality} | corr={float(corr):.6f} | lag={float(lag_sec):.3f}s | "
+        f"C3D={alignment.get('raw_label_match_c3d') or 'missing'} | TSV={alignment.get('raw_label_match_tsv') or 'missing'}"
+    )
+
+
+def _plot_decision_context_text(match: Dict[str, Any], row_role: str, series_specs: Sequence[Dict[str, Any]]) -> str:
+    kinds = {str(spec.get("kind") or "") for spec in series_specs}
+    lines: List[str] = []
+    if row_role == "sync" or "sync" in kinds:
+        lines.append(_sync_plot_metric_text(match, series_specs))
+    if row_role == "raw" or "raw" in kinds:
+        lines.append(_raw_plot_metric_text(match))
+    if not lines:
+        lines.append("Decision evidence: this row is contextual only; sync/raw overlays carry the acceptance metrics.")
+    return "\n".join(lines)
 
 
 def _repair_gap_regions(match: Dict[str, Any]) -> List[Tuple[float, float]]:
@@ -3736,6 +4362,10 @@ def _decision_reason_text(match: Dict[str, Any]) -> str:
     lines.append(f"Automatic suggestion: {_review_status_label(match)}")
     lines.append(f"Decision source: {review.get('decision_source') or 'automatic'}")
     lines.append(f"Triplet certainty: {match.get('certainty')}")
+    if match.get("manual_selection") or alignment.get("manual_selection"):
+        lines.append("Manual assembly: this candidate was created by user-selected C3D/OTB4/TSV sources and should be confirmed visually.")
+    if alignment.get("manual_reassignment"):
+        lines.append(f"Manual reassignment: {alignment.get('manual_reassignment_note') or 'A source file was reassigned and this candidate now needs confirmation.'}")
 
     if isinstance(raw_corr, (int, float)) and isinstance(raw_lag, (int, float)):
         lines.append(
@@ -3805,6 +4435,29 @@ def _decision_reason_text(match: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _decision_reason_rich_text(match: Dict[str, Any]) -> str:
+    green = "#1F5E2E"
+    red = "#7A1F1F"
+    parts: List[str] = []
+    for line in _decision_reason_text(match).splitlines():
+        escaped = html.escape(line)
+        color: Optional[str] = None
+        if line.startswith("Automatic suggestion:"):
+            if "ACCEPT" in line:
+                color = green
+            elif "REJECT" in line:
+                color = red
+        elif line.startswith("Why accepted:"):
+            color = green
+        elif line.startswith("Why rejected:"):
+            color = red
+        if color:
+            parts.append(f'<span style="color: {color}; font-weight: 700;">{escaped}</span>')
+        else:
+            parts.append(escaped)
+    return "<br>".join(parts)
+
+
 def _review_status_color_from_review(review: Dict[str, Any]) -> str:
     return {
         "auto_accept": AUTO_ACCEPT_COLOR,
@@ -3834,7 +4487,12 @@ def _review_item_text(match: Dict[str, Any]) -> str:
     status = _review_status_label(match)
     quality = (match.get("alignment") or {}).get("dedicated_sync_quality")
     raw_q = (match.get("alignment") or {}).get("raw_alignment_quality")
-    text = f"{match['match_id']:03d} | {status} | sync={quality} | raw={raw_q} | {Path(match['otb4']['path']).name}"
+    manual = " | MANUAL" if (
+        match.get("manual_selection")
+        or ((match.get("alignment") or {}).get("manual_selection"))
+        or ((match.get("alignment") or {}).get("manual_reassignment"))
+    ) else ""
+    text = f"{match['match_id']:03d} | {status}{manual} | sync={quality} | raw={raw_q} | {Path(match['otb4']['path']).name}"
     if match.get("tsv"):
         text += f" | {Path(match['tsv']['path']).name}"
     else:
@@ -3860,6 +4518,74 @@ def _review_progress(mapping: Dict[str, Any]) -> Tuple[int, int]:
     return reviewed, len(matches)
 
 
+def _refresh_mapping_summary(mapping: Dict[str, Any]) -> None:
+    matches = mapping.get("matches", []) or []
+    summary = mapping.setdefault("summary", {})
+    summary["pair_count"] = len(matches)
+    summary["certain_pair_count"] = sum(1 for match in matches if match.get("certainty") == "certain")
+    summary["certain_triplet_count"] = sum(1 for match in matches if match.get("tsv"))
+    summary["final_accept_count"] = sum(1 for match in matches if (match.get("review") or {}).get("final_accept"))
+    source_records = mapping.get("source_records", {}) or {}
+    used_paths = {
+        key: {
+            _match_source_path(match, key)
+            for match in matches
+            if _match_source_path(match, key)
+        }
+        for key in ("otb4", "c3d", "tsv")
+    }
+    summary["unmatched_c3d_count"] = sum(
+        1 for rec in (source_records.get("c3d", []) or [])
+        if str(rec.get("path") or "") and str(rec.get("path") or "") not in used_paths["c3d"]
+    )
+    summary["unmatched_otb4_count"] = sum(
+        1 for rec in (source_records.get("otb4", []) or [])
+        if str(rec.get("path") or "") and str(rec.get("path") or "") not in used_paths["otb4"]
+    )
+    summary["unmatched_tsv_count"] = sum(
+        1 for rec in (source_records.get("tsv", []) or [])
+        if str(rec.get("path") or "") and str(rec.get("path") or "") not in used_paths["tsv"]
+    )
+
+
+def _match_source_path(match: Dict[str, Any], key: str) -> str:
+    return str(((match.get(key) or {}).get("path")) or "")
+
+
+def _duplicate_source_assignments(matches: Sequence[Dict[str, Any]]) -> Dict[str, Dict[str, List[int]]]:
+    dupes: Dict[str, Dict[str, List[int]]] = {"otb4": {}, "c3d": {}, "tsv": {}}
+    for key in ("otb4", "c3d", "tsv"):
+        seen: Dict[str, List[int]] = {}
+        for idx, match in enumerate(matches):
+            path = _match_source_path(match, key)
+            if not path:
+                continue
+            seen.setdefault(path, []).append(idx)
+        dupes[key] = {path: rows for path, rows in seen.items() if len(rows) > 1}
+    return dupes
+
+
+def _duplicate_assignment_lines(matches: Sequence[Dict[str, Any]]) -> List[str]:
+    lines: List[str] = []
+    dupes = _duplicate_source_assignments(matches)
+    for key, mapping in dupes.items():
+        for path, rows in mapping.items():
+            refs = ", ".join(f"{int(matches[row].get('match_id') or row + 1):03d}" for row in rows)
+            lines.append(f"{key}: {Path(path).name} used by matches {refs}")
+    return lines
+
+
+def _ensure_unique_source_assignments(matches: Sequence[Dict[str, Any]]) -> None:
+    problem_lines = _duplicate_assignment_lines(matches)
+    if problem_lines:
+        raise RuntimeError("Duplicate source assignments detected:\n" + "\n".join(problem_lines))
+
+
+_PICKER_CANCEL = object()
+_PICKER_KEEP_CURRENT = object()
+_PICKER_CLEAR = object()
+
+
 class PlotRowWidget:
     def __init__(self, viewer, title: str, series_specs: Optional[List[Dict[str, Any]]] = None, row_role: str = "custom"):
         from PySide6 import QtWidgets
@@ -3882,12 +4608,13 @@ class PlotRowWidget:
         top.addWidget(self.add_row_btn)
         top.addWidget(self.add_overlay_btn)
         layout.addLayout(top)
-        self.status = QtWidgets.QLabel("")
-        self.status.setWordWrap(True)
-        layout.addWidget(self.status)
         self.plot = pg.PlotWidget()
         self.plot.showGrid(x=True, y=True, alpha=0.25)
         layout.addWidget(self.plot)
+        self.status = QtWidgets.QLabel("")
+        self.status.setWordWrap(True)
+        self.status.setStyleSheet("QLabel { color: #404040; padding-top: 4px; }")
+        layout.addWidget(self.status)
         self.add_row_btn.clicked.connect(self._request_new_row)
         self.add_overlay_btn.clicked.connect(self._request_overlay)
 
@@ -3949,7 +4676,7 @@ class PlotRowWidget:
                 continue
             if self.row_role == "raw":
                 y = _normalize_unit_interval(y)
-            color = _series_color(spec)
+            color = _overlay_series_color(spec, plotted, len(self.series_specs))
             self.plot.plot(t, y, pen=pg.mkPen(color=color, width=1.4), name=_series_label(spec))
             plotted += 1
             lo = float(np.nanmin(t))
@@ -3959,6 +4686,7 @@ class PlotRowWidget:
             y_hi = float(np.nanmax(y))
             y_max = y_hi if y_max is None else max(y_max, y_hi)
 
+        footer_lines: List[str] = []
         if plotted:
             self.plot.setLabel("bottom", "Aligned time", units="s")
             y_label, y_units = _y_axis_label(self.row_role, self.series_specs)
@@ -3983,13 +4711,14 @@ class PlotRowWidget:
                 for line in region.lines:
                     line.setPen(pg.mkPen(color=gap_line, width=1.0, style=QtCore.Qt.PenStyle.DashLine))
                 self.plot.addItem(region)
-            if self.row_role not in {"sync", "raw"}:
-                self.status.setText("")
+            footer_lines.append(_plot_source_files_text(self.match, self.row_role, self.series_specs))
+            footer_lines.append(_plot_decision_context_text(self.match, self.row_role, self.series_specs))
         else:
-            self.status.setText(" | ".join(missing) if missing else "No channels plotted.")
+            footer_lines.append("No channels plotted.")
 
-        if missing and plotted:
-            self.status.setText(" | ".join(missing))
+        if missing:
+            footer_lines.append("Unavailable: " + " | ".join(missing))
+        self.status.setText("\n".join(line for line in footer_lines if line))
 
 
 class ViewerWindow:
@@ -4003,6 +4732,8 @@ class ViewerWindow:
         self.window.setWindowTitle("Sync Alignment Review")
         self.window.resize(1700, 1000)
         self.window.closeEvent = self._close_event
+        self.window.resizeEvent = self._resize_event
+        self._windowed_geometry = None
         central = QtWidgets.QWidget()
         self.window.setCentralWidget(central)
         layout = QtWidgets.QHBoxLayout(central)
@@ -4022,36 +4753,38 @@ class ViewerWindow:
         palette.setColor(QtGui.QPalette.ColorRole.Highlight, QtGui.QColor(0, 0, 0, 0))
         palette.setColor(QtGui.QPalette.ColorRole.HighlightedText, QtGui.QColor("#000000"))
         self.list_widget.setPalette(palette)
-        left_layout.addWidget(self.list_widget, 1)
+        left_layout.addWidget(self.list_widget, 0)
         self.scan_notes = QtWidgets.QLabel("")
         self.scan_notes.setWordWrap(True)
         self.scan_notes.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop | QtCore.Qt.AlignmentFlag.AlignLeft)
         self.scan_notes.setStyleSheet("QLabel { background: #f4f4f4; border: 1px solid #d0d0d0; padding: 8px; }")
         left_layout.addWidget(self.scan_notes, 0)
+        left_layout.addStretch(1)
+        self.match_report_group = QtWidgets.QGroupBox("Match Report")
+        self.match_report_layout = QtWidgets.QVBoxLayout(self.match_report_group)
+        self.match_report_layout.setContentsMargins(8, 10, 8, 8)
+        self.match_report_layout.setSpacing(6)
+        self.sync_info = QtWidgets.QLabel("")
+        self.sync_info.setWordWrap(True)
+        self.sync_info.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.match_report_layout.addWidget(self.sync_info, 0)
+        self.raw_info = QtWidgets.QLabel("")
+        self.raw_info.setWordWrap(True)
+        self.raw_info.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.match_report_layout.addWidget(self.raw_info, 0)
+        self.decision_info = QtWidgets.QLabel("")
+        self.decision_info.setWordWrap(True)
+        self.decision_info.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.match_report_layout.addWidget(self.decision_info, 0)
         self.progress = QtWidgets.QLabel("")
         self.progress.setWordWrap(True)
-        left_layout.addWidget(self.progress, 0)
+        self.match_report_layout.addWidget(self.progress, 0)
         self.task_progress = QtWidgets.QProgressBar()
         self.task_progress.setRange(0, 1)
         self.task_progress.setValue(0)
         self.task_progress.setFormat("Idle")
-        left_layout.addWidget(self.task_progress, 0)
-        self.files_info = QtWidgets.QLabel("")
-        self.files_info.setWordWrap(True)
-        self.files_info.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
-        left_layout.addWidget(self.files_info, 0)
-        self.sync_info = QtWidgets.QLabel("")
-        self.sync_info.setWordWrap(True)
-        self.sync_info.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
-        left_layout.addWidget(self.sync_info, 0)
-        self.raw_info = QtWidgets.QLabel("")
-        self.raw_info.setWordWrap(True)
-        self.raw_info.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
-        left_layout.addWidget(self.raw_info, 0)
-        self.decision_info = QtWidgets.QLabel("")
-        self.decision_info.setWordWrap(True)
-        self.decision_info.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
-        left_layout.addWidget(self.decision_info, 0)
+        self.match_report_layout.addWidget(self.task_progress, 0)
+        left_layout.addWidget(self.match_report_group, 0)
         self.detail = QtWidgets.QScrollArea()
         self.detail.setWidgetResizable(True)
         self.detail_inner = QtWidgets.QWidget()
@@ -4064,6 +4797,9 @@ class ViewerWindow:
 
         self.mapping = _load_mapping(mapping_path)
         self.matches = self.mapping.get("matches", [])
+        self.source_records = self.mapping.get("source_records", {}) or {}
+        self.unmatched_c3d_records = list(self.mapping.get("unmatched_c3d_records", []) or [])
+        self.unmatched_otb4_records = list(self.mapping.get("unmatched_otb4_records", []) or [])
         for match in self.matches:
             _apply_review_defaults(match)
         self.current_match: Optional[Dict[str, Any]] = None
@@ -4071,10 +4807,15 @@ class ViewerWindow:
         self._completed_notified = False
         self.completion_message: Optional[str] = None
         self._busy = False
+        self._recompute_source_availability()
 
         self.header = QtWidgets.QLabel("")
         self.header.setWordWrap(True)
         self.detail_layout.addWidget(self.header)
+        self.match_files_info = QtWidgets.QLabel("")
+        self.match_files_info.setWordWrap(False)
+        self.match_files_info.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.detail_layout.addWidget(self.match_files_info)
 
         review_controls = QtWidgets.QHBoxLayout()
         self.accept_btn = QtWidgets.QPushButton("Accept -> Next")
@@ -4098,6 +4839,8 @@ class ViewerWindow:
 
         controls = QtWidgets.QHBoxLayout()
         self.add_row_btn = QtWidgets.QPushButton("+ Row")
+        self.manual_match_btn = QtWidgets.QPushButton("Create Manual Match")
+        self.edit_match_btn = QtWidgets.QPushButton("Set/Change Match Files")
         self.export_mat_btn = QtWidgets.QPushButton("Export accepted to .mat")
         self.parallel_export_chk = QtWidgets.QCheckBox("Parallel export")
         self.parallel_export_chk.setChecked(True)
@@ -4107,15 +4850,22 @@ class ViewerWindow:
         self.worker_spin.setEnabled(True)
         self.reset_btn = QtWidgets.QPushButton("Reset")
         controls.addWidget(self.add_row_btn)
+        controls.addWidget(self.manual_match_btn)
+        controls.addWidget(self.edit_match_btn)
         controls.addWidget(self.export_mat_btn)
         controls.addWidget(self.parallel_export_chk)
         controls.addWidget(self.worker_spin)
         controls.addWidget(self.reset_btn)
         self.detail_layout.addLayout(controls)
         self.add_row_btn.clicked.connect(self.add_plot_row)
+        self.manual_match_btn.clicked.connect(self.add_manual_match)
+        self.edit_match_btn.clicked.connect(self.edit_current_match)
         self.export_mat_btn.clicked.connect(self.export_current_mat)
         self.parallel_export_chk.toggled.connect(self.worker_spin.setEnabled)
         self.reset_btn.clicked.connect(self.reset_rows)
+        self.fullscreen_shortcut = QtGui.QShortcut(QtGui.QKeySequence("F12"), self.window)
+        self.fullscreen_shortcut.activated.connect(self._toggle_fullscreen)
+        self._apply_left_panel_sizing()
 
         self._refresh_match_list()
         self.list_widget.currentItemChanged.connect(self._on_select)
@@ -4144,6 +4894,9 @@ class ViewerWindow:
             was_blocked = self.list_widget.blockSignals(True)
             self.list_widget.setCurrentRow(target_row)
             self.list_widget.blockSignals(was_blocked)
+            self.current_match = self.matches[target_row]
+        else:
+            self.current_match = None
         self._apply_list_item_styles()
 
     def _set_busy(self, busy: bool) -> None:
@@ -4157,6 +4910,8 @@ class ViewerWindow:
             self.prev_btn,
             self.next_btn,
             self.add_row_btn,
+            self.manual_match_btn,
+            self.edit_match_btn,
             self.export_mat_btn,
             self.parallel_export_chk,
             self.worker_spin,
@@ -4213,12 +4968,32 @@ class ViewerWindow:
             item.setBackground(QtGui.QColor(_review_status_color(match)))
             item.setForeground(QtGui.QColor(_review_status_text_color(match, selected=(row == current_row))))
 
+    def _apply_left_panel_sizing(self) -> None:
+        target_height = max(360, int(self.window.height() * 0.58))
+        self.list_widget.setMinimumHeight(target_height)
+        self.list_widget.setMaximumHeight(target_height)
+
+    def _resize_event(self, event) -> None:
+        from PySide6 import QtWidgets
+
+        self._apply_left_panel_sizing()
+        QtWidgets.QMainWindow.resizeEvent(self.window, event)
+
+    def _toggle_fullscreen(self) -> None:
+        if self.window.isFullScreen():
+            self.window.showNormal()
+            if self._windowed_geometry is not None:
+                self.window.setGeometry(self._windowed_geometry)
+        else:
+            self._windowed_geometry = self.window.geometry()
+            self.window.showFullScreen()
+
     def _update_header(self) -> None:
         if self.current_match is None:
             self.header.setText("")
             self.progress.setText("")
             self.scan_notes.setText("")
-            self.files_info.setText("")
+            self.match_files_info.setText("")
             self.sync_info.setText("")
             self.raw_info.setText("")
             self.decision_info.setText("")
@@ -4238,26 +5013,32 @@ class ViewerWindow:
             f"{merge_text}"
         )
         reviewed_count, total_count = _review_progress(self.mapping)
+        user_accept_count = sum(1 for match in self.matches if (match.get("review") or {}).get("user_decision") is True)
+        user_reject_count = sum(1 for match in self.matches if (match.get("review") or {}).get("user_decision") is False)
+        free_c3d = len(self.unmatched_c3d_records)
+        free_otb4 = len(self.unmatched_otb4_records)
+        free_tsv = sum(
+            1
+            for rec in (self.source_records.get("tsv", []) or [])
+            if str(rec.get("path") or "") not in self._source_usage_map("tsv")
+        )
         self.progress.setText(
-            f"Reviewed {reviewed_count}/{total_count}. Auto-accept suggests matches with excellent raw agreement and strong OTB4/C3D sync."
+            f"Reviewed {reviewed_count}/{total_count}. User accepted={user_accept_count}, user rejected={user_reject_count}. "
+            f"Unassociated files: C3D={free_c3d}, OTB4={free_otb4}, TSV={free_tsv}. "
+            f"Auto-accept suggests matches with excellent raw agreement and strong OTB4/C3D sync."
         )
         notes = [str(msg) for msg in (self.mapping.get("startup_messages") or []) if str(msg).strip()]
         self.scan_notes.setText(
             ("Scan notes:\n" + "\n".join(f"- {msg}" for msg in notes)) if notes else "Scan notes: none."
         )
-        self.files_info.setText(
-            "Files: "
-            f"OTB4={Path(self.current_match['otb4']['path']).name} | "
-            f"C3D={Path(self.current_match['c3d']['path']).name} | "
-            f"TSV={Path(self.current_match['tsv']['path']).name if self.current_match.get('tsv') else 'missing'}"
-        )
+        self.match_files_info.setText(_match_files_line(self.current_match))
         dedicated = _dedicated_sync_agreement(self.current_match)
         self.sync_info.setText(f"Sync: {_sync_status_text(self.current_match, dedicated)}\n{_repair_status_text(self.current_match)}")
         self.raw_info.setText(f"Raw: {_raw_status_text(self.current_match)}")
         if not self.current_match.get("tsv"):
             reason = (alignment.get("tsv_skip_reason") or "No TSV match reason recorded.")
             self.raw_info.setText(f"TSV missing: {reason}")
-        self.decision_info.setText(_decision_reason_text(self.current_match))
+        self.decision_info.setText(_decision_reason_rich_text(self.current_match))
         self._update_review_controls()
 
     def _current_index(self) -> int:
@@ -4274,7 +5055,12 @@ class ViewerWindow:
         self.list_widget.setCurrentRow(idx)
 
     def _save_reviews(self) -> None:
+        _ensure_unique_source_assignments(self.matches)
         self.mapping["matches"] = self.matches
+        self.mapping["unmatched_c3d_records"] = self.unmatched_c3d_records
+        self.mapping["source_records"] = self.source_records
+        self.mapping["unmatched_otb4_records"] = self.unmatched_otb4_records
+        _refresh_mapping_summary(self.mapping)
         reviewed_count, total_count = _review_progress(self.mapping)
         self.mapping.setdefault("summary", {})["reviewed_count"] = reviewed_count
         self.mapping.setdefault("summary", {})["final_accept_count"] = sum(
@@ -4313,11 +5099,20 @@ class ViewerWindow:
         self.reset_decision_btn.setEnabled(self.current_match is not None and review.get("user_decision") is not None)
 
     def _persist_refresh_and_maybe_finish(self, selected_row: Optional[int] = None) -> None:
+        from PySide6 import QtWidgets
+
         self._set_busy(True)
         try:
             self._set_progress(0, 1, "Writing review outputs")
-            self._save_reviews()
+            try:
+                self._save_reviews()
+            except Exception as exc:
+                self._set_progress(0, 1, "Save failed")
+                QtWidgets.QMessageBox.critical(self.window, "Save Failed", str(exc))
+                return
             self._refresh_match_list(selected_row=selected_row)
+            if self.current_match is not None and self.plot_rows:
+                self._refresh_rows()
             self._update_header()
             self._maybe_finish_review()
             self._set_progress(1, 1, "Ready")
@@ -4393,6 +5188,515 @@ class ViewerWindow:
         self._clear_rows()
         self._ensure_default_rows()
         self._refresh_rows()
+
+    def _source_usage_map(self, key: str, *, exclude_rows: Optional[Sequence[int]] = None) -> Dict[str, List[int]]:
+        excluded = {int(row) for row in (exclude_rows or [])}
+        usage: Dict[str, List[int]] = {}
+        for row, match in enumerate(self.matches):
+            if row in excluded:
+                continue
+            path = _match_source_path(match, key)
+            if not path:
+                continue
+            usage.setdefault(path, []).append(row)
+        return usage
+
+    def _match_id_for_row(self, row: int) -> int:
+        return int(self.matches[row].get("match_id") or row + 1)
+
+    def _find_row_by_match_id(self, match_id: int) -> Optional[int]:
+        for row, match in enumerate(self.matches):
+            if int(match.get("match_id") or row + 1) == int(match_id):
+                return row
+        return None
+
+    def _current_match_row(self) -> Optional[int]:
+        if self.current_match is None:
+            return None
+        return self._find_row_by_match_id(int(self.current_match.get("match_id") or -1))
+
+    def _match_brief_label(self, row: int) -> str:
+        match = self.matches[row]
+        otb_name = Path(str((match.get("otb4") or {}).get("path") or "")).name
+        c3d_name = Path(str((match.get("c3d") or {}).get("path") or "")).name
+        tsv_name = Path(str((match.get("tsv") or {}).get("path") or "")).name if match.get("tsv") else "no TSV"
+        return f"{int(match.get('match_id') or row + 1):03d} ({otb_name} | {c3d_name} | {tsv_name})"
+
+    def _record_usage_text(
+        self,
+        source_key: str,
+        record: Dict[str, Any],
+        *,
+        exclude_rows: Optional[Sequence[int]] = None,
+        current_record: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[str, int]:
+        path = str(record.get("path") or "")
+        current_path = str((current_record or {}).get("path") or "")
+        if current_path and path == current_path:
+            rows = self._source_usage_map(source_key, exclude_rows=exclude_rows).get(path, [])
+            if not rows:
+                return "CURRENT", 0
+            refs = ", ".join(self._match_brief_label(row) for row in rows)
+            return f"CURRENT | ALSO USED by {refs}", 2
+        rows = self._source_usage_map(source_key, exclude_rows=exclude_rows).get(path, [])
+        if not rows:
+            return "UNASSOCIATED", 1
+        refs = ", ".join(self._match_brief_label(row) for row in rows)
+        return f"USED by {refs}", 2
+
+    def _recompute_source_availability(self) -> None:
+        self.unmatched_c3d_records = [
+            dict(rec) for rec in (self.source_records.get("c3d", []) or [])
+            if str(rec.get("path") or "") not in self._source_usage_map("c3d")
+        ]
+        self.unmatched_otb4_records = [
+            dict(rec) for rec in (self.source_records.get("otb4", []) or [])
+            if str(rec.get("path") or "") not in self._source_usage_map("otb4")
+        ]
+        self.mapping["unmatched_c3d_records"] = self.unmatched_c3d_records
+        self.mapping["unmatched_otb4_records"] = self.unmatched_otb4_records
+
+    def _mark_match_for_manual_review(self, match: Dict[str, Any], note: str) -> None:
+        alignment = match.setdefault("alignment", {})
+        alignment["manual_reassignment"] = True
+        alignment["manual_reassignment_note"] = note
+        match["review"] = {"auto_accept": False, "user_decision": None, "user_touched": False}
+        _apply_review_defaults(match)
+
+    def _detach_tsv_from_match(self, row: int, note: str) -> None:
+        old_match = self.matches[row]
+        rebuilt = _build_pair_match_from_records(old_match["otb4"], old_match["c3d"], match_id=int(old_match.get("match_id") or row + 1))
+        _apply_otb4_repairs([rebuilt], [])
+        self._mark_match_for_manual_review(rebuilt, note)
+        rebuilt["alignment"]["tsv_match_status"] = "manual_reassigned"
+        rebuilt["alignment"]["tsv_skip_reason"] = note
+        self.matches[row] = rebuilt
+
+    def _remove_match(self, row: int) -> Dict[str, Any]:
+        return self.matches.pop(row)
+
+    def _build_manual_reassignment_plan(
+        self,
+        *,
+        c3d_record: Dict[str, Any],
+        otb4_record: Dict[str, Any],
+        tsv_record: Optional[Dict[str, Any]],
+        exclude_rows: Optional[Sequence[int]] = None,
+    ) -> Dict[str, Any]:
+        excluded = {int(row) for row in (exclude_rows or [])}
+        c3d_path = str(c3d_record.get("path") or "")
+        otb_path = str(otb4_record.get("path") or "")
+        tsv_path = str((tsv_record or {}).get("path") or "")
+
+        c3d_rows = set(self._source_usage_map("c3d", exclude_rows=excluded).get(c3d_path, []))
+        otb_rows = set(self._source_usage_map("otb4", exclude_rows=excluded).get(otb_path, []))
+        tsv_rows = set(self._source_usage_map("tsv", exclude_rows=excluded).get(tsv_path, [])) if tsv_path else set()
+        remove_rows = sorted(c3d_rows | otb_rows)
+        detach_rows = sorted(tsv_rows - set(remove_rows))
+        effects: List[str] = []
+
+        for row in remove_rows:
+            reasons: List[str] = []
+            if row in c3d_rows:
+                reasons.append("selected C3D")
+            if row in otb_rows:
+                reasons.append("selected OTB4")
+            existing = self.matches[row]
+            freed_bits = [
+                Path(str((existing.get("otb4") or {}).get("path") or "")).name,
+                Path(str((existing.get("c3d") or {}).get("path") or "")).name,
+            ]
+            if existing.get("tsv"):
+                freed_bits.append(Path(str((existing.get("tsv") or {}).get("path") or "")).name)
+            effects.append(
+                f"{' and '.join(reasons).capitalize()} already belongs to match {self._match_brief_label(row)}. "
+                f"That match will be removed and these files become free: {', '.join(bit for bit in freed_bits if bit)}."
+            )
+        for row in detach_rows:
+            existing = self.matches[row]
+            effects.append(
+                f"Selected TSV already belongs to match {self._match_brief_label(row)}. "
+                f"That match will keep its OTB4/C3D pair but lose the TSV and return to review."
+            )
+        return {
+            "remove_match_ids": [self._match_id_for_row(row) for row in remove_rows],
+            "detach_tsv_match_ids": [self._match_id_for_row(row) for row in detach_rows],
+            "effects": effects,
+        }
+
+    def _confirm_manual_reassignment(
+        self,
+        *,
+        context_label: str,
+        c3d_record: Dict[str, Any],
+        otb4_record: Dict[str, Any],
+        tsv_record: Optional[Dict[str, Any]],
+        exclude_rows: Optional[Sequence[int]] = None,
+        current_match: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        from PySide6 import QtWidgets
+
+        plan = self._build_manual_reassignment_plan(
+            c3d_record=c3d_record,
+            otb4_record=otb4_record,
+            tsv_record=tsv_record,
+            exclude_rows=exclude_rows,
+        )
+        effects = list(plan["effects"])
+        current = current_match or {}
+        for key, label in (("c3d", "C3D"), ("otb4", "OTB4"), ("tsv", "TSV")):
+            old_path = str(((current.get(key) or {}).get("path")) or "")
+            new_path = str((((tsv_record if key == "tsv" else (c3d_record if key == "c3d" else otb4_record)) or {}).get("path")) or "")
+            if old_path and old_path != new_path:
+                effects.append(f"Current match will release {label} {Path(old_path).name}.")
+        if not effects:
+            return True
+        text = (
+            f"{context_label}\n\n"
+            + "\n".join(f"- {line}" for line in effects)
+            + "\n\nContinue?"
+        )
+        result = QtWidgets.QMessageBox.question(
+            self.window,
+            "Confirm Re-Match",
+            text,
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.No,
+        )
+        return result == QtWidgets.QMessageBox.StandardButton.Yes
+
+    def _record_picker(
+        self,
+        *,
+        title: str,
+        prompt: str,
+        records: Sequence[Dict[str, Any]],
+        source_key: Optional[str] = None,
+        current_record: Optional[Dict[str, Any]] = None,
+        exclude_rows: Optional[Sequence[int]] = None,
+        include_keep_current: bool = False,
+        clear_label: Optional[str] = None,
+    ) -> Any:
+        from PySide6 import QtWidgets
+
+        options: List[str] = []
+        lookup: Dict[str, Any] = {}
+        if include_keep_current:
+            current_name = Path(str((current_record or {}).get("path") or "")).name or "current"
+            keep_label = f"<Keep Current: {current_name}>"
+            options.append(keep_label)
+            lookup[keep_label] = _PICKER_KEEP_CURRENT
+        if clear_label:
+            options.append(clear_label)
+            lookup[clear_label] = _PICKER_CLEAR
+        ordered_records = list(records)
+        if source_key:
+            ordered_records.sort(
+                key=lambda record: (
+                    self._record_usage_text(
+                        source_key,
+                        record,
+                        exclude_rows=exclude_rows,
+                        current_record=current_record,
+                    )[1],
+                    Path(str(record.get("path") or "")).name.lower(),
+                )
+            )
+        for record in ordered_records:
+            path = Path(str(record.get("path") or ""))
+            bits = [path.name]
+            if source_key:
+                usage_text, _order = self._record_usage_text(
+                    source_key,
+                    record,
+                    exclude_rows=exclude_rows,
+                    current_record=current_record,
+                )
+                bits.append(usage_text)
+            if "sync_quality" in record:
+                bits.append(f"sync={record.get('sync_quality')}")
+            if "edge_count" in record:
+                bits.append(f"edges={int(record.get('edge_count') or 0)}")
+            label = " | ".join(bits)
+            suffix = 2
+            base_label = label
+            while label in lookup:
+                suffix += 1
+                label = f"{base_label} [{suffix}]"
+            options.append(label)
+            lookup[label] = dict(record)
+        if not options:
+            return _PICKER_CANCEL
+        choice, ok = QtWidgets.QInputDialog.getItem(self.window, title, prompt, options, 0, False)
+        if not ok or not choice:
+            return _PICKER_CANCEL
+        return lookup.get(choice, _PICKER_CANCEL)
+
+    def _resolve_record_choice(self, choice: Any, current_record: Optional[Dict[str, Any]]) -> Any:
+        if choice is _PICKER_CANCEL:
+            return _PICKER_CANCEL
+        if choice is _PICKER_KEEP_CURRENT:
+            return dict(current_record) if current_record else None
+        if choice is _PICKER_CLEAR:
+            return None
+        return choice
+
+    def _choose_match_source(
+        self,
+        *,
+        title: str,
+        prompt: str,
+        records: Sequence[Dict[str, Any]],
+        source_key: str,
+        current_record: Optional[Dict[str, Any]] = None,
+        exclude_rows: Optional[Sequence[int]] = None,
+        include_keep_current: bool = False,
+        clear_label: Optional[str] = None,
+    ) -> Any:
+        choice = self._record_picker(
+            title=title,
+            prompt=prompt,
+            records=records,
+            source_key=source_key,
+            current_record=current_record,
+            exclude_rows=exclude_rows,
+            include_keep_current=include_keep_current,
+            clear_label=clear_label,
+        )
+        return self._resolve_record_choice(choice, current_record)
+
+    def _build_manual_match(
+        self,
+        *,
+        c3d_record: Dict[str, Any],
+        otb4_record: Dict[str, Any],
+        tsv_record: Optional[Dict[str, Any]],
+        match_id: int,
+        note: str,
+    ) -> Tuple[Dict[str, Any], bool]:
+        manual_match = _build_pair_match_from_records(otb4_record, c3d_record, match_id=match_id)
+        manual_match["manual_selection"] = True
+        manual_match.setdefault("alignment", {})["manual_selection"] = True
+        _apply_otb4_repairs([manual_match], [])
+        tsv_ok = True
+        if tsv_record is not None:
+            tsv_ok = _apply_manual_tsv_selection(
+                manual_match,
+                tsv_record,
+                filename_clock_offset_sec=float(self.mapping.get("filename_clock_offset_sec") or 0.0),
+            )
+        self._mark_match_for_manual_review(manual_match, note)
+        return manual_match, bool(tsv_ok)
+
+    def _select_match_sources(self, *, current_row: Optional[int]) -> Any:
+        from PySide6 import QtWidgets
+
+        if current_row is None:
+            self._recompute_source_availability()
+            c3d_record = self._choose_match_source(
+                title="Select C3D",
+                prompt="Choose an unmatched C3D file to assemble manually.",
+                records=self.unmatched_c3d_records,
+                source_key="c3d",
+            )
+            if c3d_record is _PICKER_CANCEL:
+                if not self.unmatched_c3d_records:
+                    QtWidgets.QMessageBox.information(
+                        self.window,
+                        "No Unmatched C3D",
+                        "No unmatched C3D files are available for manual assembly.",
+                    )
+                return _PICKER_CANCEL
+            otb4_record = self._choose_match_source(
+                title="Select OTB4",
+                prompt="Choose the OTB4 file that belongs with this C3D file. Unassociated files are listed first.",
+                records=self.source_records.get("otb4", []) or [],
+                source_key="otb4",
+            )
+            if otb4_record is _PICKER_CANCEL or otb4_record is None:
+                return _PICKER_CANCEL
+            tsv_record = self._choose_match_source(
+                title="Select TSV",
+                prompt="Choose the TSV file for this manual candidate, or leave TSV missing for now.",
+                records=self.source_records.get("tsv", []) or [],
+                source_key="tsv",
+                clear_label="<Leave TSV Missing>",
+            )
+            if tsv_record is _PICKER_CANCEL:
+                return _PICKER_CANCEL
+            return {"c3d": c3d_record, "otb4": otb4_record, "tsv": tsv_record}
+
+        current_match = self.matches[current_row]
+        c3d_record = self._choose_match_source(
+            title="Set C3D",
+            prompt="Choose a C3D file for this match, or keep the current C3D.",
+            records=self.source_records.get("c3d", []) or [],
+            source_key="c3d",
+            current_record=current_match.get("c3d"),
+            exclude_rows=[current_row],
+            include_keep_current=True,
+        )
+        if c3d_record is _PICKER_CANCEL or c3d_record is None:
+            return _PICKER_CANCEL
+        otb4_record = self._choose_match_source(
+            title="Set OTB4",
+            prompt="Choose an OTB4 file for this match, or keep the current OTB4.",
+            records=self.source_records.get("otb4", []) or [],
+            source_key="otb4",
+            current_record=current_match.get("otb4"),
+            exclude_rows=[current_row],
+            include_keep_current=True,
+        )
+        if otb4_record is _PICKER_CANCEL or otb4_record is None:
+            return _PICKER_CANCEL
+        tsv_clear_label = "<Keep TSV Missing>" if not current_match.get("tsv") else "<Set TSV Missing>"
+        tsv_record = self._choose_match_source(
+            title="Set TSV",
+            prompt="Choose a TSV file, keep the current TSV, or explicitly leave/set TSV missing.",
+            records=self.source_records.get("tsv", []) or [],
+            source_key="tsv",
+            current_record=current_match.get("tsv"),
+            exclude_rows=[current_row],
+            include_keep_current=bool(current_match.get("tsv")),
+            clear_label=tsv_clear_label,
+        )
+        if tsv_record is _PICKER_CANCEL:
+            return _PICKER_CANCEL
+        return {"c3d": c3d_record, "otb4": otb4_record, "tsv": tsv_record}
+
+    def _apply_manual_selection(
+        self,
+        *,
+        c3d_record: Dict[str, Any],
+        otb4_record: Dict[str, Any],
+        tsv_record: Optional[Dict[str, Any]],
+        selected_row: Optional[int],
+        note: str,
+    ) -> int:
+        from PySide6 import QtWidgets
+
+        target_match_id = self._match_id_for_row(selected_row) if selected_row is not None else None
+        exclude_rows = [selected_row] if selected_row is not None else []
+        plan = self._build_manual_reassignment_plan(
+            c3d_record=c3d_record,
+            otb4_record=otb4_record,
+            tsv_record=tsv_record,
+            exclude_rows=exclude_rows,
+        )
+
+        for match_id in sorted(plan["remove_match_ids"], reverse=True):
+            row = self._find_row_by_match_id(match_id)
+            if row is not None:
+                self._remove_match(row)
+        for match_id in plan["detach_tsv_match_ids"]:
+            row = self._find_row_by_match_id(match_id)
+            if row is not None:
+                note_text = f"TSV {Path(str((tsv_record or {}).get('path') or '')).name} was reassigned by a manual overwrite."
+                self._detach_tsv_from_match(row, note_text)
+        self._recompute_source_availability()
+
+        if selected_row is None:
+            match_id = max([int(match.get("match_id") or 0) for match in self.matches] + [0]) + 1
+            manual_match, tsv_ok = self._build_manual_match(
+                c3d_record=c3d_record,
+                otb4_record=otb4_record,
+                tsv_record=tsv_record,
+                match_id=match_id,
+                note=note,
+            )
+            self.matches.append(manual_match)
+            selected_row = len(self.matches) - 1
+        else:
+            current_row = self._find_row_by_match_id(int(target_match_id or -1))
+            if current_row is None:
+                raise RuntimeError("Current match disappeared while applying the manual re-match.")
+            manual_match, tsv_ok = self._build_manual_match(
+                c3d_record=c3d_record,
+                otb4_record=otb4_record,
+                tsv_record=tsv_record,
+                match_id=int(target_match_id),
+                note=note,
+            )
+            self.matches[current_row] = manual_match
+            selected_row = current_row
+
+        self._recompute_source_availability()
+        self.mapping["matches"] = self.matches
+        if not tsv_ok:
+            QtWidgets.QMessageBox.warning(
+                self.window,
+                "Manual TSV Failed",
+                "The selected TSV could not be aligned automatically. The C3D/OTB4 pair was still updated for review.",
+            )
+        return int(selected_row)
+
+    def add_manual_match(self) -> None:
+        if self._busy:
+            return
+        selected = self._select_match_sources(current_row=None)
+        if selected is _PICKER_CANCEL:
+            return
+        c3d_record = selected["c3d"]
+        otb4_record = selected["otb4"]
+        tsv_record = selected["tsv"]
+        if not self._confirm_manual_reassignment(
+            context_label=f"Manual assembly for {Path(str(c3d_record.get('path') or '')).name} will change source assignments.",
+            c3d_record=c3d_record,
+            otb4_record=otb4_record,
+            tsv_record=tsv_record,
+        ):
+            return
+        selected_row = self._apply_manual_selection(
+            c3d_record=c3d_record,
+            otb4_record=otb4_record,
+            tsv_record=tsv_record,
+            selected_row=None,
+            note="Manual C3D/OTB4/TSV selection created this candidate.",
+        )
+        self._persist_refresh_and_maybe_finish(selected_row=selected_row)
+
+    def edit_current_match(self) -> None:
+        from PySide6 import QtWidgets
+
+        if self._busy or self.current_match is None:
+            return
+        current_row = self._current_match_row()
+        if current_row is None:
+            QtWidgets.QMessageBox.warning(self.window, "Edit Match", "The selected match could not be located.")
+            return
+        current_match = self.matches[current_row]
+        selected = self._select_match_sources(current_row=current_row)
+        if selected is _PICKER_CANCEL:
+            return
+        c3d_record = selected["c3d"]
+        otb4_record = selected["otb4"]
+        tsv_record = selected["tsv"]
+        old_c3d = str((current_match.get("c3d") or {}).get("path") or "")
+        old_otb4 = str((current_match.get("otb4") or {}).get("path") or "")
+        old_tsv = str((current_match.get("tsv") or {}).get("path") or "")
+        new_c3d = str(c3d_record.get("path") or "")
+        new_otb4 = str(otb4_record.get("path") or "")
+        new_tsv = str((tsv_record or {}).get("path") or "")
+        if old_c3d == new_c3d and old_otb4 == new_otb4 and old_tsv == new_tsv:
+            QtWidgets.QMessageBox.information(self.window, "Edit Match", "No source files were changed.")
+            return
+        if not self._confirm_manual_reassignment(
+            context_label=f"Re-matching {self._match_brief_label(current_row)} will update the current triplet.",
+            c3d_record=c3d_record,
+            otb4_record=otb4_record,
+            tsv_record=tsv_record,
+            exclude_rows=[current_row],
+            current_match=current_match,
+        ):
+            return
+        selected_row = self._apply_manual_selection(
+            c3d_record=c3d_record,
+            otb4_record=otb4_record,
+            tsv_record=tsv_record,
+            selected_row=current_row,
+            note="Manual file reassignment updated this candidate.",
+        )
+        self._persist_refresh_and_maybe_finish(selected_row=selected_row)
 
     def export_current_mat(self) -> None:
         from PySide6 import QtWidgets
@@ -4508,6 +5812,7 @@ class ViewerWindow:
         insert_at = self.detail_layout.count()
         self.plot_rows.append(row)
         self.detail_layout.insertWidget(insert_at, row.widget)
+        row.set_match(self.current_match)
         self.add_series_to_row(row, replace=True)
 
     def add_series_to_row(self, row: PlotRowWidget, replace: bool = False) -> None:
@@ -4541,6 +5846,7 @@ class ViewerWindow:
             row.series_specs = [lookup[choice]]
         else:
             row.series_specs.append(lookup[choice])
+        row.match = self.current_match
         row.refresh()
 
     def _on_select(self, current, previous):
@@ -4560,6 +5866,7 @@ class ViewerWindow:
         self._update_header()
 
     def run(self) -> int:
+        self._windowed_geometry = self.window.geometry()
         self.window.showFullScreen()
         return self.app.exec()
 
