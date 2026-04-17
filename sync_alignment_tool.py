@@ -3595,7 +3595,9 @@ def export_match_mat(match: Dict[str, Any], export_root: Path) -> Path:
     file_name = (((match.get("export_plan") or {}).get("mat") or {}).get("filename") or _mat_export_name(match, saved_stamp))
     out_path = Path(export_root) / file_name
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    aligned = _build_common_aligned_mat_struct(match)
+    otb4_struct = _build_otb4_mat_struct(match, float(start_sec), float(end_sec))
+    c3d_struct = _build_c3d_mat_struct(match, float(start_sec), float(end_sec))
+    tsv_struct = _build_tsv_mat_struct(match, float(start_sec), float(end_sec)) if match.get("tsv") else {}
     mat_dict = {
         "meta": {
             "match_id": int(match["match_id"]),
@@ -3603,7 +3605,9 @@ def export_match_mat(match: Dict[str, Any], export_root: Path) -> Path:
             "time_window_sec": np.array([float(start_sec), float(end_sec)], dtype=float),
             "duration_sec": float(end_sec - start_sec),
             "common_period_aligned": True,
-            "aligned_to_single_common_timebase": True,
+            "aligned_to_single_common_timebase": False,
+            "per_source_timebases": True,
+            "resampled": False,
             "certainty": str(match.get("certainty") or ""),
             "original_files": {
                 key: {
@@ -3623,14 +3627,11 @@ def export_match_mat(match: Dict[str, Any], export_root: Path) -> Path:
             "inner_merge": inner_merge,
             "otb4_repair": (match.get("alignment") or {}).get("otb4_repair") or {},
         },
-        "time": aligned["time"],
-        "frames": aligned["frames"],
-        "sample_rate": float(aligned["sample_rate"]),
-        "otb4": aligned["otb4"],
-        "c3d_analog": aligned["c3d_analog"],
-        "c3d_point": aligned["c3d_point"],
-        "c3d_cop": aligned["c3d_cop"],
-        "tsv": aligned["tsv"],
+        "otb4": otb4_struct,
+        "c3d_analog": c3d_struct["analog"],
+        "c3d_point": c3d_struct["point"],
+        "c3d_cop": c3d_struct["cop"],
+        "tsv": tsv_struct,
     }
     savemat(str(out_path), _mat_safe(mat_dict), long_field_names=True, do_compression=True)
     _write_merge_info_txt(out_path, match)
