@@ -51,6 +51,94 @@ SYNC_OTB_LABEL = "Syncstation AUX 2 [V]"
 SYNC_C3D_LABEL = "Voltage.2_Sync"
 SYNC_TSV_EXACT_SUFFIX = "2_Sync [Volt] [sync]"
 TSV_RAW_SUFFIX = "[raw]"
+_OTB4_PROBE_DIAG_CACHE: Dict[str, Dict[str, Any]] = {}
+TRIPLET_SEED_LIMIT = 3
+
+
+def _otb4_probe_diag_cache_key(path: str, step_sec: Optional[float] = None) -> str:
+    suffix = "auto" if step_sec in (None, "") else f"{float(step_sec):.6f}"
+    return f"{path}|step={suffix}"
+
+
+def _track_prefers_voltage_units(track: Dict[str, Any]) -> bool:
+    device = str(track.get("Device", "")).strip().lower()
+    subtitle = str(track.get("SubTitle", "")).strip().lower()
+    desc_name = str(track.get("DescriptionName", "")).strip().lower()
+    sensor_type = str(track.get("SensorType", "")).strip().lower()
+    if device == "syncstation" and subtitle.startswith("aux"):
+        return True
+    if "trigger" in desc_name:
+        return True
+    if "auxtrigger" in sensor_type:
+        return True
+    return False
+
+
+def _track_base_conversion(track: Dict[str, Any]) -> float:
+    nbits = int(track.get("ADC_Nbits", 0) or 0)
+    gain = float(track.get("Gain", 1) or 1.0)
+    adc_range = float(track.get("ADC_Range", 0) or 0.0)
+    if nbits <= 0 or gain == 0:
+        return 1.0
+    return adc_range / (2 ** nbits) / gain
+
+
+def _track_is_emg_grid(track: Dict[str, Any]) -> bool:
+    grid_info = track.get("GridInfo") or {}
+    ied = int(grid_info.get("IED", 0) or 0)
+    electrodes = int(track.get("NumberOfChannels", 0) or 0)
+    if bool(track.get("IsControl")):
+        return False
+    if str(track.get("Device", "")).strip().lower() == "syncstation":
+        return False
+    return ied > 1 or electrodes > 4
+
+
+def _track_conversion_factor(track: Dict[str, Any]) -> float:
+    conv = _track_base_conversion(track)
+    if _track_prefers_voltage_units(track):
+        return conv
+    if _track_is_emg_grid(track):
+        return conv * 1000.0
+    return conv
+
+
+def _track_label_prefix(track: Dict[str, Any]) -> str:
+    device = str(track.get("Device", "")).strip()
+    subtitle = str(track.get("SubTitle", "")).strip()
+    desc_name = str(track.get("DescriptionName", "")).strip()
+    muscle = track.get("Muscle")
+    grid_info = track.get("GridInfo")
+    if _track_is_emg_grid(track) and grid_info:
+        ied = int(grid_info["IED"])
+        rows = int(grid_info["NRow"])
+        cols = int(grid_info["NColumn"])
+        grid_pattern = f"HD{ied:02d}MM{rows:02d}{cols:02d}"
+        base = f"{subtitle or device} {grid_pattern}".strip()
+        if muscle:
+            base += f" [MUSCLE:{muscle}]"
+        return base
+    parts = [part for part in (device, subtitle or desc_name) if part]
+    return " ".join(parts).strip() or "Unknown"
+
+
+def _track_display_unit(track: Dict[str, Any]) -> Optional[str]:
+    if _track_prefers_voltage_units(track):
+        return "V"
+    return None
+
+
+def _build_track_descriptions(track: Dict[str, Any]) -> List[str]:
+    nchan = int(track.get("NumberOfChannels", 0) or 0)
+    prefix = _track_label_prefix(track)
+    unit = _track_display_unit(track)
+    labels: List[str] = []
+    for idx in range(nchan):
+        label = f"{prefix} ch{idx + 1}" if nchan > 1 else prefix
+        if unit:
+            label += f" [{unit}]"
+        labels.append(label)
+    return labels
 
 
 def _now_iso() -> str:
@@ -65,6 +153,17 @@ def _parse_timestamp_from_name(path: Path) -> Optional[datetime]:
         return datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S")
     except Exception:
         return None
+
+
+def _file_numeric_index(path_or_text: Any) -> Optional[int]:
+    stem = Path(str(path_or_text or "")).stem
+    m = re.match(r"file[_-]?0*(\d+)(?:_|$)", stem, flags=re.IGNORECASE)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            return None
+    return None
 
 
 def _filename_clock_offset_sec(path: Path) -> Optional[float]:
@@ -154,6 +253,49 @@ def _load_otb4_aux_channel(path: Path, *, device: str, subtitle: str) -> Tuple[n
             "channel_offset": target_offset,
         }
         return t, x, meta
+    finally:
+        _release_otb4_tmpdir(tmpdir)
+
+
+def _read_otb4_scan_info(path: Path) -> Tuple[np.ndarray, Dict[str, Any], List[str]]:
+    tmpdir, tracks = _extract_otb4_tracks(path)
+    try:
+        labels: List[str] = []
+        for track in tracks:
+            labels.extend(_build_track_descriptions(track))
+        target = next(
+            (
+                track
+                for track in tracks
+                if str(track.get("Device")) == SYNC_OTB_DEVICE and str(track.get("SubTitle")) == SYNC_OTB_SUBTITLE
+            ),
+            None,
+        )
+        if target is None:
+            raise ValueError(f"Missing OTB4 track {SYNC_OTB_DEVICE} {SYNC_OTB_SUBTITLE}")
+        signal_path = str(target["SignalStreamPath"])
+        offsets = _otb4_track_offsets(tracks, signal_path)
+        target_offset = next((offset for offset, track in offsets if track is target), None)
+        if target_offset is None:
+            raise ValueError(f"Unable to locate track offset for {SYNC_OTB_DEVICE} {SYNC_OTB_SUBTITLE}")
+        sig_file = tmpdir / signal_path
+        raw = np.fromfile(sig_file, dtype=np.int16)
+        total_channels = sum(int(track["NumberOfChannels"]) for _offset, track in offsets)
+        if total_channels <= 0 or raw.size % total_channels != 0:
+            raise ValueError(f"Invalid OTB4 signal layout for {signal_path}")
+        samples = raw.size // total_channels
+        data = raw.reshape((total_channels, samples), order="F").astype(np.float64)
+        x = data[target_offset, :] * float(_track_conversion_factor(target))
+        fs = float(target["SamplingFrequency"])
+        meta = {
+            "label": SYNC_OTB_LABEL,
+            "sampling_frequency": fs,
+            "device": SYNC_OTB_DEVICE,
+            "subtitle": SYNC_OTB_SUBTITLE,
+            "signal_path": signal_path,
+            "channel_offset": target_offset,
+        }
+        return np.asarray(x, dtype=float).reshape(-1), meta, labels
     finally:
         _release_otb4_tmpdir(tmpdir)
 
@@ -518,6 +660,146 @@ def _binary_edges(x: np.ndarray, threshold: float) -> np.ndarray:
     return np.flatnonzero(np.diff(b) != 0)
 
 
+def _pulse_groups_from_signal(x: np.ndarray) -> List[Tuple[int, int]]:
+    arr = np.asarray(x, dtype=float).reshape(-1)
+    if arr.size == 0:
+        return []
+    med = float(np.nanmedian(arr)) if np.any(np.isfinite(arr)) else 0.0
+    arr = np.nan_to_num(arr, nan=med)
+    lo = float(np.nanmin(arr))
+    hi = float(np.nanmax(arr))
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi == lo:
+        return []
+    use_high = abs(hi - med) >= abs(lo - med)
+    thr = med + 0.5 * (hi - med) if use_high else med - 0.5 * (med - lo)
+    active = arr >= thr if use_high else arr <= thr
+    idx = np.flatnonzero(active)
+    if idx.size == 0:
+        return []
+    groups: List[Tuple[int, int]] = []
+    start = int(idx[0])
+    prev = int(idx[0])
+    for cur in idx[1:]:
+        cur = int(cur)
+        if cur != prev + 1:
+            groups.append((start, prev - start + 1))
+            start = cur
+        prev = cur
+    groups.append((start, prev - start + 1))
+    return groups
+
+
+def _infer_pulse_duration_ms(x: np.ndarray, sample_rate: float) -> Dict[str, Any]:
+    fs = float(sample_rate or 0.0)
+    if fs <= 0.0:
+        return {"confirmed": False, "reason": "missing sample rate"}
+    groups = _pulse_groups_from_signal(x)
+    if not groups:
+        return {"confirmed": False, "reason": "no pulse groups detected", "sample_rate_hz": fs}
+    widths_samples = [int(length) for _start, length in groups if int(length) > 0]
+    widths_ms = [float(length) / fs * 1000.0 for length in widths_samples]
+    observed_mode_samples = max(set(widths_samples), key=widths_samples.count)
+    observed_mode_ms = float(observed_mode_samples) / fs * 1000.0
+    allowed_ms = np.asarray([0.2, 0.5, 1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0], dtype=float)
+    nearest = allowed_ms[np.argmin(np.abs(allowed_ms - observed_mode_ms))]
+    exact_observed = any(abs(float(w) - 1.0) <= 0.05 for w in widths_ms)
+    # At 2 kHz, a 1 ms pulse can still alias to a single 0.5 ms sample depending on phase.
+    ambiguous_alias = abs(observed_mode_ms - 0.5) <= 0.05 and fs <= 2500.0
+    confirmed = exact_observed and not ambiguous_alias
+    candidates: List[float] = []
+    if confirmed:
+        candidates = [1.0]
+    else:
+        candidates.append(float(nearest))
+        if ambiguous_alias:
+            candidates.append(1.0)
+        candidates = sorted({round(v, 3) for v in candidates})
+    return {
+        "confirmed": bool(confirmed),
+        "sample_rate_hz": fs,
+        "group_count": len(widths_samples),
+        "observed_width_samples_mode": int(observed_mode_samples),
+        "observed_width_ms_mode": round(float(observed_mode_ms), 6),
+        "all_widths_ms": [round(float(v), 6) for v in widths_ms],
+        "nearest_allowed_ms": float(nearest),
+        "candidate_durations_ms": candidates,
+        "reason": (
+            "1 ms confirmed from sampled pulse width"
+            if confirmed
+            else "single-sample pulse at current sample rate cannot distinguish 0.5 ms from an aliased 1 ms TTL pulse"
+            if ambiguous_alias
+            else "sampled pulse width does not confirm 1 ms"
+        ),
+    }
+
+
+def _sync_pulse_duration_ms_from_match(match: Dict[str, Any], diag: Optional[Dict[str, Any]] = None) -> Optional[float]:
+    alignment = match.get("alignment") or {}
+    configured = alignment.get("configured_sync_pulse_duration_ms")
+    if configured not in (None, ""):
+        try:
+            value = float(configured)
+            if value > 0.0:
+                return value
+        except Exception:
+            pass
+    if diag is None:
+        diag = _otb4_probe_sync_diagnostics(match)
+    for info in (
+        (diag.get("control_pulse_duration_info") or {}),
+        (diag.get("aux2_pulse_duration_info") or {}),
+    ):
+        try:
+            candidates = [float(v) for v in (info.get("candidate_durations_ms") or []) if float(v) > 0.0]
+        except Exception:
+            candidates = []
+        if candidates:
+            if any(abs(v - 1.0) <= 1e-9 for v in candidates):
+                return 1.0
+            return float(candidates[0])
+    return None
+
+
+def _sync_decrement_ms_from_match(match: Dict[str, Any]) -> Optional[float]:
+    alignment = match.get("alignment") or {}
+    configured = alignment.get("configured_sync_decrement_ms")
+    if configured not in (None, ""):
+        try:
+            value = float(configured)
+            if value > 0.0:
+                return value
+        except Exception:
+            pass
+    return None
+
+
+def _sync_pattern_match_tolerance_sec(match: Dict[str, Any], diag: Optional[Dict[str, Any]] = None) -> float:
+    if diag is None:
+        diag = _otb4_probe_sync_diagnostics(match)
+    pulse_ms = _sync_pulse_duration_ms_from_match(match, diag=diag)
+    sample_periods_sec: List[float] = []
+    ambiguous_alias = False
+    for info in (
+        (diag.get("control_pulse_duration_info") or {}),
+        (diag.get("aux2_pulse_duration_info") or {}),
+    ):
+        try:
+            fs = float(info.get("sample_rate_hz") or 0.0)
+        except Exception:
+            fs = 0.0
+        if fs > 0.0:
+            sample_periods_sec.append(1.0 / fs)
+        candidates = [float(v) for v in (info.get("candidate_durations_ms") or []) if float(v) > 0.0]
+        if len(candidates) >= 2 and any(abs(v - 0.5) <= 0.05 for v in candidates) and any(abs(v - 1.0) <= 0.05 for v in candidates):
+            ambiguous_alias = True
+    sample_period_sec = max(sample_periods_sec) if sample_periods_sec else 0.0
+    pulse_sec = max(float(pulse_ms or 0.0) / 1000.0, sample_period_sec)
+    tolerance_sec = max(0.002, (2.0 * sample_period_sec) + (0.5 * pulse_sec))
+    if ambiguous_alias:
+        tolerance_sec += max(sample_period_sec, 0.0005)
+    return min(0.006, tolerance_sec)
+
+
 def _collapse_edge_pairs(edges: np.ndarray, max_gap_samples: int = 2) -> np.ndarray:
     if len(edges) == 0:
         return edges
@@ -720,8 +1002,94 @@ def _exact_raw_pair_candidates(tsv_record: Dict[str, Any], c3d_record: Dict[str,
     return out
 
 
-def _load_c3d_cop_channel(path: Path, channel_name: str) -> Tuple[np.ndarray, np.ndarray]:
+def _normalize_global_pair_specs(specs: Optional[Sequence[Dict[str, Any]]]) -> List[Dict[str, str]]:
+    out: List[Dict[str, str]] = []
+    for spec in specs or []:
+        kind = str((spec or {}).get("kind") or "").strip().lower()
+        if kind != "raw":
+            continue
+        tsv_channel = str((spec or {}).get("tsv_channel") or "").strip()
+        c3d_channel = str((spec or {}).get("c3d_channel") or "").strip()
+        c3d_kind = str((spec or {}).get("c3d_kind") or "analog").strip().lower() or "analog"
+        if not tsv_channel or not c3d_channel:
+            continue
+        out.append(
+            {
+                "kind": "raw",
+                "tsv_channel": tsv_channel,
+                "c3d_channel": c3d_channel,
+                "c3d_kind": c3d_kind,
+                "label_match": str((spec or {}).get("label_match") or "preferred_global"),
+            }
+        )
+    return out
+
+
+def _preferred_raw_pair_candidates(
+    tsv_record: Dict[str, Any],
+    c3d_record: Dict[str, Any],
+    preferred_pairs: Optional[Sequence[Dict[str, Any]]],
+) -> List[Dict[str, str]]:
+    tsv_names = {str(name) for name in (tsv_record.get("channel_names") or [])}
+    c3d_analog = {str(name) for name in (c3d_record.get("channel_names") or [])}
+    c3d_points = {str(name) for name in (c3d_record.get("point_channel_names") or [])}
+    out: List[Dict[str, str]] = []
+    seen: set[Tuple[str, str, str]] = set()
+    for spec in _normalize_global_pair_specs(preferred_pairs):
+        if spec["tsv_channel"] not in tsv_names:
+            continue
+        if spec["c3d_kind"] == "analog" and spec["c3d_channel"] not in c3d_analog:
+            continue
+        if spec["c3d_kind"] == "point":
+            base = str(spec["c3d_channel"]).split(".", 1)[0]
+            if base not in c3d_points:
+                continue
+        key = (spec["tsv_channel"], spec["c3d_channel"], spec["c3d_kind"])
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(dict(spec))
+    return out
+
+
+def _available_global_pair_options(folder: Path) -> List[Dict[str, Any]]:
+    folder = Path(folder)
+    c3d_paths = _iter_source_files(folder, ".c3d", excluded_dir_names=("matched", "accepted", "__pycache__", ".git"))
+    tsv_paths = _iter_source_files(folder, ".tsv", excluded_dir_names=("matched", "accepted", "__pycache__", ".git"))
+    if not c3d_paths or not tsv_paths:
+        return [{"label": "Auto detect exact raw/sync pairs", "kind": "auto"}]
+    try:
+        c3d_record = _extract_c3d_record(c3d_paths[0]).to_json()
+        tsv_record = _extract_tsv_record(tsv_paths[0]).to_json()
+    except Exception:
+        return [{"label": "Auto detect exact raw/sync pairs", "kind": "auto"}]
+    options: List[Dict[str, Any]] = [{"label": "Auto detect exact raw/sync pairs", "kind": "auto"}]
+    if c3d_record.get("sync_present") and c3d_record.get("sync_channel") and tsv_record.get("sync_present") and tsv_record.get("sync_channel"):
+        options.append(
+            {
+                "label": f"Shared sync: {c3d_record.get('sync_channel')} <-> {tsv_record.get('sync_channel')}",
+                "kind": "sync",
+            }
+        )
+    for pair in _exact_raw_pair_candidates(tsv_record, c3d_record):
+        label = f"Raw: {pair['c3d_channel']} <-> {pair['tsv_channel']}"
+        options.append({**pair, "kind": "raw", "label": label})
+    return options
+
+
+@lru_cache(maxsize=128)
+def _c3d_forceplat_metadata(path: Path) -> Dict[str, Any]:
     c3d = ezc3d.c3d(str(path), extract_forceplat_data=True)
+    return {
+        "c3d": c3d,
+        "analog_time": _analog_time_from_c3d(c3d),
+    }
+
+
+@lru_cache(maxsize=256)
+def _load_c3d_cop_channel(path: Path, channel_name: str) -> Tuple[np.ndarray, np.ndarray]:
+    meta = _c3d_forceplat_metadata(path)
+    c3d = meta["c3d"]
     platforms = c3d["data"].get("platform", [])
     if not platforms:
         raise ValueError("No force-platform data found in C3D file.")
@@ -733,7 +1101,7 @@ def _load_c3d_cop_channel(path: Path, channel_name: str) -> Tuple[np.ndarray, np
     if idx is None or idx >= cop.shape[0]:
         raise ValueError(f"Unsupported C3D CoP channel: {channel_name}")
     scale = _unit_scale_to_meters(platform.get("unit_position", "m"))
-    return _analog_time_from_c3d(c3d), np.asarray(cop[idx], dtype=float) * scale
+    return np.asarray(meta["analog_time"], dtype=float), np.asarray(cop[idx], dtype=float) * scale
 
 
 def _load_c3d_series(path: Path, kind: str, channel_name: str) -> Tuple[np.ndarray, np.ndarray]:
@@ -871,8 +1239,21 @@ def _effective_raw_quality(raw_result: Dict[str, Any], edge_align: Optional[Dict
     return quality
 
 
-def _best_tsv_raw_alignment(tsv_record: Dict[str, Any], c3d_record: Dict[str, Any]) -> Dict[str, Any]:
-    pairs = _exact_raw_pair_candidates(tsv_record, c3d_record)
+def _best_tsv_raw_alignment(
+    tsv_record: Dict[str, Any],
+    c3d_record: Dict[str, Any],
+    preferred_pairs: Optional[Sequence[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    pairs = _preferred_raw_pair_candidates(tsv_record, c3d_record, preferred_pairs) + _exact_raw_pair_candidates(tsv_record, c3d_record)
+    dedup: List[Dict[str, str]] = []
+    seen_pairs: set[Tuple[str, str, str]] = set()
+    for pair in pairs:
+        key = (str(pair.get("tsv_channel") or ""), str(pair.get("c3d_channel") or ""), str(pair.get("c3d_kind") or "analog"))
+        if key in seen_pairs:
+            continue
+        seen_pairs.add(key)
+        dedup.append(pair)
+    pairs = dedup
     if not pairs:
         return {
             "quality": "missing",
@@ -897,10 +1278,10 @@ def _best_tsv_raw_alignment(tsv_record: Dict[str, Any], c3d_record: Dict[str, An
             np.asarray(y_c3d, dtype=float),
             np.asarray(t_tsv, dtype=float),
             np.asarray(y_tsv, dtype=float),
-            max_shift_sec=8.0,
-            coarse_step_sec=0.01,
-            fine_window_sec=0.35,
-            fine_step_sec=0.001,
+            max_shift_sec=2.0,
+            coarse_step_sec=0.05,
+            fine_window_sec=0.05,
+            fine_step_sec=0.005,
         )
         corr = result.get("corr")
         shift_sec = result.get("shift_sec")
@@ -918,7 +1299,17 @@ def _best_tsv_raw_alignment(tsv_record: Dict[str, Any], c3d_record: Dict[str, An
             "label_match": pair["label_match"],
             "samples": int(result.get("samples") or 0),
         }
-        if best is None or abs_corr > abs(float(best["corr"])):
+        cur_key = (
+            0 if str(pair.get("label_match") or "").startswith("preferred") else 1,
+            -abs_corr,
+            abs(float(shift_sec)),
+        )
+        best_key = (
+            0 if best and str(best.get("label_match") or "").startswith("preferred") else 1,
+            -abs(float(best["corr"])) if best and best.get("corr") is not None else float("inf"),
+            abs(float(best.get("lag_sec") or 0.0)) if best else float("inf"),
+        )
+        if best is None or cur_key < best_key:
             best = candidate
     if best is None:
         return {
@@ -995,6 +1386,144 @@ def _sync_overlay_summary(match: Dict[str, Any]) -> str:
     if tsv_sync_missing:
         metrics += f" otb4/c3d={alignment.get('dedicated_sync_pair_quality') or 'n/a'}"
     return " | ".join(["Sync overlay", metrics] + parts)
+
+
+def _otb4_probe_sync_diagnostics(match: Dict[str, Any]) -> Dict[str, Any]:
+    record = match.get("otb4") or {}
+    diag = dict(record.get("probe_sync_diagnostics") or {})
+    if diag:
+        return diag
+    path = str(record.get("path") or "")
+    if not path:
+        return {}
+    configured_step_ms = _sync_decrement_ms_from_match(match)
+    configured_step_sec = float(configured_step_ms) / 1000.0 if configured_step_ms not in (None, "") else None
+    cache_key = _otb4_probe_diag_cache_key(path, configured_step_sec)
+    cached = _OTB4_PROBE_DIAG_CACHE.get(cache_key)
+    if cached:
+        record["probe_sync_diagnostics"] = dict(cached)
+        return dict(cached)
+    try:
+        computed = _extract_otb4_probe_sync_diagnostics(
+            Path(path),
+            default_step_sec=configured_step_sec,
+            candidate_step_secs=[configured_step_sec] if configured_step_sec else None,
+        )
+    except Exception:
+        computed = {}
+    if computed:
+        _OTB4_PROBE_DIAG_CACHE[cache_key] = dict(computed)
+        record["probe_sync_diagnostics"] = dict(computed)
+        return dict(computed)
+    return {}
+
+
+def _otb4_probe_sync_summary_text(match: Dict[str, Any]) -> str:
+    diag = _otb4_probe_sync_diagnostics(match)
+    probes = list(diag.get("probes") or [])
+    if not probes:
+        return "OTB4 probe sync: unavailable"
+    ref_source = str(diag.get("reference_source") or "control")
+    ref_expected = int((diag.get("reference_pattern") or {}).get("expected_event_count") or 0)
+    synced = int(diag.get("synced_probe_count") or 0)
+    total = len(probes)
+    non_sync = [probe for probe in probes if probe.get("non_sync")]
+    repairable = sum(1 for probe in non_sync if "repairable from ramp" in str(probe.get("sample_status") or ""))
+    bits = [
+        f"OTB4 probe sync: ref={ref_source} expected={ref_expected}",
+        f"synced={synced}/{total}",
+        f"non-sync={len(non_sync)}",
+    ]
+    pulse_info = (diag.get("aux2_pulse_duration_info") or {}) if ref_source == "aux2" else (diag.get("control_pulse_duration_info") or {})
+    if pulse_info:
+        if pulse_info.get("confirmed"):
+            bits.append("TTL=1.0 ms confirmed")
+        else:
+            candidates = pulse_info.get("candidate_durations_ms") or []
+            if candidates:
+                bits.append("TTL~" + "/".join(f"{float(v):g} ms" for v in candidates))
+    configured_pulse_ms = _sync_pulse_duration_ms_from_match(match, diag=diag)
+    if configured_pulse_ms is not None:
+        bits.append(f"cfg={configured_pulse_ms:g} ms")
+    configured_step_ms = _sync_decrement_ms_from_match(match)
+    if configured_step_ms is not None:
+        bits.append(f"step={configured_step_ms:g} ms")
+    bits.append(f"mark tol={_sync_pattern_match_tolerance_sec(match, diag=diag) * 1000.0:.1f} ms")
+    if repairable:
+        bits.append(f"repairable={repairable}")
+    if non_sync:
+        detail = []
+        for probe in non_sync[:3]:
+            ref_summary = probe.get("reference_summary") or {}
+            detail.append(
+                f"{probe.get('device')} {int(ref_summary.get('matched_count') or 0)}/{ref_expected}"
+            )
+        bits.append("off-pattern=" + ", ".join(detail))
+    return " | ".join(bits)
+
+
+def _otb4_probe_sync_annotation_text(match: Dict[str, Any]) -> str:
+    diag = _otb4_probe_sync_diagnostics(match)
+    probes = list(diag.get("probes") or [])
+    if not probes:
+        return "OTB4 peripheral probe sync unavailable."
+    lines = [_otb4_probe_sync_summary_text(match)]
+    for label, info in (("control TTL", diag.get("control_pulse_duration_info") or {}), ("AUX2 TTL", diag.get("aux2_pulse_duration_info") or {})):
+        if not info:
+            continue
+        if info.get("confirmed"):
+            lines.append(f"{label}: 1.0 ms confirmed from sampled pulse width.")
+        else:
+            candidates = info.get("candidate_durations_ms") or []
+            if candidates:
+                lines.append(
+                    f"{label}: sampled width={float(info.get('observed_width_ms_mode') or 0.0):.3f} ms, "
+                    f"candidate configured durations={', '.join(f'{float(v):g} ms' for v in candidates)} | {info.get('reason')}"
+                )
+    ref_note = str((diag.get("reference_pattern") or {}).get("note") or "").strip()
+    if ref_note:
+        lines.append(f"Reference pattern: {ref_note}")
+    for probe in probes:
+        if not probe.get("non_sync"):
+            continue
+        ref_summary = probe.get("reference_summary") or {}
+        lines.append(
+            f"{probe.get('device')}: {probe.get('sync_status')} | aligned={int(ref_summary.get('matched_count') or 0)}/{int((diag.get('reference_pattern') or {}).get('expected_event_count') or 0)} | "
+            f"missing={int(ref_summary.get('unmatched_ref') or 0)} | extra={int(ref_summary.get('unmatched_other') or 0)} | "
+            f"shift={float(probe.get('optimal_lag_sec') or 0.0) * 1000.0:.1f} ms | {probe.get('sample_status')}"
+        )
+    return "\n".join(lines)
+
+
+def _expected_sync_markers(match: Dict[str, Any], device: Optional[str] = None, tolerance_sec: Optional[float] = None) -> List[Dict[str, Any]]:
+    diag = _otb4_probe_sync_diagnostics(match)
+    match_tolerance_sec = float(tolerance_sec if tolerance_sec is not None else _sync_pattern_match_tolerance_sec(match, diag=diag))
+    expected = np.asarray(diag.get("expected_times_sec") or [], dtype=float)
+    if expected.size == 0:
+        return []
+    if device:
+        probe = next((item for item in (diag.get("probes") or []) if str(item.get("device") or "") == str(device)), None)
+        observed = np.asarray((((probe or {}).get("shifted_event_times_sec")) or ((probe or {}).get("event_times_sec")) or []), dtype=float)
+        markers: List[Dict[str, Any]] = []
+        for event_sec in expected:
+            status = "confirmed" if observed.size and np.any(np.abs(observed - float(event_sec)) <= match_tolerance_sec) else "missing"
+            markers.append({"time_sec": float(event_sec), "status": status})
+        return markers
+
+    control_obs = np.asarray(diag.get("control_observed_times_sec") or [], dtype=float)
+    aux2_obs = np.asarray(diag.get("aux2_observed_times_sec") or [], dtype=float)
+    markers = []
+    for event_sec in expected:
+        ctrl_ok = bool(control_obs.size and np.any(np.abs(control_obs - float(event_sec)) <= match_tolerance_sec))
+        aux_ok = bool(aux2_obs.size and np.any(np.abs(aux2_obs - float(event_sec)) <= match_tolerance_sec))
+        if ctrl_ok and (not aux2_obs.size or aux_ok):
+            status = "confirmed"
+        elif ctrl_ok or aux_ok:
+            status = "partial"
+        else:
+            status = "missing"
+        markers.append({"time_sec": float(event_sec), "status": status})
+    return markers
 
 
 def _triplet_spike_agreement(records: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
@@ -1348,6 +1877,467 @@ def _dedicated_sync_agreement(match: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _detect_buffer_events_abs(values: np.ndarray, sample_rate: float) -> np.ndarray:
+    x = np.abs(np.asarray(values, dtype=float).reshape(-1))
+    if x.size == 0:
+        return np.asarray([], dtype=int)
+    x = np.nan_to_num(x, nan=0.0)
+    q99 = float(np.nanpercentile(x, 99.0))
+    max_abs = float(np.nanmax(x))
+    if not np.isfinite(max_abs) or max_abs <= 0.0:
+        return np.asarray([], dtype=int)
+    if max_abs <= q99 * 4.0:
+        return np.asarray([], dtype=int)
+    threshold = max(max_abs * 0.5, float(np.nanpercentile(x, 99.99)))
+    candidates = np.flatnonzero(x >= threshold)
+    if candidates.size == 0:
+        return np.asarray([], dtype=int)
+    min_gap = max(1, int(round(float(sample_rate or 2000.0) * 0.15)))
+    kept: List[int] = [int(candidates[0])]
+    for idx in candidates[1:]:
+        if int(idx) - kept[-1] >= min_gap:
+            kept.append(int(idx))
+    return np.asarray(kept, dtype=int)
+
+
+def _schedule_interval_sec(start_interval_sec: float, step_sec: float, idx: int, min_interval_sec: float) -> float:
+    start = float(start_interval_sec)
+    step = float(step_sec)
+    minimum = float(min_interval_sec)
+    if step <= 0.0 or start <= minimum:
+        return max(minimum, start)
+    cycle_len = max(1, int(round((start - minimum) / step)) + 1)
+    phase = int(idx) % cycle_len
+    return max(minimum, start - step * float(phase))
+
+
+def _schedule_gap_sec(start_interval_sec: float, step_sec: float, start_idx: int, span: int, min_interval_sec: float) -> float:
+    return float(sum(_schedule_interval_sec(start_interval_sec, step_sec, start_idx + offset, min_interval_sec) for offset in range(int(span))))
+
+
+def _extend_expected_times_cyclic(
+    expected_times_sec: Sequence[float],
+    *,
+    start_interval_sec: Optional[float],
+    start_phase_index: Optional[int],
+    step_sec: Optional[float],
+    min_interval_sec: float,
+    target_start_sec: Optional[float] = None,
+    target_end_sec: Optional[float] = None,
+) -> List[float]:
+    expected = [float(v) for v in expected_times_sec]
+    if not expected:
+        return expected
+    if not isinstance(start_interval_sec, (int, float)) or not isinstance(start_phase_index, int) or not isinstance(step_sec, (int, float)):
+        return expected
+    start_interval = float(start_interval_sec)
+    step = float(step_sec)
+    phase0 = int(start_phase_index)
+    slack_sec = max(0.2, 2.0 * abs(step))
+    intervals_used = max(0, len(expected) - 1)
+    next_idx = phase0 + intervals_used
+    while target_end_sec is not None:
+        next_time = float(expected[-1]) + _schedule_interval_sec(start_interval, step, next_idx, min_interval_sec)
+        if next_time > float(target_end_sec) + slack_sec:
+            break
+        expected.append(next_time)
+        next_idx += 1
+    prev_idx = phase0 - 1
+    while target_start_sec is not None and prev_idx >= 0:
+        prev_time = float(expected[0]) - _schedule_interval_sec(start_interval, step, prev_idx, min_interval_sec)
+        if prev_time < float(target_start_sec) - slack_sec:
+            break
+        expected.insert(0, prev_time)
+        prev_idx -= 1
+    return expected
+
+
+def _fit_descending_sync_pattern(
+    event_times_sec: Sequence[float],
+    *,
+    default_step_sec: float = 0.10,
+    candidate_step_secs: Optional[Sequence[float]] = None,
+    min_interval_sec: float = 3.0,
+    max_missing_between: int = 4,
+    cycle_start_sec: float = 5.0,
+) -> Dict[str, Any]:
+    observed = np.asarray(event_times_sec, dtype=float).reshape(-1)
+    if observed.size == 0:
+        return {
+            "observed_event_count": 0,
+            "expected_event_count": 0,
+            "expected_times_sec": [],
+            "start_interval_sec": None,
+            "start_phase_index": None,
+            "step_sec": None,
+            "gap_mae_ms": None,
+            "max_gap_error_ms": None,
+            "inserted_missing_events": 0,
+            "pattern_observed": False,
+            "note": "no spikes detected",
+        }
+    if observed.size == 1:
+        return {
+            "observed_event_count": 1,
+            "expected_event_count": 1,
+            "expected_times_sec": [float(observed[0])],
+            "start_interval_sec": None,
+            "start_phase_index": None,
+            "step_sec": None,
+            "gap_mae_ms": None,
+            "max_gap_error_ms": None,
+            "inserted_missing_events": 0,
+            "pattern_observed": False,
+            "note": "single spike only",
+        }
+
+    gaps = np.diff(observed)
+    start_interval_sec = float(cycle_start_sec)
+    step_candidates = [float(v) for v in (candidate_step_secs or (0.05, float(default_step_sec))) if float(v) > 0.0]
+    if not step_candidates:
+        step_candidates = [float(default_step_sec or 0.10)]
+    step_candidates = sorted({round(v, 6) for v in step_candidates})
+    best: Optional[Tuple[Tuple[float, float, int, int, float], float, int, List[int], List[float]]] = None
+    for step_sec in step_candidates:
+        max_phase_idx = max(0, int(round(max(0.0, start_interval_sec - float(min_interval_sec)) / float(step_sec or 0.10))))
+        for start_phase_idx in range(0, max_phase_idx + 1):
+            gap_errors = []
+            missing_between = []
+            schedule_idx = int(start_phase_idx)
+            for gap_sec in gaps:
+                best_local: Optional[Tuple[float, int]] = None
+                for missing_count in range(0, max_missing_between + 1):
+                    predicted_gap_sec = _schedule_gap_sec(
+                        start_interval_sec,
+                        step_sec,
+                        schedule_idx,
+                        missing_count + 1,
+                        min_interval_sec,
+                    )
+                    cost = abs(predicted_gap_sec - float(gap_sec))
+                    cand = (cost, missing_count)
+                    if best_local is None or cand < best_local:
+                        best_local = cand
+                assert best_local is not None
+                gap_errors.append(float(best_local[0]))
+                missing_between.append(int(best_local[1]))
+                schedule_idx += int(best_local[1]) + 1
+            score = (
+                float(np.mean(gap_errors) * 1000.0),
+                float(np.max(gap_errors) * 1000.0),
+                int(sum(missing_between)),
+                int(start_phase_idx),
+                abs(float(step_sec) - float(default_step_sec)),
+            )
+            if best is None or score < best[0]:
+                best = (score, float(step_sec), int(start_phase_idx), missing_between, gap_errors)
+
+    assert best is not None
+    score, step_sec, start_phase_idx, missing_between, gap_errors = best
+    expected_times: List[float] = [float(observed[0])]
+    schedule_idx = int(start_phase_idx)
+    current_time = float(observed[0])
+    for missing_count in missing_between:
+        for _ in range(int(missing_count) + 1):
+            current_time += _schedule_interval_sec(start_interval_sec, step_sec, schedule_idx, min_interval_sec)
+            expected_times.append(float(current_time))
+            schedule_idx += 1
+    pattern_observed = bool(score[0] <= 80.0 and score[1] <= 160.0)
+    return {
+        "observed_event_count": int(observed.size),
+        "expected_event_count": len(expected_times),
+        "expected_times_sec": [float(v) for v in expected_times],
+        "start_interval_sec": float(start_interval_sec),
+        "start_phase_index": int(start_phase_idx),
+        "step_sec": float(step_sec),
+        "gap_mae_ms": float(score[0]),
+        "max_gap_error_ms": float(score[1]),
+        "inserted_missing_events": int(sum(missing_between)),
+        "pattern_observed": pattern_observed,
+        "note": (
+            f"fixed cyclic 5.00->3.00 s pattern observed (step {int(round(step_sec * 1000.0))} ms, phase {int(start_phase_idx)})"
+            if pattern_observed
+            else f"fixed cyclic 5.00->3.00 s pattern not cleanly observed (step {int(round(step_sec * 1000.0))} ms, gap MAE {score[0]:.1f} ms, phase {int(start_phase_idx)})"
+        ),
+    }
+
+
+def _expected_times_from_pattern_window(
+    pattern: Optional[Dict[str, Any]],
+    fallback_times_sec: Sequence[float],
+    *,
+    target_start_sec: Optional[float] = None,
+    target_end_sec: Optional[float] = None,
+) -> np.ndarray:
+    if not pattern:
+        return np.asarray(fallback_times_sec, dtype=float).reshape(-1)
+    expected = _extend_expected_times_cyclic(
+        pattern.get("expected_times_sec") or [],
+        start_interval_sec=pattern.get("start_interval_sec"),
+        start_phase_index=pattern.get("start_phase_index"),
+        step_sec=pattern.get("step_sec"),
+        min_interval_sec=3.0,
+        target_start_sec=target_start_sec,
+        target_end_sec=target_end_sec,
+    )
+    if expected:
+        return np.asarray(expected, dtype=float)
+    return np.asarray(fallback_times_sec, dtype=float).reshape(-1)
+
+
+def _event_alignment_summary(
+    other_times_sec: Sequence[float],
+    ref_times_sec: Sequence[float],
+    tolerance_sec: float = 0.15,
+    *,
+    trace_start_sec: Optional[float] = None,
+    trace_end_sec: Optional[float] = None,
+    edge_guard_sec: Optional[float] = None,
+) -> Dict[str, Any]:
+    other = np.asarray(other_times_sec, dtype=float).reshape(-1)
+    ref = np.asarray(ref_times_sec, dtype=float).reshape(-1)
+    if other.size == 0 or ref.size == 0:
+        return {
+            "matched_count": 0,
+            "unmatched_other": int(other.size),
+            "unmatched_ref": int(ref.size),
+            "offset_sec": None,
+            "mean_lag_ms": None,
+            "mean_abs_residual_ms": None,
+        }
+    candidates = np.unique(np.round(np.append(0.0, (other[:, None] - ref[None, :]).reshape(-1)), 6))
+    best_score: Optional[Tuple[int, float, float]] = None
+    best_offset: Optional[float] = None
+    best_lags_ms: List[float] = []
+    best_abs_residual_ms: List[float] = []
+    best_unmatched_other = int(other.size)
+    best_unmatched_ref = int(ref.size)
+    guard_sec = float(edge_guard_sec if edge_guard_sec is not None else max(0.02, tolerance_sec))
+    for offset in candidates:
+        shifted = other - float(offset)
+        effective_ref = ref
+        if trace_start_sec is not None and trace_end_sec is not None:
+            shifted_start = float(trace_start_sec) - float(offset)
+            shifted_end = float(trace_end_sec) - float(offset)
+            mask = (ref >= (shifted_start - guard_sec)) & (ref <= (shifted_end + guard_sec))
+            effective_ref = ref[mask]
+            if effective_ref.size == 0:
+                continue
+        i = 0
+        j = 0
+        lags_ms: List[float] = []
+        abs_residual_ms: List[float] = []
+        while i < other.size and j < effective_ref.size:
+            delta = float(shifted[i] - effective_ref[j])
+            if abs(delta) <= tolerance_sec:
+                raw_lag_sec = float(other[i] - effective_ref[j])
+                lags_ms.append(raw_lag_sec * 1000.0)
+                abs_residual_ms.append(abs(delta) * 1000.0)
+                i += 1
+                j += 1
+                continue
+            if delta < -tolerance_sec:
+                i += 1
+            else:
+                j += 1
+        unmatched_other = int(other.size - len(lags_ms))
+        unmatched_ref = int(effective_ref.size - len(lags_ms))
+        score = (len(lags_ms), -unmatched_ref, -unmatched_other, -float(sum(abs_residual_ms)), -abs(float(offset)))
+        if best_score is None or score > best_score:
+            best_score = score
+            best_offset = float(offset)
+            best_lags_ms = lags_ms
+            best_abs_residual_ms = abs_residual_ms
+            best_unmatched_other = unmatched_other
+            best_unmatched_ref = unmatched_ref
+    return {
+        "matched_count": len(best_lags_ms),
+        "unmatched_other": best_unmatched_other,
+        "unmatched_ref": best_unmatched_ref,
+        "offset_sec": best_offset,
+        "mean_lag_ms": float(np.mean(best_lags_ms)) if best_lags_ms else None,
+        "mean_abs_residual_ms": float(np.mean(best_abs_residual_ms)) if best_abs_residual_ms else None,
+    }
+
+
+def _otb4_pattern_quality_key(pattern: Optional[Dict[str, Any]], label: str) -> Tuple[int, float, float, int, int]:
+    if not pattern:
+        return (1, float("inf"), float("inf"), 1, 1)
+    return (
+        0 if bool(pattern.get("pattern_observed")) else 1,
+        float(pattern.get("gap_mae_ms") if pattern.get("gap_mae_ms") is not None else float("inf")),
+        float(pattern.get("max_gap_error_ms") if pattern.get("max_gap_error_ms") is not None else float("inf")),
+        -int(pattern.get("expected_event_count") or 0),
+        0 if label == "control" else 1,
+    )
+
+
+def _otb4_sync_status_from_alignment(summary: Dict[str, Any]) -> str:
+    if int(summary.get("matched_count") or 0) <= 0:
+        return "non-sync"
+    if int(summary.get("unmatched_ref") or 0) == 0 and int(summary.get("unmatched_other") or 0) == 0 and float(summary.get("mean_abs_residual_ms") or 0.0) <= 25.0:
+        return "synced"
+    if int(summary.get("unmatched_ref") or 0) <= 1 and int(summary.get("unmatched_other") or 0) == 0:
+        return "deviating"
+    return "non-sync"
+
+
+def _extract_otb4_probe_sync_diagnostics(
+    path: Path,
+    *,
+    default_step_sec: Optional[float] = None,
+    candidate_step_secs: Optional[Sequence[float]] = None,
+) -> Dict[str, Any]:
+    tracks = _load_otb4_track_data(path)
+    control_buffer: Optional[Dict[str, Any]] = None
+    aux2_trace: Optional[Dict[str, Any]] = None
+    control_pulse_info: Optional[Dict[str, Any]] = None
+    aux2_pulse_info: Optional[Dict[str, Any]] = None
+    probe_buffers: Dict[str, Dict[str, Any]] = {}
+    probe_ramps: Dict[str, Dict[str, Any]] = {}
+    for _offset, track, raw_arr in tracks:
+        if int(track.get("NumberOfChannels", 0) or 0) != 1:
+            continue
+        device = str(track.get("Device", "")).strip()
+        subtitle = str(track.get("SubTitle", "")).strip()
+        raw = np.asarray(raw_arr[0], dtype=float).reshape(-1)
+        is_ramp = _is_counter_track(track, raw)
+        fs = float(track.get("SamplingFrequency") or 0.0)
+        t = np.arange(raw.size, dtype=float) / fs if fs > 0 else np.arange(raw.size, dtype=float)
+        converted = raw * float(_track_conversion_factor(track))
+        payload = {
+            "device": device,
+            "subtitle": subtitle,
+            "sample_rate": fs,
+            "time_sec": t.tolist(),
+            "values": converted.tolist(),
+            "raw_values": raw.tolist(),
+        }
+        if device == "Syncstation" and bool(track.get("IsControl")) and not subtitle and not is_ramp:
+            events = _detect_buffer_events_abs(raw, fs)
+            payload["event_indices"] = events.tolist()
+            payload["event_times_sec"] = [float(v) for v in t[events]]
+            control_buffer = payload
+            control_pulse_info = _infer_pulse_duration_ms(raw, fs)
+        elif device == "Syncstation" and subtitle == "AUX 2":
+            events = _detect_buffer_events_abs(raw, fs)
+            payload["event_indices"] = events.tolist()
+            payload["event_times_sec"] = [float(v) for v in t[events]]
+            aux2_trace = payload
+            aux2_pulse_info = _infer_pulse_duration_ms(raw, fs)
+        elif device != "Syncstation" and subtitle == "Buffer" and bool(track.get("IsControl")):
+            events = _detect_buffer_events_abs(raw, fs)
+            payload["event_indices"] = events.tolist()
+            payload["event_times_sec"] = [float(v) for v in t[events]]
+            probe_buffers[device] = payload
+        elif device != "Syncstation" and (subtitle == "Ramp" or is_ramp):
+            holes = _find_holes_and_jumpbacks(_to_ascending_ramp(raw))
+            zones = _find_discrepancy_zones(holes["cleaned_ramp"])
+            payload["ramp_zones"] = [{"start_index": int(start), "hole_samples": int(length)} for start, length in zones if int(length) > 0]
+            payload["ramp_samples_added"] = int(sum(int(length) for _start, length in zones if int(length) > 0))
+            probe_ramps[device] = payload
+
+    fit_default_step_sec = float(default_step_sec) if default_step_sec not in (None, "") else 0.10
+    fit_candidate_step_secs = [float(v) for v in (candidate_step_secs or []) if v not in (None, "")]
+    fit_candidate_step_secs = fit_candidate_step_secs or None
+    control_pattern = _fit_descending_sync_pattern(
+        ((control_buffer or {}).get("event_times_sec") or []),
+        default_step_sec=fit_default_step_sec,
+        candidate_step_secs=fit_candidate_step_secs,
+    )
+    aux2_pattern = _fit_descending_sync_pattern(
+        ((aux2_trace or {}).get("event_times_sec") or []),
+        default_step_sec=fit_default_step_sec,
+        candidate_step_secs=fit_candidate_step_secs,
+    )
+    reference_source, reference_pattern = min(
+        [("control", control_pattern), ("aux2", aux2_pattern)],
+        key=lambda item: _otb4_pattern_quality_key(item[1], item[0]),
+    )
+    window_start = None
+    window_end = None
+    observed_sets = []
+    for payload in (control_buffer, aux2_trace):
+        arr = np.asarray((payload or {}).get("event_times_sec") or [], dtype=float)
+        if arr.size:
+            observed_sets.append(arr)
+    if observed_sets:
+        window_start = float(min(arr[0] for arr in observed_sets))
+        window_end = float(max(arr[-1] for arr in observed_sets))
+    reference_expected = _expected_times_from_pattern_window(reference_pattern, (control_buffer or {}).get("event_times_sec") or [], target_start_sec=window_start, target_end_sec=window_end)
+    control_expected = _expected_times_from_pattern_window(control_pattern, (control_buffer or {}).get("event_times_sec") or [], target_start_sec=window_start, target_end_sec=window_end)
+    aux2_expected = _expected_times_from_pattern_window(aux2_pattern, (aux2_trace or {}).get("event_times_sec") or [], target_start_sec=window_start, target_end_sec=window_end)
+
+    probes: List[Dict[str, Any]] = []
+    for device in sorted(probe_buffers):
+        buf = probe_buffers[device]
+        ramp = probe_ramps.get(device)
+        event_times = np.asarray(buf.get("event_times_sec") or [], dtype=float)
+        probe_pattern = _fit_descending_sync_pattern(
+            event_times.tolist(),
+            default_step_sec=fit_default_step_sec,
+            candidate_step_secs=fit_candidate_step_secs,
+        )
+        trace_time = np.asarray(buf.get("time_sec") or [], dtype=float)
+        trace_start = float(trace_time[0]) if trace_time.size else None
+        trace_end = float(trace_time[-1]) if trace_time.size else None
+        ref_summary = _event_alignment_summary(event_times, reference_expected, trace_start_sec=trace_start, trace_end_sec=trace_end)
+        control_summary = _event_alignment_summary(event_times, control_expected, trace_start_sec=trace_start, trace_end_sec=trace_end)
+        aux2_summary = _event_alignment_summary(event_times, aux2_expected, trace_start_sec=trace_start, trace_end_sec=trace_end)
+        optimal_lag_sec = ref_summary.get("offset_sec")
+        shifted_event_times = (event_times - float(optimal_lag_sec or 0.0)).tolist()
+        ramp_samples_added = int((ramp or {}).get("ramp_samples_added") or 0)
+        ramp_zone_count = len((ramp or {}).get("ramp_zones") or [])
+        sample_status = (
+            f"repairable from ramp (+{ramp_samples_added} samples across {ramp_zone_count} zone(s))"
+            if ramp_samples_added > 0
+            else "all samples present (ramp clean)"
+        )
+        sync_status = _otb4_sync_status_from_alignment(ref_summary)
+        probes.append(
+            {
+                "device": device,
+                "buffer_channel": f"{device} Buffer",
+                "ramp_channel": f"{device} Ramp",
+                "event_count": int(event_times.size),
+                "event_times_sec": [float(v) for v in event_times.tolist()],
+                "shifted_event_times_sec": [float(v) for v in shifted_event_times],
+                "optimal_lag_sec": float(optimal_lag_sec or 0.0),
+                "sync_status": sync_status,
+                "sample_status": sample_status,
+                "pattern_observed_in_probe_spikes": bool(probe_pattern.get("pattern_observed")),
+                "probe_pattern_note": str(probe_pattern.get("note") or ""),
+                "reference_summary": ref_summary,
+                "control_summary": control_summary,
+                "aux2_summary": aux2_summary,
+                "ramp_zone_count": ramp_zone_count,
+                "ramp_samples_added": ramp_samples_added,
+                "non_sync": sync_status != "synced",
+            }
+        )
+
+    return {
+        "reference_source": reference_source,
+        "reference_pattern": reference_pattern,
+        "control_pattern": control_pattern,
+        "aux2_pattern": aux2_pattern,
+        "control_observed_event_count": int(len((control_buffer or {}).get("event_times_sec") or [])),
+        "control_observed_times_sec": [float(v) for v in ((control_buffer or {}).get("event_times_sec") or [])],
+        "control_expected_event_count": int(control_pattern.get("expected_event_count") or 0),
+        "aux2_observed_event_count": int(len((aux2_trace or {}).get("event_times_sec") or [])),
+        "aux2_observed_times_sec": [float(v) for v in ((aux2_trace or {}).get("event_times_sec") or [])],
+        "aux2_expected_event_count": int(aux2_pattern.get("expected_event_count") or 0),
+        "expected_times_sec": [float(v) for v in reference_expected.tolist()],
+        "configured_step_sec": float(fit_default_step_sec) if default_step_sec not in (None, "") else None,
+        "candidate_step_secs": [float(v) for v in (fit_candidate_step_secs or [])],
+        "control_pulse_duration_info": control_pulse_info or {},
+        "aux2_pulse_duration_info": aux2_pulse_info or {},
+        "probes": probes,
+        "synced_probe_count": sum(1 for probe in probes if probe.get("sync_status") == "synced"),
+        "non_sync_probe_count": sum(1 for probe in probes if probe.get("non_sync")),
+    }
+
+
 @dataclass
 class SyncRecord:
     path: str
@@ -1370,6 +2360,7 @@ class SyncRecord:
     duration_sec: Optional[float] = None
     channel_names: Optional[List[str]] = None
     point_channel_names: Optional[List[str]] = None
+    probe_sync_diagnostics: Optional[Dict[str, Any]] = None
 
     def to_json(self) -> Dict[str, Any]:
         return {
@@ -1393,22 +2384,16 @@ class SyncRecord:
             "duration_sec": self.duration_sec,
             "channel_names": self.channel_names or [],
             "point_channel_names": self.point_channel_names or [],
+            "probe_sync_diagnostics": self.probe_sync_diagnostics or {},
         }
 
 
-def _extract_otb4_record(path: Path) -> SyncRecord:
-    data, _time, descs, fs, _name, _size = load_otb4_file(str(path))
-    flat = []
-    for d in descs:
-        try:
-            flat.append(str(d[0][0]))
-        except Exception:
-            flat.append(str(d))
-
+def _extract_otb4_record(path: Path, *, include_probe_sync_diagnostics: bool = False) -> SyncRecord:
     ts = _parse_timestamp_from_name(path)
     notes: List[str] = []
+    probe_sync_diagnostics: Dict[str, Any] = {}
     try:
-        _t_aux, x_aux, aux_meta = _load_otb4_aux_channel(path, device=SYNC_OTB_DEVICE, subtitle=SYNC_OTB_SUBTITLE)
+        x_aux, aux_meta, flat = _read_otb4_scan_info(path)
     except Exception as exc:
         return SyncRecord(
             path=str(path),
@@ -1416,8 +2401,8 @@ def _extract_otb4_record(path: Path) -> SyncRecord:
             sync_channel=None,
             sync_present=False,
             sync_quality="missing",
-            sample_rate=float(fs),
-            sample_count=int(data.shape[1]),
+            sample_rate=None,
+            sample_count=0,
             threshold=None,
             edge_count=0,
             edge_times_sec=[],
@@ -1427,6 +2412,7 @@ def _extract_otb4_record(path: Path) -> SyncRecord:
             notes=[f"Unable to read {SYNC_OTB_DEVICE} {SYNC_OTB_SUBTITLE}: {exc}"],
             timestamp=ts.isoformat(sep=" ") if ts else None,
             channel_names=flat,
+            probe_sync_diagnostics=probe_sync_diagnostics,
         )
 
     x = np.asarray(x_aux, dtype=float).reshape(-1)
@@ -1445,6 +2431,28 @@ def _extract_otb4_record(path: Path) -> SyncRecord:
     notes.append("The generic OTB4 reader exposes duplicate control-style labels; those are ignored for sync extraction.")
     if len(peaks_sec) < 4:
         notes.append("Edge count is low; sync trace may be truncated or only partially visible.")
+    if include_probe_sync_diagnostics:
+        try:
+            probe_sync_diagnostics = _extract_otb4_probe_sync_diagnostics(path)
+            _OTB4_PROBE_DIAG_CACHE[_otb4_probe_diag_cache_key(str(path), None)] = dict(probe_sync_diagnostics)
+            non_sync = int(probe_sync_diagnostics.get("non_sync_probe_count") or 0)
+            total_probes = len(probe_sync_diagnostics.get("probes") or [])
+            ref_source = str(probe_sync_diagnostics.get("reference_source") or "control")
+            ref_expected = int((probe_sync_diagnostics.get("reference_pattern") or {}).get("expected_event_count") or 0)
+            notes.append(
+                f"Peripheral probe sync: reference={ref_source} expected={ref_expected} | synced={int(probe_sync_diagnostics.get('synced_probe_count') or 0)}/{total_probes} | non-sync={non_sync}."
+            )
+            repairable = [
+                str(probe.get("device") or "")
+                for probe in (probe_sync_diagnostics.get("probes") or [])
+                if str(probe.get("sync_status") or "") != "synced" and "repairable from ramp" in str(probe.get("sample_status") or "")
+            ]
+            if repairable:
+                notes.append(f"Non-sync but ramp-repairable probes: {', '.join(repairable)}.")
+        except Exception as exc:
+            notes.append(f"Peripheral probe sync diagnostics unavailable: {exc}")
+    else:
+        notes.append("Peripheral probe sync diagnostics deferred until review selection.")
     channel_names = [SYNC_OTB_LABEL] + [name for name in flat if name != SYNC_OTB_LABEL]
     return SyncRecord(
         path=str(path),
@@ -1463,27 +2471,18 @@ def _extract_otb4_record(path: Path) -> SyncRecord:
         notes=notes,
         timestamp=ts.isoformat(sep=" ") if ts else None,
         channel_names=channel_names,
+        probe_sync_diagnostics=probe_sync_diagnostics,
     )
 
 
 def _extract_c3d_record(path: Path) -> SyncRecord:
-    c3d = ezc3d.c3d(str(path), extract_forceplat_data=True)
+    c3d = ezc3d.c3d(str(path), extract_forceplat_data=False)
     labels = list(c3d["parameters"]["ANALOG"]["LABELS"]["value"])
     point_labels = list(c3d["parameters"].get("POINT", {}).get("LABELS", {}).get("value", []))
     if "LABELS2" in c3d["parameters"].get("POINT", {}):
         point_labels += list(c3d["parameters"]["POINT"]["LABELS2"]["value"])
     rate = float(c3d["parameters"]["ANALOG"]["RATE"]["value"][0])
-    platform_notes: List[str] = []
-    platforms = c3d["data"].get("platform", [])
-    if platforms:
-        cop = np.asarray(platforms[0].get("center_of_pressure"), dtype=float)
-        if cop.ndim == 2 and cop.shape[0] >= 2:
-            unit_pos = platforms[0].get("unit_position", "unknown")
-            platform_notes.append(f"C3D force-platform CoP available: copx/copy ({unit_pos}).")
-        else:
-            platform_notes.append("C3D force-platform present but CoP x/y unavailable.")
-    else:
-        platform_notes.append("No C3D force-platform data found.")
+    platform_notes: List[str] = ["C3D force-platform data is loaded on demand for raw alignment/export."]
     if SYNC_C3D_LABEL not in labels:
         ts = _parse_timestamp_from_name(path)
         return SyncRecord(
@@ -1542,6 +2541,7 @@ def _extract_c3d_record(path: Path) -> SyncRecord:
     )
 
 
+@lru_cache(maxsize=256)
 def _read_tsv_table(path: Path) -> Tuple[List[str], pd.DataFrame]:
     with open(path, "r", encoding="utf-8-sig", newline="") as f:
         header = f.readline()
@@ -1830,6 +2830,17 @@ def _apply_otb4_repairs(matches: List[Dict[str, Any]], log_lines: List[str]) -> 
         base_pairwise = ((_triplet_spike_agreement([match["otb4"], match["c3d"]]).get("pairwise") or {}).get("otb4_vs_c3d") or {})
         base_mean_ms = base_pairwise.get("mean_abs_ms")
         base_max_ms = base_pairwise.get("max_abs_ms")
+        if isinstance(base_mean_ms, (int, float)) and isinstance(base_max_ms, (int, float)):
+            if float(base_mean_ms) <= 20.0 and float(base_max_ms) <= 50.0:
+                match.setdefault("alignment", {})["otb4_repair"] = {
+                    "applied": False,
+                    "repair_source": "skipped_good_base_sync",
+                    "base_mean_abs_ms": base_mean_ms,
+                    "base_max_abs_ms": base_max_ms,
+                    "block_reason": "base_otb4_c3d_sync_already_good",
+                    "zones": [],
+                }
+                continue
         candidates = _detect_otb4_repair_candidates(
             otb_path,
             match["otb4"].get("edge_times_sec") or [],
@@ -2113,6 +3124,16 @@ def _apply_otb4_repairs(matches: List[Dict[str, Any]], log_lines: List[str]) -> 
         )
 
 
+def _ensure_otb4_repair_applied(match: Dict[str, Any], log_lines: Optional[List[str]] = None) -> None:
+    if not (match.get("otb4") and match.get("c3d")):
+        return
+    alignment = match.setdefault("alignment", {})
+    if bool(alignment.get("otb4_repair_evaluated")):
+        return
+    _apply_otb4_repairs([match], log_lines or [])
+    alignment["otb4_repair_evaluated"] = True
+
+
 def _pair_records(left: List[SyncRecord], right: List[SyncRecord], skip_penalty: float = 0.25) -> List[Tuple[SyncRecord, SyncRecord, float]]:
     if not left or not right:
         return []
@@ -2158,6 +3179,159 @@ def _pair_records(left: List[SyncRecord], right: List[SyncRecord], skip_penalty:
         i, j = prev_i, prev_j
     out.reverse()
     return out
+
+
+def _pair_index_cost_matrix(cost: np.ndarray, skip_penalty: float = 0.25) -> List[Tuple[int, int, float]]:
+    if cost.size == 0:
+        return []
+    n_left, n_right = cost.shape
+    dp = np.full((n_left + 1, n_right + 1), np.inf, dtype=float)
+    move: List[List[Optional[Tuple[str, int, int]]]] = [[None] * (n_right + 1) for _ in range(n_left + 1)]
+    dp[0, 0] = 0.0
+    for i in range(n_left + 1):
+        for j in range(n_right + 1):
+            cur = float(dp[i, j])
+            if not np.isfinite(cur):
+                continue
+            if i < n_left and cur + float(skip_penalty) < dp[i + 1, j]:
+                dp[i + 1, j] = cur + float(skip_penalty)
+                move[i + 1][j] = ("skip_left", i, j)
+            if j < n_right and cur + float(skip_penalty) < dp[i, j + 1]:
+                dp[i, j + 1] = cur + float(skip_penalty)
+                move[i][j + 1] = ("skip_right", i, j)
+            if i < n_left and j < n_right and cur + float(cost[i, j]) < dp[i + 1, j + 1]:
+                dp[i + 1, j + 1] = cur + float(cost[i, j])
+                move[i + 1][j + 1] = ("pair", i, j)
+    i = n_left
+    j = n_right
+    out: List[Tuple[int, int, float]] = []
+    while i > 0 or j > 0:
+        step = move[i][j]
+        if step is None:
+            break
+        kind, prev_i, prev_j = step
+        if kind == "pair":
+            out.append((prev_i, prev_j, float(cost[prev_i, prev_j])))
+        i, j = prev_i, prev_j
+    out.reverse()
+    return out
+
+
+def _summarize_c3d_tsv_pair_certainty(eval_info: Dict[str, Any]) -> str:
+    raw_result = eval_info.get("raw_result") or {}
+    raw_corr = raw_result.get("corr")
+    raw_lag = raw_result.get("lag_sec")
+    if isinstance(raw_corr, (int, float)) and isinstance(raw_lag, (int, float)):
+        abs_corr = abs(float(raw_corr))
+        abs_lag = abs(float(raw_lag))
+        if abs_corr >= 0.995 and abs_lag <= 1.0:
+            return "certain"
+        if abs_corr >= 0.95 and abs_lag <= 5.0:
+            return "probable"
+    return "uncertain"
+
+
+def _evaluate_c3d_tsv_candidate(
+    c3d_record: SyncRecord,
+    tsv_record: SyncRecord,
+    *,
+    preferred_pairs: Optional[Sequence[Dict[str, Any]]] = None,
+) -> Optional[Dict[str, Any]]:
+    c3d_json = c3d_record.to_json()
+    tsv_json = tsv_record.to_json()
+    raw_result = _best_tsv_raw_alignment(tsv_json, c3d_json, preferred_pairs=preferred_pairs)
+    temp_match = {
+        "otb4": None,
+        "c3d": c3d_json,
+        "tsv": tsv_json,
+        "alignment": {
+            "source_mode": "c3d_tsv",
+            "raw_alignment_lag_sec": raw_result.get("lag_sec"),
+            "raw_alignment_corr": raw_result.get("corr"),
+            "raw_alignment_quality": raw_result.get("quality"),
+            "otb4_c3d_edge_alignment": {"basis": "not_applicable"},
+        },
+    }
+    dedicated = _dedicated_sync_agreement(temp_match)
+    c3d_duration = float(c3d_record.sample_count or 0) / float(c3d_record.sample_rate or 1.0) if c3d_record.sample_rate else None
+    tsv_duration = float(tsv_record.duration_sec) if tsv_record.duration_sec is not None else None
+    duration_penalty = abs(float(c3d_duration or 0.0) - float(tsv_duration or 0.0)) * 0.1 if c3d_duration and tsv_duration else 0.0
+    raw_corr = raw_result.get("corr")
+    raw_lag = raw_result.get("lag_sec")
+    raw_penalty = 2.5
+    if isinstance(raw_corr, (int, float)) and isinstance(raw_lag, (int, float)):
+        raw_penalty = (1.0 - abs(float(raw_corr))) * 40.0 + 0.15 * abs(float(raw_lag))
+    score = float(duration_penalty + raw_penalty)
+    if raw_result.get("corr") is None:
+        return None
+    certainty = _summarize_c3d_tsv_pair_certainty({"raw_result": raw_result, "dedicated": dedicated})
+    return {
+        "c3d_json": c3d_json,
+        "tsv_json": tsv_json,
+        "raw_result": raw_result,
+        "dedicated": dedicated,
+        "score": score,
+        "duration_penalty": duration_penalty,
+        "certainty": certainty,
+        "basis": "raw_only",
+    }
+
+
+def _build_c3d_tsv_match_from_eval(
+    eval_info: Dict[str, Any],
+    *,
+    match_id: int,
+) -> Dict[str, Any]:
+    c3d_json = dict(eval_info["c3d_json"])
+    tsv_json = dict(eval_info["tsv_json"])
+    raw_result = dict(eval_info["raw_result"])
+    dedicated = dict(eval_info["dedicated"])
+    alignment = {
+        "source_mode": "c3d_tsv",
+        "sync_channel": "shared C3D/TSV",
+        "tsv_match_status": "paired_without_otb4",
+        "tsv_skip_reason": None,
+        "tsv_alignment_basis": eval_info.get("basis"),
+        "raw_alignment_corr": raw_result.get("corr"),
+        "raw_alignment_lag_sec": raw_result.get("lag_sec"),
+        "raw_alignment_samples": raw_result.get("samples"),
+        "raw_label_match_tsv": raw_result.get("tsv_channel"),
+        "raw_label_match_c3d": raw_result.get("c3d_channel"),
+        "raw_label_match_c3d_kind": raw_result.get("c3d_kind"),
+        "raw_label_based": raw_result.get("label_matched"),
+        "raw_alignment_quality": raw_result.get("quality"),
+        "sync_edge_skips": {"otb4": 0, "c3d": 0, "tsv": 0},
+        "otb4_c3d_edge_alignment": {"basis": "not_applicable", "matched_count": 0},
+        "dedicated_sync_quality": dedicated.get("quality"),
+        "dedicated_sync_pair_quality": dedicated.get("pair_quality"),
+        "dedicated_sync_mean_abs_ms": dedicated.get("mean_abs_delta_ms"),
+        "dedicated_sync_max_abs_ms": dedicated.get("max_abs_delta_ms"),
+        "dedicated_sync_spike_count": dedicated.get("spike_count"),
+        "dedicated_sync_pairwise": dedicated.get("pairwise"),
+    }
+    match = {
+        "match_id": int(match_id),
+        "certainty": str(eval_info.get("certainty") or "uncertain"),
+        "pair_cost": float(eval_info.get("score") or 0.0),
+        "otb4": None,
+        "c3d": c3d_json,
+        "tsv": tsv_json,
+        "alignment": alignment,
+    }
+    alignment["raw_alignment_quality"] = _effective_raw_quality(raw_result, alignment.get("otb4_c3d_edge_alignment"))
+    alignment["plot_time_shifts_sec"] = _match_plot_shifts(match)
+    alignment["inner_merge"] = _build_inner_merge_alignment(match)
+    alignment["sync_triplet_quality"] = alignment["dedicated_sync_quality"]
+    alignment["sync_triplet_spike_mean_abs_ms"] = alignment["dedicated_sync_mean_abs_ms"]
+    alignment["sync_triplet_spike_max_abs_ms"] = alignment["dedicated_sync_max_abs_ms"]
+    alignment["sync_triplet_spike_count"] = alignment["dedicated_sync_spike_count"]
+    alignment["sync_triplet_pairwise"] = alignment["dedicated_sync_pairwise"]
+    alignment["sync_triplet_waveform_quality"] = alignment["raw_alignment_quality"]
+    alignment["sync_triplet_raw_corr_c3d_tsv"] = raw_result.get("corr")
+    alignment["sync_triplet_waveform_pairwise"] = {
+        "c3d_vs_tsv_raw": {"corr": raw_result.get("corr"), "lag_sec": raw_result.get("lag_sec")}
+    }
+    return match
 
 
 def _summarize_pair_cost(cost: float) -> str:
@@ -2260,6 +3434,15 @@ def _auto_accept_match(match: Dict[str, Any]) -> bool:
     )
     if not raw_ok and edge_align.get("basis") == "late_c3d_raw_bridge" and isinstance(raw_corr, (int, float)):
         raw_ok = abs(float(raw_corr)) >= 0.999
+    if not match.get("otb4"):
+        c3d_tsv = (alignment.get("dedicated_sync_pairwise") or {}).get("c3d_vs_tsv") or {}
+        sync_ok = False
+        if int(c3d_tsv.get("count") or 0) > 0:
+            if int(c3d_tsv.get("matched_spikes_50ms") or 0) >= int(c3d_tsv.get("count") or 0):
+                sync_ok = True
+            elif isinstance(c3d_tsv.get("mean_abs_ms"), (int, float)) and isinstance(c3d_tsv.get("max_abs_ms"), (int, float)):
+                sync_ok = float(c3d_tsv.get("mean_abs_ms")) <= 20.0 and float(c3d_tsv.get("max_abs_ms")) <= 50.0
+        return match.get("certainty") == "certain" and (raw_ok or sync_ok)
     return (
         match.get("certainty") == "certain"
         and raw_ok
@@ -2291,6 +3474,10 @@ def _match_tsv_records(
     log_lines: List[str],
     *,
     filename_clock_offset_sec: float = 0.0,
+    preferred_pairs: Optional[Sequence[Dict[str, Any]]] = None,
+    initially_used_paths: Optional[Sequence[str]] = None,
+    candidate_paths_by_match: Optional[Dict[int, Sequence[str]]] = None,
+    restrict_to_hints: bool = False,
 ) -> List[Dict[str, Any]]:
     candidates: List[SyncRecord] = [
         rec
@@ -2301,10 +3488,25 @@ def _match_tsv_records(
         and rec.duration_sec >= 5.0
         and (rec.sync_present or any(str(c).lower().endswith("[raw]") for c in (rec.channel_names or [])))
     ]
-    used: set[str] = set()
+    used: set[str] = {str(path) for path in (initially_used_paths or []) if str(path)}
     matched_tsv: List[Dict[str, Any]] = []
     for match in matches:
         if not (match.get("otb4") and match.get("c3d")):
+            continue
+        local_candidates = candidates
+        hinted_paths = {
+            str(path)
+            for path in (candidate_paths_by_match or {}).get(int(match.get("match_id") or 0), [])
+            if str(path)
+        }
+        if hinted_paths:
+            local_candidates = [rec for rec in candidates if rec.path in hinted_paths]
+        elif restrict_to_hints:
+            match["alignment"]["tsv_match_status"] = "missing"
+            match["alignment"]["tsv_skip_reason"] = "No hinted TSV triplet candidate was available for this pair."
+            log_lines.append(
+                f"[tsv-seed] match {match['match_id']:03d}: no hinted triplet TSV candidate available."
+            )
             continue
         otb_dt = _parse_record_dt(match["otb4"].get("timestamp"))
         if otb_dt is None:
@@ -2326,9 +3528,8 @@ def _match_tsv_records(
             c3d_rel = np.asarray(c3d_edges[:n_ref], dtype=float)
             template_ref = (((otb_rel - otb_rel[0]) + (c3d_rel - c3d_rel[0])) / 2.0).tolist()
 
-        best: Optional[Tuple[float, SyncRecord, float, Dict[str, Any], Dict[str, Any], Dict[str, Any]]] = None
-        best_diag: Optional[Tuple[SyncRecord, float, Optional[float], Optional[float], Optional[float], str]] = None
-        for rec in candidates:
+        ranked_candidates: List[Tuple[float, SyncRecord, float, float, float]] = []
+        for rec in local_candidates:
             if rec.path in used:
                 continue
             last_ts = rec.last_ts
@@ -2345,11 +3546,20 @@ def _match_tsv_records(
             end_delta = abs(last_ts - otb_end)
             filename_delta = abs(end_anchor - otb_start) if name_dt is not None else 0.0
             duration_penalty = 0.1 * abs((rec.duration_sec or 0.0) - pair_span)
+            cheap_score = start_delta + end_delta + duration_penalty + 0.01 * filename_delta
+            ranked_candidates.append((cheap_score, rec, start_delta, end_delta, filename_delta))
+        ranked_candidates.sort(key=lambda item: item[0])
+
+        best: Optional[Tuple[float, SyncRecord, float, Dict[str, Any], Dict[str, Any], Dict[str, Any]]] = None
+        best_diag: Optional[Tuple[SyncRecord, float, Optional[float], Optional[float], Optional[float], str]] = None
+        shortlist = ranked_candidates[: min(3, len(ranked_candidates))]
+        for _cheap_score, rec, start_delta, end_delta, filename_delta in shortlist:
             rec_json = rec.to_json()
-            raw_result = _best_tsv_raw_alignment(rec_json, match["c3d"])
+            raw_result = _best_tsv_raw_alignment(rec_json, match["c3d"], preferred_pairs=preferred_pairs)
             raw_corr = raw_result.get("corr")
             diag_corr = abs(float(raw_corr)) if isinstance(raw_corr, (int, float)) else None
             diag_lag = abs(float(raw_result.get("lag_sec") or 0.0)) if raw_result.get("lag_sec") is not None else None
+            duration_penalty = 0.1 * abs((rec.duration_sec or 0.0) - pair_span)
             diag_score = start_delta + end_delta + duration_penalty + 0.01 * filename_delta
             if (
                 best_diag is None
@@ -2359,19 +3569,6 @@ def _match_tsv_records(
                 best_diag = (rec, diag_score, diag_corr, diag_lag, filename_delta, raw_result.get("quality") or "missing")
             if raw_corr is None or abs(float(raw_corr)) < 0.95:
                 continue
-
-            if rec.sync_present and rec.sync_channel and template_ref:
-                try:
-                    _cols, df = _read_tsv_table(Path(rec.path))
-                    x = pd.to_numeric(df[rec.sync_channel], errors="coerce").to_numpy(dtype=float)
-                    t_rel = pd.to_numeric(df["t_rel"], errors="coerce").to_numpy(dtype=float)
-                    refined_peaks = _detect_tsv_spikes_with_template(x, t_rel, np.diff(template_ref))
-                    if len(refined_peaks) >= 2:
-                        rec_json["edge_times_sec"] = [float(v) for v in refined_peaks]
-                        rec_json["edge_count"] = len(refined_peaks)
-                        rec_json["intervals_sec"] = [float(v) for v in np.diff(refined_peaks).tolist()]
-                except Exception:
-                    pass
 
             temp_match = {
                 **match,
@@ -2391,19 +3588,10 @@ def _match_tsv_records(
             }
             temp_match["alignment"]["otb4_c3d_edge_alignment"] = edge_align
             temp_match["alignment"]["raw_alignment_quality"] = _effective_raw_quality(raw_result, edge_align)
-            dedicated = _dedicated_sync_agreement(temp_match)
-            basis = "dedicated_sync+raw" if rec.sync_present and rec.sync_channel else "raw_only"
             raw_penalty = (1.0 - abs(float(raw_corr))) * 40.0 + 0.15 * abs(float(raw_result.get("lag_sec") or 0.0))
-            sync_penalty = 0.5
-            if rec.sync_present and rec.sync_channel:
-                mean_abs = dedicated.get("mean_abs_delta_ms")
-                if mean_abs is None:
-                    sync_penalty = 1.5
-                else:
-                    sync_penalty = min(float(mean_abs) / 200.0, 3.0)
-            score = start_delta + end_delta + duration_penalty + 0.01 * filename_delta + raw_penalty + sync_penalty
+            score = start_delta + end_delta + duration_penalty + 0.01 * filename_delta + raw_penalty
             if best is None or score < best[0]:
-                best = (score, rec, filename_delta, rec_json, raw_result, dedicated)
+                best = (score, rec, filename_delta, rec_json, raw_result, {})
         if best is None:
             reason = "No TSV candidate passed the time-window and raw-match filters."
             if best_diag is not None:
@@ -2419,7 +3607,19 @@ def _match_tsv_records(
             match["alignment"]["tsv_skip_reason"] = reason
             log_lines.append(f"[tsv-match] match {match['match_id']:03d}: {reason}")
             continue
-        score, rec, filename_delta, rec_json, raw_result, dedicated = best
+        score, rec, filename_delta, rec_json, raw_result, _dedicated_unused = best
+        dedicated = _dedicated_sync_agreement(
+            {
+                **match,
+                "tsv": rec_json,
+                "alignment": {
+                    **(match.get("alignment") or {}),
+                    "raw_alignment_lag_sec": raw_result.get("lag_sec"),
+                    "raw_alignment_corr": raw_result.get("corr"),
+                    "raw_alignment_quality": raw_result.get("quality"),
+                },
+            }
+        )
         if score > 8.0:
             reason = (
                 f"Best TSV {Path(rec.path).name} rejected because combined score={score:.3f} exceeded 8.000 "
@@ -2442,7 +3642,7 @@ def _match_tsv_records(
         match["alignment"]["tsv_end_minus_otb_sec"] = round(rec.last_ts - otb_end, 6) if rec.last_ts is not None else None
         match["alignment"]["tsv_start_minus_otb_start_sec"] = round(rec.first_ts - otb_start, 6) if rec.first_ts is not None else None
         match["alignment"]["tsv_score"] = round(score, 6)
-        match["alignment"]["tsv_alignment_basis"] = "dedicated_sync+raw" if rec.sync_present and rec.sync_channel else "raw_only"
+        match["alignment"]["tsv_alignment_basis"] = "raw_only"
         match["alignment"]["sync_edge_skips"] = temp_match["alignment"].get("sync_edge_skips") or {"otb4": 0, "c3d": 0, "tsv": 0}
         match["alignment"]["otb4_c3d_edge_alignment"] = temp_match["alignment"].get("otb4_c3d_edge_alignment") or {}
         match["alignment"]["raw_alignment_quality"] = _effective_raw_quality(raw_result, match["alignment"].get("otb4_c3d_edge_alignment"))
@@ -2461,7 +3661,6 @@ def _match_tsv_records(
         }
         match["alignment"]["otb4_c3d_edge_alignment"] = final_edge_align
         match["alignment"]["raw_alignment_quality"] = _effective_raw_quality(raw_result, final_edge_align)
-        dedicated = _dedicated_sync_agreement(match)
         match["alignment"]["dedicated_sync_quality"] = dedicated.get("quality")
         match["alignment"]["dedicated_sync_pair_quality"] = dedicated.get("pair_quality")
         match["alignment"]["dedicated_sync_mean_abs_ms"] = dedicated.get("mean_abs_delta_ms")
@@ -2487,7 +3686,7 @@ def _match_tsv_records(
             f"filename_delta={filename_delta:.3f}s "
             f"basis={match['alignment']['tsv_alignment_basis']} "
             f"raw={match['alignment']['raw_alignment_quality']} corr={raw_result.get('corr')} lag={raw_result.get('lag_sec')}s "
-            f"dedicated_sync={dedicated.get('quality')} mean_abs={dedicated.get('mean_abs_delta_ms')}ms max_abs={dedicated.get('max_abs_delta_ms')}ms"
+            f"dedicated_sync_info={dedicated.get('quality')} mean_abs={dedicated.get('mean_abs_delta_ms')}ms max_abs={dedicated.get('max_abs_delta_ms')}ms"
         )
         if raw_result.get("tsv_channel") and raw_result.get("c3d_channel"):
             log_lines.append(
@@ -2724,10 +3923,146 @@ def _apply_manual_tsv_selection(
     return True
 
 
-def analyze_folder(folder: Path) -> Dict[str, Any]:
+def _match_c3d_tsv_records(
+    c3d_records: List[SyncRecord],
+    tsv_records: List[SyncRecord],
+    log_lines: List[str],
+    *,
+    preferred_pairs: Optional[Sequence[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    tsv_candidates = [
+        rec for rec in tsv_records
+        if rec.duration_sec is None or float(rec.duration_sec) >= 5.0
+    ]
+    if not c3d_records or not tsv_candidates:
+        return []
+    eval_matrix: List[List[Optional[Dict[str, Any]]]] = []
+    cost = np.full((len(c3d_records), len(tsv_candidates)), 6.0, dtype=float)
+    for i, c3d in enumerate(c3d_records):
+        row: List[Optional[Dict[str, Any]]] = []
+        for j, tsv in enumerate(tsv_candidates):
+            eval_info = _evaluate_c3d_tsv_candidate(c3d, tsv, preferred_pairs=preferred_pairs)
+            row.append(eval_info)
+            if eval_info is not None:
+                cost[i, j] = float(eval_info.get("score") or 6.0)
+        eval_matrix.append(row)
+    pairs = _pair_index_cost_matrix(cost, skip_penalty=4.0)
+    matches: List[Dict[str, Any]] = []
+    for match_id, (i, j, pair_cost) in enumerate(pairs, start=1):
+        eval_info = eval_matrix[i][j]
+        if eval_info is None:
+            continue
+        match = _build_c3d_tsv_match_from_eval(eval_info, match_id=match_id)
+        _apply_review_defaults(match)
+        matches.append(match)
+        raw_result = eval_info.get("raw_result") or {}
+        dedicated = eval_info.get("dedicated") or {}
+        log_lines.append(
+            f"[c3d-tsv-pair] {match_id:03d} c3d={Path(c3d_records[i].path).name} tsv={Path(tsv_candidates[j].path).name} "
+            f"score={pair_cost:.3f} certainty={match.get('certainty')} basis={eval_info.get('basis')} "
+            f"raw={raw_result.get('quality')} corr={raw_result.get('corr')} lag={raw_result.get('lag_sec')}s "
+            f"sync={dedicated.get('quality')} mean_abs={dedicated.get('mean_abs_delta_ms')}ms max_abs={dedicated.get('max_abs_delta_ms')}ms"
+        )
+    return matches
+
+
+def _build_triplet_seed_hints(
+    pair_matches: Sequence[Dict[str, Any]],
+    tsv_records: Sequence[SyncRecord],
+) -> Dict[int, List[str]]:
+    tsv_by_index: Dict[int, List[SyncRecord]] = {}
+    for rec in tsv_records:
+        idx = _file_numeric_index(rec.path)
+        if idx is None:
+            continue
+        tsv_by_index.setdefault(idx, []).append(rec)
+    out: Dict[int, List[str]] = {}
+    for match in pair_matches:
+        c3d_path = ((match.get("c3d") or {}).get("path") or "")
+        idx = _file_numeric_index(c3d_path)
+        if idx is None:
+            continue
+        hinted = tsv_by_index.get(idx) or []
+        if hinted:
+            out[int(match.get("match_id") or 0)] = [rec.path for rec in hinted]
+    return out
+
+
+def _build_c3d_tsv_seed_pairs(
+    c3d_records: Sequence[SyncRecord],
+    tsv_records: Sequence[SyncRecord],
+) -> List[Tuple[SyncRecord, SyncRecord]]:
+    tsv_by_index: Dict[int, List[SyncRecord]] = {}
+    for rec in tsv_records:
+        idx = _file_numeric_index(rec.path)
+        if idx is None:
+            continue
+        tsv_by_index.setdefault(idx, []).append(rec)
+    out: List[Tuple[SyncRecord, SyncRecord]] = []
+    used_tsv: set[str] = set()
+    for c3d in c3d_records:
+        idx = _file_numeric_index(c3d.path)
+        if idx is None:
+            continue
+        candidates = [rec for rec in (tsv_by_index.get(idx) or []) if rec.path not in used_tsv]
+        if len(candidates) != 1:
+            continue
+        out.append((c3d, candidates[0]))
+        used_tsv.add(candidates[0].path)
+    return out
+
+
+def _derive_preferred_pairs_from_matches(matches: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    seen: set[Tuple[str, str, str]] = set()
+    out: List[Dict[str, Any]] = []
+    for match in matches:
+        alignment = match.get("alignment") or {}
+        tsv_channel = str(alignment.get("raw_label_match_tsv") or "").strip()
+        c3d_channel = str(alignment.get("raw_label_match_c3d") or "").strip()
+        c3d_kind = str(alignment.get("raw_label_match_c3d_kind") or "analog").strip().lower() or "analog"
+        if not tsv_channel or not c3d_channel:
+            continue
+        key = (tsv_channel, c3d_channel, c3d_kind)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(
+            {
+                "kind": "raw",
+                "tsv_channel": tsv_channel,
+                "c3d_channel": c3d_channel,
+                "c3d_kind": c3d_kind,
+                "label_match": "derived_from_triplet",
+            }
+        )
+    return out
+
+
+def analyze_folder(folder: Path, match_options: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     folder = folder.resolve()
     log_lines: List[str] = []
     log_lines.append(f"[{_now_iso()}] Scan start: {folder}")
+    preferred_pairs = _normalize_global_pair_specs((match_options or {}).get("preferred_channel_pairs"))
+    configured_sync_pulse_duration_ms = (match_options or {}).get("sync_pulse_duration_ms")
+    plausible_sync_pulse_durations_ms = [
+        float(v) for v in ((match_options or {}).get("plausible_sync_pulse_durations_ms") or []) if v not in (None, "")
+    ]
+    configured_sync_decrement_ms = (match_options or {}).get("sync_decrement_ms")
+    plausible_sync_decrements_ms = [
+        float(v) for v in ((match_options or {}).get("plausible_sync_decrements_ms") or []) if v not in (None, "")
+    ]
+    if preferred_pairs:
+        log_lines.append(f"[pairing] preferred global raw pairs: {json.dumps(preferred_pairs, ensure_ascii=False)}")
+    if configured_sync_pulse_duration_ms not in (None, ""):
+        log_lines.append(
+            f"[sync] configured SyncMini / Syncstation TTL duration={float(configured_sync_pulse_duration_ms):g} ms "
+            f"(plausible from sampled data: {', '.join(f'{v:g}' for v in plausible_sync_pulse_durations_ms) or 'not available'} ms)."
+        )
+    if configured_sync_decrement_ms not in (None, ""):
+        log_lines.append(
+            f"[sync] configured SyncMini decrement={float(configured_sync_decrement_ms):g} ms "
+            f"(plausible from sampled data: {', '.join(f'{v:g}' for v in plausible_sync_decrements_ms) or 'not available'} ms)."
+        )
     filename_clock_offset_sec = _infer_root_filename_clock_offset_sec(folder) or 0.0
     log_lines.append(
         f"[timing] filename clock offset={filename_clock_offset_sec:.3f}s ({filename_clock_offset_sec / 3600.0:.6f}h) "
@@ -2740,7 +4075,7 @@ def analyze_folder(folder: Path) -> Dict[str, Any]:
     unmatched: List[Dict[str, Any]] = []
 
     for path in _iter_source_files(folder, ".otb4", excluded_dir_names=("matched", "accepted", "__pycache__", ".git")):
-        rec = _extract_otb4_record(path)
+        rec = _extract_otb4_record(path, include_probe_sync_diagnostics=False)
         otb4_records.append(rec)
         log_lines.append(
             f"[otb4] {path.name}: sync={rec.sync_present} quality={rec.sync_quality} "
@@ -2769,64 +4104,183 @@ def analyze_folder(folder: Path) -> Dict[str, Any]:
         for note in rec.notes:
             log_lines.append(f"  - {note}")
 
-    otb4_to_c3d = _pair_records(otb4_records, c3d_records)
-    otb4_to_c3d.sort(key=lambda t: t[0].path)
-
     pair_matches: List[Dict[str, Any]] = []
-    pair_id = 1
-    for otb, c3d, cost in otb4_to_c3d:
-        certainty = _summarize_pair_cost(cost)
-        alignment = {
-            "sync_channel": "shared TTL",
-            "overlap_start_sec": max(
-                otb.edge_times_sec[0] if otb.edge_times_sec else 0.0,
-                c3d.edge_times_sec[0] if c3d.edge_times_sec else 0.0,
-            ),
-            "overlap_end_sec": min(
-                otb.edge_times_sec[-1] if otb.edge_times_sec else 0.0,
-                c3d.edge_times_sec[-1] if c3d.edge_times_sec else 0.0,
-            ),
-        }
-        triplet = _triplet_spike_agreement([otb.to_json(), c3d.to_json()])
-        alignment["sync_triplet_quality"] = triplet["quality"]
-        alignment["sync_triplet_spike_mean_abs_ms"] = triplet["mean_abs_delta_ms"]
-        alignment["sync_triplet_spike_max_abs_ms"] = triplet["max_abs_delta_ms"]
-        alignment["sync_triplet_spike_count"] = triplet["spike_count"]
-        alignment["sync_triplet_pairwise"] = triplet["pairwise"]
-        log_lines.append(
-            f"[pair] {pair_id:03d} otb4={Path(otb.path).name} c3d={Path(c3d.path).name} "
-            f"cost={cost:.6f} certainty={certainty} spikes={triplet['quality']} "
-            f"mean_abs={triplet['mean_abs_delta_ms']}ms max_abs={triplet['max_abs_delta_ms']}ms"
-        )
-        pair_matches.append(
-            {
-                "match_id": pair_id,
-                "certainty": certainty,
-                "pair_cost": cost,
-                "otb4": otb.to_json(),
-                "c3d": c3d.to_json(),
-                "tsv": None,
-                "alignment": alignment,
-            }
-        )
-        pair_id += 1
+    matched_tsv: List[Dict[str, Any]] = []
+    if otb4_records and c3d_records:
+        otb4_to_c3d = _pair_records(otb4_records, c3d_records)
+        otb4_to_c3d.sort(key=lambda t: t[0].path)
 
-    _apply_otb4_repairs(pair_matches, log_lines)
-    matched_tsv = _match_tsv_records(
-        pair_matches,
-        tsv_records,
-        log_lines,
-        filename_clock_offset_sec=filename_clock_offset_sec,
-    )
+        pair_id = 1
+        for otb, c3d, cost in otb4_to_c3d:
+            certainty = _summarize_pair_cost(cost)
+            alignment = {
+                "source_mode": "otb4_c3d_tsv",
+                "sync_channel": "shared TTL",
+                "configured_sync_pulse_duration_ms": float(configured_sync_pulse_duration_ms) if configured_sync_pulse_duration_ms not in (None, "") else None,
+                "plausible_sync_pulse_durations_ms": plausible_sync_pulse_durations_ms,
+                "configured_sync_decrement_ms": float(configured_sync_decrement_ms) if configured_sync_decrement_ms not in (None, "") else None,
+                "plausible_sync_decrements_ms": plausible_sync_decrements_ms,
+                "overlap_start_sec": max(
+                    otb.edge_times_sec[0] if otb.edge_times_sec else 0.0,
+                    c3d.edge_times_sec[0] if c3d.edge_times_sec else 0.0,
+                ),
+                "overlap_end_sec": min(
+                    otb.edge_times_sec[-1] if otb.edge_times_sec else 0.0,
+                    c3d.edge_times_sec[-1] if c3d.edge_times_sec else 0.0,
+                ),
+            }
+            triplet = _triplet_spike_agreement([otb.to_json(), c3d.to_json()])
+            alignment["sync_triplet_quality"] = triplet["quality"]
+            alignment["sync_triplet_spike_mean_abs_ms"] = triplet["mean_abs_delta_ms"]
+            alignment["sync_triplet_spike_max_abs_ms"] = triplet["max_abs_delta_ms"]
+            alignment["sync_triplet_spike_count"] = triplet["spike_count"]
+            alignment["sync_triplet_pairwise"] = triplet["pairwise"]
+            log_lines.append(
+                f"[pair] {pair_id:03d} otb4={Path(otb.path).name} c3d={Path(c3d.path).name} "
+                f"cost={cost:.6f} certainty={certainty} spikes={triplet['quality']} "
+                f"mean_abs={triplet['mean_abs_delta_ms']}ms max_abs={triplet['max_abs_delta_ms']}ms"
+            )
+            pair_matches.append(
+                {
+                    "match_id": pair_id,
+                    "certainty": certainty,
+                    "pair_cost": cost,
+                    "otb4": otb.to_json(),
+                    "c3d": c3d.to_json(),
+                    "tsv": None,
+                    "alignment": alignment,
+                }
+            )
+            pair_id += 1
+
+        for match in pair_matches:
+            match.setdefault("alignment", {})["otb4_repair_evaluated"] = False
+        log_lines.append("[repair] OTB4 repair evaluation deferred until review selection or MAT export.")
+        seed_hints = _build_triplet_seed_hints(pair_matches, tsv_records)
+        if seed_hints:
+            seeded_pair_matches = [match for match in pair_matches if int(match.get("match_id") or 0) in set(sorted(seed_hints)[:TRIPLET_SEED_LIMIT])]
+            log_lines.append(
+                f"[triplet-seed] found {sum(len(v) for v in seed_hints.values())} hinted TSV candidate(s) "
+                f"for {len(seed_hints)} OTB4/C3D pair(s) by shared file index; "
+                f"evaluating the first {len(seeded_pair_matches)} to derive raw matching rules."
+            )
+            matched_tsv.extend(
+                _match_tsv_records(
+                    seeded_pair_matches,
+                    tsv_records,
+                    log_lines,
+                    filename_clock_offset_sec=filename_clock_offset_sec,
+                    preferred_pairs=preferred_pairs,
+                    candidate_paths_by_match=seed_hints,
+                    restrict_to_hints=True,
+                )
+            )
+        derived_pairs = _derive_preferred_pairs_from_matches([match for match in pair_matches if match.get("tsv")])
+        second_pass_pairs = derived_pairs or preferred_pairs
+        unresolved_pairs = [match for match in pair_matches if not match.get("tsv")]
+        if unresolved_pairs:
+            used_tsv_paths = [str((match.get("tsv") or {}).get("path") or "") for match in pair_matches if match.get("tsv")]
+            if derived_pairs:
+                log_lines.append(f"[pairing] derived raw pairs from matched triplets: {json.dumps(derived_pairs, ensure_ascii=False)}")
+            elif preferred_pairs:
+                log_lines.append("[pairing] no triplet-derived pairs were available; falling back to initial raw rules for unresolved doublets.")
+            matched_tsv.extend(
+                _match_tsv_records(
+                    unresolved_pairs,
+                    tsv_records,
+                    log_lines,
+                    filename_clock_offset_sec=filename_clock_offset_sec,
+                    preferred_pairs=second_pass_pairs,
+                    initially_used_paths=used_tsv_paths,
+                    candidate_paths_by_match=seed_hints,
+                    restrict_to_hints=bool(seed_hints),
+                )
+            )
+            unresolved_pairs = [match for match in pair_matches if not match.get("tsv")]
+            used_tsv_paths = [str((match.get("tsv") or {}).get("path") or "") for match in pair_matches if match.get("tsv")]
+        if unresolved_pairs and not derived_pairs:
+            matched_tsv.extend(
+                _match_tsv_records(
+                    unresolved_pairs,
+                    tsv_records,
+                    log_lines,
+                    filename_clock_offset_sec=filename_clock_offset_sec,
+                    preferred_pairs=preferred_pairs,
+                    initially_used_paths=used_tsv_paths,
+                )
+            )
+    elif c3d_records and tsv_records:
+        seeded_pairs = _build_c3d_tsv_seed_pairs(c3d_records, tsv_records)[:TRIPLET_SEED_LIMIT]
+        seeded_matches: List[Dict[str, Any]] = []
+        used_c3d_paths: set[str] = set()
+        used_tsv_paths: set[str] = set()
+        if seeded_pairs:
+            log_lines.append(
+                f"[triplet-seed] found {len(seeded_pairs)} hinted C3D/TSV pair(s) by shared file index for initial raw matching."
+            )
+            for match_id, (c3d, tsv) in enumerate(seeded_pairs, start=1):
+                eval_info = _evaluate_c3d_tsv_candidate(c3d, tsv, preferred_pairs=preferred_pairs)
+                if eval_info is None:
+                    continue
+                match = _build_c3d_tsv_match_from_eval(eval_info, match_id=match_id)
+                _apply_review_defaults(match)
+                seeded_matches.append(match)
+                used_c3d_paths.add(c3d.path)
+                used_tsv_paths.add(tsv.path)
+                raw_result = eval_info.get("raw_result") or {}
+                log_lines.append(
+                    f"[c3d-tsv-seed] {match_id:03d} c3d={Path(c3d.path).name} tsv={Path(tsv.path).name} "
+                    f"certainty={match.get('certainty')} raw={raw_result.get('quality')} "
+                    f"corr={raw_result.get('corr')} lag={raw_result.get('lag_sec')}s"
+                )
+        derived_pairs = _derive_preferred_pairs_from_matches(seeded_matches)
+        remaining_c3d = [rec for rec in c3d_records if rec.path not in used_c3d_paths]
+        remaining_tsv = [rec for rec in tsv_records if rec.path not in used_tsv_paths]
+        fallback_pairs = derived_pairs or preferred_pairs
+        pair_matches = list(seeded_matches)
+        if remaining_c3d and remaining_tsv:
+            if derived_pairs:
+                log_lines.append(f"[pairing] derived raw pairs from seeded C3D/TSV matches: {json.dumps(derived_pairs, ensure_ascii=False)}")
+            elif preferred_pairs:
+                log_lines.append("[pairing] no seeded C3D/TSV derivations were available; falling back to initial raw rules for remaining doublets.")
+            pair_matches.extend(
+                _match_c3d_tsv_records(
+                    remaining_c3d,
+                    remaining_tsv,
+                    log_lines,
+                    preferred_pairs=fallback_pairs,
+                )
+            )
+        log_lines.append(f"[mode] C3D+TSV matching mode active (OTB4 absent).")
+    else:
+        log_lines.append("[mode] No supported file combination found for matching.")
     pair_matches.sort(key=_c3d_review_sort_key)
     for idx, match in enumerate(pair_matches, start=1):
         match["match_id"] = idx
         _apply_review_defaults(match)
-    certain_triplets = [match for match in pair_matches if match.get("tsv")]
+    certain_triplets = [match for match in pair_matches if match.get("tsv") and match.get("otb4")]
     pair_only_matches = [match for match in pair_matches if not match.get("tsv")]
     used_otb_paths = {str((match.get("otb4") or {}).get("path") or "") for match in pair_matches}
     used_c3d_paths = {str((match.get("c3d") or {}).get("path") or "") for match in pair_matches}
     startup_messages: List[str] = []
+    if otb4_records and c3d_records and not tsv_records:
+        startup_messages.append(
+            "Two-file review mode: OTB4 and C3D were found, TSV is absent. Pair-only matches can still be reviewed and accepted."
+        )
+    if c3d_records and tsv_records and not otb4_records:
+        startup_messages.append(
+            "Two-file review mode: C3D and TSV were found, OTB4 is absent. Matches use the exact or configured [raw] channel pair(s) only."
+        )
+    if configured_sync_pulse_duration_ms not in (None, ""):
+        startup_messages.append(
+            f"Configured SyncMini / Syncstation TTL duration: {float(configured_sync_pulse_duration_ms):g} ms "
+            f"(plausible sampled durations: {', '.join(f'{v:g}' for v in plausible_sync_pulse_durations_ms) or 'not available'} ms)."
+        )
+    if configured_sync_decrement_ms not in (None, ""):
+        startup_messages.append(
+            f"Configured SyncMini decrement: {float(configured_sync_decrement_ms):g} ms "
+            f"(plausible sampled decrements: {', '.join(f'{v:g}' for v in plausible_sync_decrements_ms) or 'not available'} ms)."
+        )
     if pair_only_matches:
         startup_messages.append(
             f"{len(pair_only_matches)} certain OTB4/C3D pair(s) are included in review without a TSV match."
@@ -2851,10 +4305,16 @@ def analyze_folder(folder: Path) -> Dict[str, Any]:
         "tsv_count": len(tsv_records),
         "pair_count": len(pair_matches),
         "certain_pair_count": sum(1 for match in pair_matches if match.get("certainty") == "certain"),
-        "certain_tsv_count": len(matched_tsv),
+        "certain_tsv_count": sum(1 for match in pair_matches if match.get("tsv")),
         "certain_triplet_count": len(certain_triplets),
-        "auto_accept_count": sum(1 for match in certain_triplets if (match.get("review") or {}).get("auto_accept")),
+        "auto_accept_count": sum(1 for match in pair_matches if (match.get("review") or {}).get("auto_accept")),
         "filename_clock_offset_sec": round(float(filename_clock_offset_sec), 6),
+        "match_mode": "otb4_c3d_tsv" if otb4_records and c3d_records else "c3d_tsv" if c3d_records and tsv_records else "unsupported",
+        "preferred_channel_pairs": preferred_pairs,
+        "sync_pulse_duration_ms": float(configured_sync_pulse_duration_ms) if configured_sync_pulse_duration_ms not in (None, "") else None,
+        "plausible_sync_pulse_durations_ms": plausible_sync_pulse_durations_ms,
+        "sync_decrement_ms": float(configured_sync_decrement_ms) if configured_sync_decrement_ms not in (None, "") else None,
+        "plausible_sync_decrements_ms": plausible_sync_decrements_ms,
     }
     log_lines.append(f"[summary] {json.dumps(summary, ensure_ascii=False)}")
     log_lines.append(f"[{_now_iso()}] Scan complete.")
@@ -2869,6 +4329,13 @@ def analyze_folder(folder: Path) -> Dict[str, Any]:
         "unmatched": unmatched,
         "startup_messages": startup_messages,
         "filename_clock_offset_sec": round(float(filename_clock_offset_sec), 6),
+        "match_options": {
+            "preferred_channel_pairs": preferred_pairs,
+            "sync_pulse_duration_ms": float(configured_sync_pulse_duration_ms) if configured_sync_pulse_duration_ms not in (None, "") else None,
+            "plausible_sync_pulse_durations_ms": plausible_sync_pulse_durations_ms,
+            "sync_decrement_ms": float(configured_sync_decrement_ms) if configured_sync_decrement_ms not in (None, "") else None,
+            "plausible_sync_decrements_ms": plausible_sync_decrements_ms,
+        },
         "source_records": {
             "otb4": [rec.to_json() for rec in otb4_records],
             "c3d": [rec.to_json() for rec in c3d_records],
@@ -3098,12 +4565,12 @@ def _write_review_outputs(export_dir: Path, mapping: Dict[str, Any], saved_stamp
     legacy_accepted_dir = export_dir / "accepted"
     if legacy_accepted_dir.exists():
         shutil.rmtree(legacy_accepted_dir, ignore_errors=True)
-    if not _review_complete(mapping):
-        matched_dir.mkdir(exist_ok=True, parents=True)
+        if not _review_complete(mapping):
+            matched_dir.mkdir(exist_ok=True, parents=True)
     else:
         matched_dir.mkdir(exist_ok=True, parents=True)
         for match in mapping.get("matches", []):
-            if not (match.get("review") or {}).get("final_accept") or not match.get("tsv"):
+            if not (match.get("review") or {}).get("final_accept"):
                 continue
             copied = _copy_match_group(match, matched_dir, saved_stamp)
             match.setdefault("review_outputs", {})["matched_copied"] = copied
@@ -3120,7 +4587,7 @@ def _write_review_outputs(export_dir: Path, mapping: Dict[str, Any], saved_stamp
 
     accepted_matches = [
         match for match in mapping.get("matches", [])
-        if (match.get("review") or {}).get("final_accept") and match.get("tsv")
+        if (match.get("review") or {}).get("final_accept")
     ]
     accepted_mapping = {
         "source_root": mapping["source_root"],
@@ -3187,8 +4654,8 @@ def export_results(source_folder: Path, export_dir: Path, mapping: Dict[str, Any
     return mapping_path, log_path, matched_dir
 
 
-def run_scan(folder: Path, export_dir: Optional[Path] = None) -> Tuple[Path, Path, Path]:
-    result = analyze_folder(folder)
+def run_scan(folder: Path, export_dir: Optional[Path] = None, match_options: Optional[Dict[str, Any]] = None) -> Tuple[Path, Path, Path]:
+    result = analyze_folder(folder, match_options=match_options)
     return export_results(folder, export_dir or folder, result["mapping"], result["log_lines"])
 
 
@@ -3200,13 +4667,11 @@ def _load_mapping(mapping_path: Path) -> Dict[str, Any]:
     return mapping
 
 
-def _load_otb4_channel(path: Path, channel_name: str, repair_zones: Optional[Sequence[Tuple[int, int]]] = None) -> Tuple[np.ndarray, np.ndarray]:
+@lru_cache(maxsize=256)
+def _load_otb4_channel_base(path: Path, channel_name: str) -> Tuple[np.ndarray, np.ndarray]:
     if channel_name == SYNC_OTB_LABEL:
         t, x, _meta = _load_otb4_aux_channel(path, device=SYNC_OTB_DEVICE, subtitle=SYNC_OTB_SUBTITLE)
-        if repair_zones:
-            x = _insert_nan_holes_signal(x, repair_zones)
-            t = np.arange(len(x), dtype=float) / float(_meta["sampling_frequency"])
-        return t, x
+        return np.asarray(t, dtype=float), np.asarray(x, dtype=float)
     data, _time, descs, fs, _name, _size = load_otb4_file(str(path))
     flat = []
     for d in descs:
@@ -3216,14 +4681,30 @@ def _load_otb4_channel(path: Path, channel_name: str, repair_zones: Optional[Seq
             flat.append(str(d))
     idx = flat.index(channel_name)
     x = np.asarray(data[idx], dtype=float).reshape(-1)
-    if repair_zones:
-        x = _insert_nan_holes_signal(x, repair_zones)
     t = np.arange(len(x), dtype=float) / float(fs)
     return t, x
 
 
+def _load_otb4_channel(path: Path, channel_name: str, repair_zones: Optional[Sequence[Tuple[int, int]]] = None) -> Tuple[np.ndarray, np.ndarray]:
+    t, x = _load_otb4_channel_base(path, channel_name)
+    t = np.asarray(t, dtype=float)
+    x = np.asarray(x, dtype=float)
+    if repair_zones:
+        x = _insert_nan_holes_signal(x, repair_zones)
+        if t.size >= 2:
+            dt = float(np.nanmedian(np.diff(t)))
+            if np.isfinite(dt) and dt > 0.0:
+                t = np.arange(len(x), dtype=float) * dt
+            else:
+                t = np.arange(len(x), dtype=float)
+        else:
+            t = np.arange(len(x), dtype=float)
+    return t, x
+
+
+@lru_cache(maxsize=128)
 def _c3d_metadata(path: Path) -> Dict[str, Any]:
-    c3d = ezc3d.c3d(str(path))
+    c3d = ezc3d.c3d(str(path), extract_forceplat_data=False)
     analog_labels = list(c3d["parameters"]["ANALOG"]["LABELS"]["value"])
     point_labels = list(c3d["parameters"].get("POINT", {}).get("LABELS", {}).get("value", []))
     if "LABELS2" in c3d["parameters"].get("POINT", {}):
@@ -3239,6 +4720,7 @@ def _c3d_metadata(path: Path) -> Dict[str, Any]:
     }
 
 
+@lru_cache(maxsize=512)
 def _load_c3d_analog_channel(path: Path, channel_name: str) -> Tuple[np.ndarray, np.ndarray]:
     meta = _c3d_metadata(path)
     labels = meta["analog_labels"]
@@ -3251,6 +4733,26 @@ def _load_c3d_analog_channel(path: Path, channel_name: str) -> Tuple[np.ndarray,
     return t, x
 
 
+@lru_cache(maxsize=512)
+def _load_otb4_track_series(path: Path, device: str, subtitle: str) -> Tuple[np.ndarray, np.ndarray]:
+    for _offset, track, raw_arr in _load_otb4_track_data(path):
+        if int(track.get("NumberOfChannels", 0) or 0) != 1:
+            continue
+        if str(track.get("Device", "")).strip() != str(device).strip():
+            continue
+        if str(track.get("SubTitle", "")).strip() != str(subtitle).strip():
+            continue
+        raw = np.asarray(raw_arr[0], dtype=float).reshape(-1)
+        x = raw * float(_track_conversion_factor(track))
+        fs = float(track.get("SamplingFrequency") or 0.0)
+        t = np.arange(len(x), dtype=float) / fs if fs > 0 else np.arange(len(x), dtype=float)
+        if str(subtitle).strip() == "Ramp":
+            x = _to_ascending_ramp(raw).astype(float)
+        return t, x
+    raise ValueError(f"Missing OTB4 track {device} {subtitle}")
+
+
+@lru_cache(maxsize=512)
 def _load_c3d_point_channel(path: Path, channel_name: str) -> Tuple[np.ndarray, np.ndarray]:
     meta = _c3d_metadata(path)
     labels = meta["point_labels"]
@@ -3270,8 +4772,9 @@ def _load_c3d_point_channel(path: Path, channel_name: str) -> Tuple[np.ndarray, 
     return t, x
 
 
+@lru_cache(maxsize=512)
 def _load_tsv_channel(path: Path, channel_name: str) -> Tuple[np.ndarray, np.ndarray]:
-    df = pd.read_csv(path, sep="\t", decimal=",", encoding="utf-8-sig")
+    _cols, df = _read_tsv_table(path)
     if channel_name in df.columns:
         x = pd.to_numeric(df[channel_name], errors="coerce").to_numpy(dtype=float)
     elif channel_name.strip().lower() == "performed":
@@ -3303,12 +4806,50 @@ def _channel_list_for_record(record: Dict[str, Any]) -> List[str]:
     return names
 
 
+def _otb4_probe_track_options(record: Dict[str, Any]) -> List[Tuple[str, Dict[str, Any]]]:
+    options: List[Tuple[str, Dict[str, Any]]] = []
+    diag = dict(record.get("probe_sync_diagnostics") or {})
+    if not diag:
+        path = str(record.get("path") or "")
+        if path:
+            cached = _OTB4_PROBE_DIAG_CACHE.get(_otb4_probe_diag_cache_key(path, None))
+            if cached:
+                diag = dict(cached)
+                record["probe_sync_diagnostics"] = dict(cached)
+            else:
+                try:
+                    diag = _extract_otb4_probe_sync_diagnostics(Path(path))
+                except Exception:
+                    diag = {}
+                if diag:
+                    _OTB4_PROBE_DIAG_CACHE[_otb4_probe_diag_cache_key(path, None)] = dict(diag)
+                    record["probe_sync_diagnostics"] = dict(diag)
+    for probe in diag.get("probes") or []:
+        device = str(probe.get("device") or "").strip()
+        if not device:
+            continue
+        options.append(
+            (
+                f"OTB4 probe buffer: {device}",
+                {"source": "otb4", "channel": f"{device} Buffer", "kind": "probe_buffer", "device": device, "subtitle": "Buffer"},
+            )
+        )
+        options.append(
+            (
+                f"OTB4 probe ramp: {device}",
+                {"source": "otb4", "channel": f"{device} Ramp", "kind": "probe_ramp", "device": device, "subtitle": "Ramp"},
+            )
+        )
+    return options
+
+
 def _channel_options_for_record(record: Dict[str, Any]) -> List[Tuple[str, Dict[str, Any]]]:
     options: List[Tuple[str, Dict[str, Any]]] = []
     kind = record["kind"]
     if kind == "otb4":
         for ch in _channel_list_for_record(record):
             options.append((f"OTB4: {ch}", {"source": "otb4", "channel": ch, "kind": "sync" if ch == record.get("sync_channel") else "otb4"}))
+        options.extend(_otb4_probe_track_options(record))
     elif kind == "c3d":
         for ch in ("copx", "copy"):
             options.append((f"C3D CoP: {ch}", {"source": "c3d", "channel": ch, "kind": "cop"}))
@@ -3332,6 +4873,17 @@ def _sync_series_specs(match: Dict[str, Any]) -> List[Dict[str, Any]]:
     return specs
 
 
+def _probe_detail_series_specs(match: Dict[str, Any], device: str) -> List[Dict[str, Any]]:
+    specs: List[Dict[str, Any]] = []
+    diag = _otb4_probe_sync_diagnostics(match)
+    probe = next((item for item in (diag.get("probes") or []) if str(item.get("device") or "") == str(device)), None)
+    if probe is None:
+        return specs
+    specs.append({"source": "otb4", "channel": f"{device} Buffer", "kind": "probe_buffer", "device": device, "subtitle": "Buffer"})
+    specs.append({"source": "otb4", "channel": f"{device} Ramp", "kind": "probe_ramp", "device": device, "subtitle": "Ramp"})
+    return specs
+
+
 def _raw_series_specs(match: Dict[str, Any]) -> List[Dict[str, Any]]:
     alignment = match.get("alignment") or {}
     tsv_channel = alignment.get("raw_label_match_tsv")
@@ -3347,13 +4899,20 @@ def _raw_series_specs(match: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 def _load_series_for_spec(match: Dict[str, Any], spec: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray]:
     source = spec["source"]
+    probe_shift_sec = 0.0
     if source == "otb4":
-        device = _otb_label_device(spec["channel"])
-        t, y = _load_otb4_channel(
-            Path(match[source]["path"]),
-            spec["channel"],
-            repair_zones=_repair_zones_for_match(match, device=device),
-        )
+        if spec.get("kind") in {"probe_buffer", "probe_ramp"} and spec.get("device") and spec.get("subtitle"):
+            t, y = _load_otb4_track_series(Path(match[source]["path"]), str(spec.get("device")), str(spec.get("subtitle")))
+            diag = _otb4_probe_sync_diagnostics(match)
+            probe = next((item for item in (diag.get("probes") or []) if str(item.get("device") or "") == str(spec.get("device"))), None)
+            probe_shift_sec = -float((probe or {}).get("optimal_lag_sec") or 0.0)
+        else:
+            device = _otb_label_device(spec["channel"])
+            t, y = _load_otb4_channel(
+                Path(match[source]["path"]),
+                spec["channel"],
+                repair_zones=_repair_zones_for_match(match, device=device),
+            )
     elif source == "c3d":
         t, y = _load_c3d_series(Path(match[source]["path"]), spec.get("c3d_kind") or spec.get("kind") or "analog", spec["channel"])
     elif source == "tsv":
@@ -3361,7 +4920,7 @@ def _load_series_for_spec(match: Dict[str, Any], spec: Dict[str, Any]) -> Tuple[
     else:
         raise ValueError(source)
     shift = float(_match_plot_shifts(match).get(source, 0.0))
-    return t + shift, y
+    return t + shift + probe_shift_sec, y
 
 
 def _mat_field_name(label: str, used: set[str]) -> str:
@@ -3598,6 +5157,7 @@ def export_match_mat(match: Dict[str, Any], export_root: Path) -> Path:
     otb4_struct = _build_otb4_mat_struct(match, float(start_sec), float(end_sec))
     c3d_struct = _build_c3d_mat_struct(match, float(start_sec), float(end_sec))
     tsv_struct = _build_tsv_mat_struct(match, float(start_sec), float(end_sec)) if match.get("tsv") else {}
+    tracebio_struct = _build_tracebio_fullrate_struct(match, float(start_sec), float(end_sec)) if match.get("tsv") else {}
     mat_dict = {
         "meta": {
             "match_id": int(match["match_id"]),
@@ -3632,6 +5192,7 @@ def export_match_mat(match: Dict[str, Any], export_root: Path) -> Path:
         "c3d_point": c3d_struct["point"],
         "c3d_cop": c3d_struct["cop"],
         "tsv": tsv_struct,
+        "tsv_reconstructed": tracebio_struct,
     }
     savemat(str(out_path), _mat_safe(mat_dict), long_field_names=True, do_compression=True)
     _write_merge_info_txt(out_path, match)
@@ -3846,28 +5407,327 @@ def _load_aligned_series(match: Dict[str, Any], spec: Dict[str, Any]) -> Tuple[n
     return t + shift, y
 
 
-def _build_common_otb_target(match: Dict[str, Any]) -> Dict[str, Any]:
+def _parse_tracebio_scalar(value: Any) -> Any:
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return text
+        text = text.replace(",", ".")
+        try:
+            if any(ch in text for ch in (".", "e", "E")):
+                return float(text)
+            return int(text)
+        except Exception:
+            return value
+    return value
+
+
+def _tracebio_settings_path(match: Dict[str, Any]) -> Optional[Path]:
+    override = _tracebio_settings_path_override(match)
+    if override is not None:
+        return override
+    export_plan = match.get("export_plan") or {}
+    matched_json = ((export_plan.get("matched") or {}).get("tsv_json") or {})
+    for key in ("renamed_path", "original_path"):
+        candidate = matched_json.get(key)
+        if candidate:
+            path = Path(str(candidate))
+            if path.exists():
+                return path
+    path = _tsv_sidecar_json_path(match)
+    if path is not None and path.exists():
+        return path
+    return None
+
+
+def _load_tracebio_settings(match: Dict[str, Any]) -> Dict[str, Any]:
+    path = _tracebio_settings_path(match)
+    if path is None:
+        raise FileNotFoundError("traceBio settings JSON not found for matched TSV.")
+    return json.loads(path.read_text(encoding="utf-8-sig"))
+
+
+def _tracebio_settings_path_override(match: Dict[str, Any]) -> Optional[Path]:
+    tracebio_state = ((match.get("export_plan") or {}).get("tracebio") or {})
+    candidate = tracebio_state.get("settings_json_override")
+    if not candidate:
+        return None
+    path = Path(str(candidate))
+    return path if path.exists() else None
+
+
+def _sync_tracebio_settings_export_plan(match: Dict[str, Any], path: Path) -> None:
+    matched = match.setdefault("export_plan", {}).setdefault("matched", {})
+    plan = matched.setdefault("tsv_json", {})
+    plan["original_path"] = str(path)
+    plan["original_filename"] = path.name
+
+
+def _set_tracebio_settings_path_override(match: Dict[str, Any], path: Path) -> None:
+    resolved = Path(path)
+    match.setdefault("export_plan", {}).setdefault("tracebio", {})["settings_json_override"] = str(resolved)
+    _sync_tracebio_settings_export_plan(match, resolved)
+
+
+def _tracebio_selected_path_override(match: Dict[str, Any]) -> Optional[Path]:
+    tracebio_state = ((match.get("export_plan") or {}).get("tracebio") or {})
+    candidate = tracebio_state.get("selected_path_override")
+    if not candidate:
+        return None
+    path = Path(str(candidate))
+    return path if path.exists() else None
+
+
+def _tracebio_settings_search_roots(match: Dict[str, Any], path_file: Optional[Path] = None) -> List[Path]:
+    roots: List[Path] = []
+
+    def _add(root: Optional[Path]) -> None:
+        if root is None:
+            return
+        try:
+            resolved = root.resolve()
+        except Exception:
+            resolved = root
+        if resolved.exists() and resolved.is_dir() and all(str(resolved).lower() != str(existing).lower() for existing in roots):
+            roots.append(resolved)
+
+    settings_override = _tracebio_settings_path_override(match)
+    if settings_override is not None:
+        _add(settings_override.parent)
+
+    settings_path = _tracebio_settings_path(match)
+    if settings_path is not None:
+        _add(settings_path.parent)
+
+    tsv_path = Path(str((match.get("tsv") or {}).get("path") or "")).resolve() if (match.get("tsv") or {}).get("path") else None
+    if tsv_path is not None:
+        _add(tsv_path.parent)
+        _add(tsv_path.parent / "settings")
+        _add(tsv_path.parent.parent / "settings")
+
+    if path_file is not None:
+        try:
+            selected_path = Path(path_file).resolve()
+        except Exception:
+            selected_path = Path(path_file)
+        _add(selected_path.parent)
+        _add(selected_path.parent / "settings")
+        _add(selected_path.parent.parent / "settings")
+
+    source_root = match.get("source_root")
+    if source_root:
+        _add(Path(str(source_root)) / "settings")
+    return roots
+
+
+def _tracebio_find_settings_for_path(match: Dict[str, Any], path_file: Path) -> Optional[Path]:
+    selected_name = path_file.name.strip().lower()
+    if not selected_name:
+        return None
+    for root in _tracebio_settings_search_roots(match, path_file=path_file):
+        for candidate in root.glob("*.json"):
+            try:
+                data = json.loads(candidate.read_text(encoding="utf-8-sig"))
+            except Exception:
+                continue
+            configured = Path(str(data.get("SelectedPath") or "")).name.strip().lower()
+            if configured and configured == selected_name:
+                return candidate
+    return None
+
+
+def _set_tracebio_selected_path_override(match: Dict[str, Any], path: Path) -> None:
+    resolved = Path(path)
+    tracebio_state = match.setdefault("export_plan", {}).setdefault("tracebio", {})
+    tracebio_state["selected_path_override"] = str(resolved)
+    inferred_settings = _tracebio_find_settings_for_path(match, resolved)
+    if inferred_settings is not None:
+        tracebio_state["settings_json_override"] = str(inferred_settings)
+        _sync_tracebio_settings_export_plan(match, inferred_settings)
+
+
+def _tracebio_paths_roots(match: Dict[str, Any]) -> List[Path]:
+    roots: List[Path] = []
+
+    def _add_file_related_roots(candidate: Any) -> None:
+        if not candidate:
+            return
+        try:
+            path = Path(str(candidate))
+        except Exception:
+            return
+        candidates = [path.parent / "paths", path.parent.parent / "paths"]
+        for root in candidates:
+            try:
+                resolved = root.resolve()
+            except Exception:
+                resolved = root
+            if resolved.exists() and resolved.is_dir() and all(str(resolved).lower() != str(existing).lower() for existing in roots):
+                roots.append(resolved)
+
+    override = _tracebio_selected_path_override(match)
+    if override is not None:
+        override_root = override.parent.resolve()
+        roots.append(override_root)
+
+    export_plan = match.get("export_plan") or {}
+    matched_plan = export_plan.get("matched") or {}
+    for branch in ("tsv_json", "tsv_file"):
+        data = matched_plan.get(branch) or {}
+        _add_file_related_roots(data.get("original_path"))
+        _add_file_related_roots(data.get("renamed_path"))
+
+    settings_path = _tracebio_settings_path(match)
+    if settings_path is not None:
+        _add_file_related_roots(settings_path)
+
+    _add_file_related_roots((match.get("tsv") or {}).get("path"))
+    return roots
+
+
+def _tracebio_axis_hint(settings: Dict[str, Any]) -> str:
+    signal = str(settings.get("SelectedSignal") or "").strip().lower()
+    if "/cop/cy " in signal:
+        return "ap"
+    if "/cop/cx " in signal:
+        return "ml"
+    return ""
+
+
+def _tracebio_name_tokens(text: str) -> List[str]:
+    return re.findall(r"[a-z0-9]+", str(text).lower())
+
+
+def _tracebio_selected_path_file(match: Dict[str, Any], settings: Dict[str, Any]) -> Path:
+    override = _tracebio_selected_path_override(match)
+    if override is not None:
+        return override
+
+    selected = str(settings.get("SelectedPath") or "").strip()
+    if not selected:
+        raise FileNotFoundError("traceBio settings JSON does not contain SelectedPath.")
+
+    roots = _tracebio_paths_roots(match)
+    tried: List[str] = []
+    for root in roots:
+        direct = root / selected
+        tried.append(str(direct))
+        if direct.exists():
+            return direct
+
+    axis_hint = _tracebio_axis_hint(settings)
+    target_tokens = set(_tracebio_name_tokens(Path(selected).stem))
+    target_numbers = {token for token in target_tokens if token.isdigit()}
+    best_path: Optional[Path] = None
+    best_score: Optional[Tuple[int, int, int, int, str]] = None
+    for root in roots:
+        for candidate in root.glob("*.tsv"):
+            candidate_tokens = set(_tracebio_name_tokens(candidate.stem))
+            overlap = len(target_tokens & candidate_tokens)
+            number_overlap = len(target_numbers & {token for token in candidate_tokens if token.isdigit()})
+            axis_match = 1 if axis_hint and axis_hint in candidate.stem.lower() else 0
+            if overlap <= 0 and number_overlap <= 0:
+                continue
+            score = (-axis_match, -number_overlap, -overlap, len(candidate.name), candidate.name.lower())
+            if best_score is None or score < best_score:
+                best_score = score
+                best_path = candidate
+    if best_path is not None:
+        return best_path
+
+    tried_text = "\n".join(tried[:8])
+    suffix = f"\nTried:\n{tried_text}" if tried_text else ""
+    raise FileNotFoundError(f"SelectedPath not found in paths folder for '{selected}'.{suffix}")
+
+
+def _load_tracebio_path_vertices(path: Path) -> Tuple[np.ndarray, np.ndarray]:
+    df = pd.read_csv(path, sep="\t", decimal=",", encoding="utf-8-sig")
+    if not {"seconds", "value"}.issubset(df.columns):
+        raise ValueError(f"Path file {path} does not contain required columns: seconds, value")
+    t = pd.to_numeric(df["seconds"], errors="coerce").to_numpy(dtype=float)
+    y = pd.to_numeric(df["value"], errors="coerce").to_numpy(dtype=float)
+    mask = np.isfinite(t) & np.isfinite(y)
+    if np.count_nonzero(mask) < 2:
+        raise ValueError(f"Path file {path} does not contain at least two valid vertices.")
+    t = t[mask]
+    y = y[mask]
+    order = np.argsort(t)
+    return t[order], y[order]
+
+
+def _tracebio_zero_offset_m(tsv_raw: np.ndarray, tsv_offset: np.ndarray, raw_m: np.ndarray) -> float:
+    delta = np.asarray(tsv_raw, dtype=float) - np.asarray(tsv_offset, dtype=float)
+    finite_delta = delta[np.isfinite(delta)]
+    if finite_delta.size:
+        return float(np.nanmedian(finite_delta))
+    finite_raw = np.asarray(raw_m, dtype=float)
+    finite_raw = finite_raw[np.isfinite(finite_raw)]
+    if finite_raw.size:
+        return float(np.nanmedian(finite_raw))
+    return 0.0
+
+
+def _tracebio_resolve_record_limits(
+    settings: Dict[str, Any],
+    *,
+    offset_m: np.ndarray,
+    tsv_offset: np.ndarray,
+) -> Tuple[float, float]:
+    record_min_m = float(_parse_tracebio_scalar(settings.get("RecordMin")))
+    record_max_m = float(_parse_tracebio_scalar(settings.get("RecordMax")))
+    if np.isfinite(record_min_m) and np.isfinite(record_max_m) and record_max_m > record_min_m:
+        return float(record_min_m), float(record_max_m)
+
+    finite_tsv_offset = np.asarray(tsv_offset, dtype=float)
+    finite_tsv_offset = finite_tsv_offset[np.isfinite(finite_tsv_offset)]
+    if finite_tsv_offset.size >= 2:
+        lo = float(np.nanmin(finite_tsv_offset))
+        hi = float(np.nanmax(finite_tsv_offset))
+        if np.isfinite(lo) and np.isfinite(hi) and hi > lo:
+            return lo, hi
+
+    finite_offset = np.asarray(offset_m, dtype=float)
+    finite_offset = finite_offset[np.isfinite(finite_offset)]
+    if finite_offset.size >= 2:
+        lo = float(np.nanmin(finite_offset))
+        hi = float(np.nanmax(finite_offset))
+        if np.isfinite(lo) and np.isfinite(hi) and hi > lo:
+            return lo, hi
+
+    center = float(np.nanmedian(finite_offset)) if finite_offset.size else 0.0
+    return center - 0.5, center + 0.5
+
+
+def _build_common_c3d_target(match: Dict[str, Any]) -> Dict[str, Any]:
     inner_merge = ((match.get("alignment") or {}).get("inner_merge") or {})
     start_sec = inner_merge.get("inner_merge_start_sec")
     end_sec = inner_merge.get("inner_merge_end_sec")
     if not isinstance(start_sec, (int, float)) or not isinstance(end_sec, (int, float)) or end_sec <= start_sec:
         raise ValueError("Common matched time window is unavailable.")
 
+    c3d_record = match.get("c3d") or {}
+    first_label = next(iter(c3d_record.get("channel_names") or []), None)
+    if not first_label:
+        raise ValueError("C3D analog labels are unavailable.")
+    c3d_path = Path(c3d_record["path"])
+    t_native, _y = _load_c3d_analog_channel(c3d_path, first_label)
+    target_fs = float(_c3d_metadata(c3d_path)["analog_rate"])
+    aligned_time = np.asarray(t_native, dtype=float) + float(_match_plot_shifts(match).get("c3d", 0.0))
+    mask = np.isfinite(aligned_time) & (aligned_time >= float(start_sec)) & (aligned_time <= float(end_sec))
+    if not np.any(mask):
+        raise ValueError("No C3D analog samples in common matched time window.")
+
     otb_path = Path(match["otb4"]["path"])
-    otb_data, otb_time, descs, fs, _name, _size = load_otb4_file(str(otb_path))
+    otb_data, otb_time, descs, otb_fs, _name, _size = load_otb4_file(str(otb_path))
     otb_data = np.asarray(otb_data, dtype=float)
     labels = _description_texts(descs)
     full_len = _max_otb_repaired_length(match, int(otb_data.shape[1]), labels)
-    otb_shift = float(_match_plot_shifts(match).get("otb4", 0.0))
-    aligned_otb_time = np.arange(full_len, dtype=float) / float(fs) + otb_shift
-    mask = np.isfinite(aligned_otb_time) & (aligned_otb_time >= float(start_sec)) & (aligned_otb_time <= float(end_sec))
-    if not np.any(mask):
-        raise ValueError("No OTB4 samples in common matched time window.")
-    target_t = aligned_otb_time[mask]
+    otb_aligned_time = np.arange(full_len, dtype=float) / float(otb_fs) + float(_match_plot_shifts(match).get("otb4", 0.0))
+    target_t = aligned_time[mask]
     return {
         "start_sec": float(start_sec),
         "end_sec": float(end_sec),
-        "fs": float(fs),
+        "fs": float(target_fs),
         "path": otb_path,
         "data": otb_data,
         "labels": labels,
@@ -3875,14 +5735,109 @@ def _build_common_otb_target(match: Dict[str, Any]) -> Dict[str, Any]:
         "mask": mask,
         "target_t": target_t,
         "out_time": target_t - float(start_sec),
+        "c3d_path": c3d_path,
+        "otb_aligned_time": otb_aligned_time,
+    }
+
+
+def _build_tracebio_fullrate_struct(match: Dict[str, Any], start_sec: float, end_sec: float) -> Dict[str, Any]:
+    if not match.get("tsv") or not match.get("c3d"):
+        return {}
+    settings = _load_tracebio_settings(match)
+    path_file = _tracebio_selected_path_file(match, settings)
+    path_t, path_y = _load_tracebio_path_vertices(path_file)
+    bundle = _build_common_c3d_target(match)
+    target_t = np.asarray(bundle["target_t"], dtype=float)
+    out_time = np.asarray(bundle["out_time"], dtype=float)
+    c3d_path = Path((match.get("c3d") or {})["path"])
+    c3d_shift = float(_match_plot_shifts(match).get("c3d", 0.0))
+
+    selected_signal = str(settings.get("SelectedSignal") or "").strip()
+    signal_key = selected_signal.lower()
+    if "/cop/cy " in signal_key:
+        moment_label = "Moment.Mx1"
+    elif "/cop/cx " in signal_key:
+        moment_label = "Moment.My1"
+    else:
+        raise ValueError(f"Unsupported traceBio SelectedSignal: {selected_signal}")
+    force_label = "Force.Fz1"
+
+    t_force, force_z = _load_c3d_analog_channel(c3d_path, force_label)
+    t_moment, moment = _load_c3d_analog_channel(c3d_path, moment_label)
+    t_force = t_force + c3d_shift
+    t_moment = t_moment + c3d_shift
+    force_full = _resample_to_target_time(target_t, t_force, force_z)
+    moment_full = _resample_to_target_time(target_t, t_moment, moment)
+    valid_force = np.abs(force_full) > 1e-9
+    raw_m = np.full(target_t.shape, np.nan, dtype=float)
+    raw_m[valid_force] = moment_full[valid_force] / force_full[valid_force] / 1000.0
+
+    tsv_path = Path((match.get("tsv") or {})["path"])
+    _cols, tsv_df = _read_tsv_table(tsv_path)
+    raw_column = f"{selected_signal} [raw]"
+    offset_column = f"{selected_signal} [offset]"
+    if raw_column not in tsv_df.columns or offset_column not in tsv_df.columns:
+        raw_column, offset_column = _find_tsv_raw_offset_pair(list(tsv_df.columns))
+    if raw_column is None or offset_column is None:
+        raise ValueError("TSV raw/offset columns for traceBio reconstruction are unavailable.")
+    tsv_raw = _tsv_numeric_column(tsv_df, raw_column)
+    tsv_offset = _tsv_numeric_column(tsv_df, offset_column)
+    zero_offset_m = _tracebio_zero_offset_m(tsv_raw, tsv_offset, raw_m)
+    offset_m = raw_m - zero_offset_m
+
+    record_min_m, record_max_m = _tracebio_resolve_record_limits(settings, offset_m=offset_m, tsv_offset=tsv_offset)
+    performed_percent_unsmoothed = np.clip(100.0 * (offset_m - record_min_m) / (record_max_m - record_min_m), 0.0, 100.0)
+
+    if "t_rel" in tsv_df.columns:
+        tsv_rel = pd.to_numeric(tsv_df["t_rel"], errors="coerce").to_numpy(dtype=float)
+        tsv_rel = tsv_rel[np.isfinite(tsv_rel)]
+        tsv_path_start_aligned = float(_match_plot_shifts(match).get("tsv", 0.0)) + (float(tsv_rel[0]) if tsv_rel.size else 0.0)
+    else:
+        tsv_path_start_aligned = float(_match_plot_shifts(match).get("tsv", 0.0))
+    path_relative_time = target_t - tsv_path_start_aligned
+    desired = np.interp(path_relative_time, path_t, path_y, left=float(path_y[0]), right=float(path_y[-1]))
+    corridor_half_width = float(_parse_tracebio_scalar(settings.get("CorridorHalfWidth")))
+    desired_upper = desired + corridor_half_width
+    desired_lower = desired - corridor_half_width
+
+    label_map = {
+        "performed_percent_unsmoothed": "Authoritative full-rate non-smoothed performed path in percent",
+        "desired": "Exact desired path from SelectedPath vertices",
+        "desired_upper": "Desired upper corridor bound",
+        "desired_lower": "Desired lower corridor bound",
+        "raw_m": raw_column,
+        "offset_m": offset_column,
+    }
+    return {
+        "time": out_time,
+        "frames": np.arange(target_t.size, dtype=np.int64),
+        "sample_rate": float(bundle["fs"]),
+        "performed_percent_unsmoothed": performed_percent_unsmoothed,
+        "desired": desired,
+        "desired_upper": desired_upper,
+        "desired_lower": desired_lower,
+        "raw_m": raw_m,
+        "offset_m": offset_m,
+        "zero_offset_m": float(zero_offset_m),
+        "record_min_m": float(record_min_m),
+        "record_max_m": float(record_max_m),
+        "selected_signal": selected_signal,
+        "selected_path": str(settings.get("SelectedPath") or ""),
+        "selected_path_source": str(path_file),
+        "corridor_half_width": float(corridor_half_width),
+        "relative_mode": bool(settings.get("RelativeMode")),
+        "smoothing_method": str(settings.get("SmoothingMethod") or ""),
+        "smoothing_frames": int(_parse_tracebio_scalar(settings.get("SmoothingFrames")) or 0),
+        "label_map": label_map,
     }
 
 
 def _build_common_aligned_mat_struct(match: Dict[str, Any]) -> Dict[str, Any]:
-    bundle = _build_common_otb_target(match)
+    bundle = _build_common_c3d_target(match)
     target_t = np.asarray(bundle["target_t"], dtype=float)
     out_time = np.asarray(bundle["out_time"], dtype=float)
     fs = float(bundle["fs"])
+    otb_aligned_time = np.asarray(bundle["otb_aligned_time"], dtype=float)
     aligned: Dict[str, Any] = {
         "time": out_time,
         "frames": np.arange(target_t.size, dtype=np.int64),
@@ -3907,7 +5862,7 @@ def _build_common_aligned_mat_struct(match: Dict[str, Any]) -> Dict[str, Any]:
         elif row.size > bundle["full_len"]:
             row = row[: int(bundle["full_len"])]
         field = _mat_field_name(label, otb_used)
-        aligned["otb4"][field] = row[bundle["mask"]]
+        aligned["otb4"][field] = _resample_to_target_time(target_t, otb_aligned_time, row)
         otb_map[field] = label
     aligned["otb4"]["label_map"] = otb_map
 
@@ -3960,20 +5915,21 @@ def _build_common_aligned_mat_struct(match: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _build_pipe_bundle(match: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, Dict[str, Any]]:
-    bundle = _build_common_otb_target(match)
+    bundle = _build_common_c3d_target(match)
     otb_path = Path(bundle["path"])
     otb_data = np.asarray(bundle["data"], dtype=float)
     labels = list(bundle["labels"])
     fs = float(bundle["fs"])
     path_grids = _infer_otb_grids(labels)
     emg_groups = _infer_otb_emg_groups(otb_path)
-    mask = np.asarray(bundle["mask"], dtype=bool)
     target_t = np.asarray(bundle["target_t"], dtype=float)
     out_time = np.asarray(bundle["out_time"], dtype=float)
     target_fs = float(fs)
+    otb_aligned_time = np.asarray(bundle["otb_aligned_time"], dtype=float)
     data_out: List[np.ndarray] = []
     desc_out: List[str] = []
     json_means: Dict[str, Any] = {"filename": _pipe_mat_path(Path((((match.get("export_plan") or {}).get("mat") or {}).get("path") or "out.mat"))).name}
+    tracebio_fullrate = _build_tracebio_fullrate_struct(match, float(bundle["start_sec"]), float(bundle["end_sec"])) if match.get("tsv") else {}
 
     grid_by_end = {grid["block_end"]: grid for grid in path_grids}
     original_to_output: Dict[int, int] = {}
@@ -3987,26 +5943,27 @@ def _build_pipe_bundle(match: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray, n
             row = np.pad(row, (0, int(bundle["full_len"] - row.size)), constant_values=np.nan)
         elif row.size > bundle["full_len"]:
             row = row[: int(bundle["full_len"])]
-        col = row[mask].astype(float, copy=True)
+        col = _resample_to_target_time(target_t, otb_aligned_time, row).astype(float, copy=True)
         data_out.append(col)
         out_idx = len(data_out) - 1
         desc_out.append(label)
         original_to_output[idx] = out_idx
-        if idx in grid_by_end:
-            if "Performed Path" in [d for d in desc_out[-2:]] or "Original Path" in [d for d in desc_out[-2:]]:
-                continue
-            performed_col, original_col = _preferred_tsv_path_columns(match.get("tsv") or {})
-            if performed_col:
-                t, y = _load_aligned_series(match, {"source": "tsv", "channel": performed_col})
-                data_out.append(_resample_to_target_time(target_t, t, y))
+        if idx in grid_by_end and tracebio_fullrate:
+            if "Performed Path" not in desc_out:
+                data_out.append(np.asarray(tracebio_fullrate["performed_percent_unsmoothed"], dtype=float))
                 desc_out.append("Performed Path")
-            if original_col:
-                t, y = _load_aligned_series(match, {"source": "tsv", "channel": original_col})
-                data_out.append(_resample_to_target_time(target_t, t, y))
-                desc_out.append("Original Path")
+            if "Desired Path" not in desc_out:
+                data_out.append(np.asarray(tracebio_fullrate["desired"], dtype=float))
+                desc_out.append("Desired Path")
+            if "Desired Upper Path" not in desc_out:
+                data_out.append(np.asarray(tracebio_fullrate["desired_upper"], dtype=float))
+                desc_out.append("Desired Upper Path")
+            if "Desired Lower Path" not in desc_out:
+                data_out.append(np.asarray(tracebio_fullrate["desired_lower"], dtype=float))
+                desc_out.append("Desired Lower Path")
 
     for label, spec in _build_pipe_extra_specs(match):
-        if label in {"Performed Path", "Original Path"}:
+        if label in {"Performed Path", "Original Path", "Desired Path", "Desired Upper Path", "Desired Lower Path"}:
             continue
         t, y = _load_aligned_series(match, spec)
         data_out.append(_resample_to_target_time(target_t, t, y))
@@ -4062,6 +6019,10 @@ def _series_label(spec: Dict[str, Any]) -> str:
     source = spec["source"]
     channel = spec["channel"]
     prefix = {"otb4": "OTB4", "c3d": "C3D", "tsv": "TSV"}.get(source, source.upper())
+    if spec.get("kind") == "probe_buffer":
+        return f"{prefix} probe buffer: {spec.get('device')}"
+    if spec.get("kind") == "probe_ramp":
+        return f"{prefix} probe ramp: {spec.get('device')}"
     if spec.get("kind") == "point":
         return f"{prefix} point: {channel}"
     if spec.get("kind") == "cop":
@@ -4074,6 +6035,10 @@ def _series_label(spec: Dict[str, Any]) -> str:
 
 
 def _series_color(spec: Dict[str, Any]) -> str:
+    if spec.get("kind") == "probe_buffer":
+        return "#0A9396"
+    if spec.get("kind") == "probe_ramp":
+        return "#AE2012"
     if spec.get("kind") == "sync":
         return {"otb4": "#0B84A5", "c3d": "#F6C85F", "tsv": "#6F4E7C"}.get(spec["source"], "#666666")
     if spec.get("kind") == "point":
@@ -4138,6 +6103,7 @@ def _sync_annotation_text(match: Dict[str, Any], dedicated: Dict[str, Any]) -> s
     raw_corr = alignment.get("raw_alignment_corr")
     if isinstance(raw_corr, (int, float)):
         lines.append(f"used raw alignment: {alignment.get('raw_alignment_quality')}  corr={raw_corr:.3f}  lag={alignment.get('raw_alignment_lag_sec'):.3f}s")
+    lines.append(_otb4_probe_sync_annotation_text(match))
     return "\n".join(lines)
 
 
@@ -4148,8 +6114,10 @@ def _sync_status_text(match: Dict[str, Any], dedicated: Dict[str, Any]) -> str:
     if isinstance(raw_corr, (int, float)):
         raw_text += f" corr {raw_corr:.3f}"
     if dedicated.get("tsv_sync_missing"):
-        return f"Dedicated sync missing in TSV | OTB4/C3D {dedicated.get('pair_quality')} | {raw_text}"
-    return f"Dedicated sync {dedicated.get('quality')} | {raw_text}"
+        base = f"Dedicated sync missing in TSV | OTB4/C3D {dedicated.get('pair_quality')} | {raw_text}"
+    else:
+        base = f"Dedicated sync {dedicated.get('quality')} | {raw_text}"
+    return base + " | " + _otb4_probe_sync_summary_text(match)
 
 
 def _raw_annotation_text(match: Dict[str, Any]) -> str:
@@ -4208,29 +6176,47 @@ def _plot_source_files_text(match: Dict[str, Any], row_role: str, series_specs: 
             if source in {"otb4", "c3d", "tsv"} and source not in source_order and match.get(source):
                 source_order.append(source)
     if not source_order:
-        return "Files in this plot: none"
-    parts = [f"{source.upper()}={Path(str((match.get(source) or {}).get('path') or '')).name}" for source in source_order]
-    return "Files in this plot: " + " | ".join(parts)
+        return "Files: none"
+    parts = [f"{source.upper()}:{Path(str((match.get(source) or {}).get('path') or '')).name}" for source in source_order]
+    return "Files: " + " | ".join(parts)
 
 
 def _sync_plot_metric_text(match: Dict[str, Any], series_specs: Sequence[Dict[str, Any]]) -> str:
     dedicated = _dedicated_sync_agreement(match)
     plotted_sources = [str(spec.get("source") or "") for spec in series_specs if spec.get("kind") == "sync"]
     plotted_sources = [source for idx, source in enumerate(plotted_sources) if source and source not in plotted_sources[:idx]]
-    parts = [f"Sync evidence: {dedicated.get('quality') or 'missing'}"]
+    parts = [f"Sync {dedicated.get('quality') or 'missing'}"]
     mean_abs = dedicated.get("mean_abs_delta_ms")
     max_abs = dedicated.get("max_abs_delta_ms")
     spike_count = dedicated.get("spike_count")
     if isinstance(mean_abs, (int, float)):
-        parts.append(f"mean={float(mean_abs):.3f} ms")
+        parts.append(f"mean {float(mean_abs):.1f} ms")
     if isinstance(max_abs, (int, float)):
-        parts.append(f"max={float(max_abs):.3f} ms")
+        parts.append(f"max {float(max_abs):.1f} ms")
     if isinstance(spike_count, (int, float)):
         parts.append(f"n={int(spike_count)}")
     pair_text = _pairwise_sync_metric_text(dedicated, plotted_sources)
     if pair_text:
         parts.append(pair_text)
+    parts.append(_otb4_probe_sync_summary_text(match))
     return " | ".join(parts)
+
+
+def _probe_detail_plot_metric_text(match: Dict[str, Any], device: str) -> str:
+    diag = _otb4_probe_sync_diagnostics(match)
+    probe = next((item for item in (diag.get("probes") or []) if str(item.get("device") or "") == str(device)), None)
+    if not probe:
+        return "Probe sync detail unavailable."
+    ref_summary = probe.get("reference_summary") or {}
+    ref_expected = int((diag.get("reference_pattern") or {}).get("expected_event_count") or 0)
+    optimal_lag_sec = float(probe.get("optimal_lag_sec") or 0.0)
+    return (
+        f"{device} | {probe.get('sync_status')} | "
+        f"ok={int(ref_summary.get('matched_count') or 0)}/{ref_expected} | "
+        f"miss={int(ref_summary.get('unmatched_ref') or 0)} | extra={int(ref_summary.get('unmatched_other') or 0)} | "
+        f"shift={optimal_lag_sec * 1000.0:.1f} ms | "
+        f"{probe.get('sample_status')}"
+    )
 
 
 def _raw_plot_metric_text(match: Dict[str, Any]) -> str:
@@ -4239,11 +6225,10 @@ def _raw_plot_metric_text(match: Dict[str, Any]) -> str:
     lag_sec = alignment.get("raw_alignment_lag_sec")
     quality = alignment.get("raw_alignment_quality") or "missing"
     if not isinstance(corr, (int, float)) or not isinstance(lag_sec, (int, float)):
-        return "Raw evidence: unavailable"
+        return "Raw unavailable"
     return (
-        "Raw evidence: "
-        f"{quality} | corr={float(corr):.6f} | lag={float(lag_sec):.3f}s | "
-        f"C3D={alignment.get('raw_label_match_c3d') or 'missing'} | TSV={alignment.get('raw_label_match_tsv') or 'missing'}"
+        f"Raw {quality} | r={float(corr):.3f} | lag={float(lag_sec) * 1000.0:.1f} ms | "
+        f"{alignment.get('raw_label_match_c3d') or 'C3D?'} vs {alignment.get('raw_label_match_tsv') or 'TSV?'}"
     )
 
 
@@ -4254,9 +6239,12 @@ def _plot_decision_context_text(match: Dict[str, Any], row_role: str, series_spe
         lines.append(_sync_plot_metric_text(match, series_specs))
     if row_role == "raw" or "raw" in kinds:
         lines.append(_raw_plot_metric_text(match))
+    if row_role == "probe_detail":
+        device = str(next((spec.get("device") for spec in series_specs if spec.get("device")), "") or "")
+        lines.append(_probe_detail_plot_metric_text(match, device))
     if not lines:
-        lines.append("Decision evidence: this row is contextual only; sync/raw overlays carry the acceptance metrics.")
-    return "\n".join(lines)
+        lines.append("Context only; sync/raw rows carry the decision metrics.")
+    return " || ".join(lines)
 
 
 def _repair_gap_regions(match: Dict[str, Any]) -> List[Tuple[float, float]]:
@@ -4311,6 +6299,8 @@ def _repair_status_text(match: Dict[str, Any]) -> str:
 def _y_axis_label(row_role: str, series_specs: Sequence[Dict[str, Any]]) -> Tuple[str, Optional[str]]:
     if row_role == "raw":
         return "Normalized value", None
+    if row_role == "probe_detail":
+        return "Probe sync / ramp", None
     if len(series_specs) == 1 and series_specs[0].get("kind") in {"cop", "raw"}:
         return "Position", "m"
     return "Value", None
@@ -4474,7 +6464,7 @@ def _review_status_color(match: Dict[str, Any]) -> str:
 
 def _review_status_text_color(match: Dict[str, Any], selected: bool = False) -> str:
     if selected:
-        return "#000000"
+        return "#FFFFFF" if _review_status_key(match) in {"user_accept", "user_reject"} else "#000000"
     return "#FFFFFF" if _review_status_key(match) in {"user_accept", "user_reject"} else "#000000"
 
 
@@ -4484,20 +6474,255 @@ def _style_button(button, bg_color: str, fg_color: str) -> None:
     )
 
 
+def _html_badge(text: str, bg: str, fg: str = "#FFFFFF") -> str:
+    return (
+        f'<span style="background:{bg}; color:{fg}; border:1px solid {bg}; '
+        f'border-radius:10px; padding:3px 8px; font-weight:700;">{html.escape(text)}</span>'
+    )
+
+
+def _html_muted(text: str) -> str:
+    return f'<span style="color:#5F6B7A;">{html.escape(text)}</span>'
+
+
+def _report_label_style(bg: str, border: str, fg: str = "#17212B") -> str:
+    return (
+        "QLabel {"
+        f"background:{bg}; color:{fg}; border:1px solid {border}; border-radius:10px; "
+        "padding:10px 12px;"
+        "}"
+    )
+
+
+def _review_status_badge(match: Dict[str, Any]) -> str:
+    key = _review_status_key(match)
+    mapping = {
+        "auto_accept": ("AUTO-ACCEPT", "#D7F0DD", "#123A20"),
+        "user_accept": ("USER-ACCEPT", "#1E6B2D", "#FFFFFF"),
+        "auto_reject": ("AUTO-REJECT", "#F6D9D9", "#5B1F1F"),
+        "user_reject": ("USER-REJECT", "#8B1E1E", "#FFFFFF"),
+    }
+    text, bg, fg = mapping[key]
+    return _html_badge(text, bg, fg)
+
+
+def _certainty_badge(certainty: Any) -> str:
+    text = str(certainty or "unknown")
+    if text == "certain":
+        return _html_badge(f"Certainty: {text}", "#D7F0DD", "#123A20")
+    if text == "probable":
+        return _html_badge(f"Certainty: {text}", "#FFF0C7", "#6A4D00")
+    return _html_badge(f"Certainty: {text}", "#F6D9D9", "#5B1F1F")
+
+
+def _exportable_badge(match: Dict[str, Any]) -> str:
+    exportable = bool(match.get("otb4") and match.get("c3d") and match.get("tsv"))
+    return _html_badge(
+        "Exportable MAT" if exportable else "Review only",
+        "#DCEEFF" if exportable else "#F6D9D9",
+        "#154463" if exportable else "#5B1F1F",
+    )
+
+
+def _probe_health_badge(match: Dict[str, Any]) -> str:
+    diag = _otb4_probe_sync_diagnostics(match)
+    non_sync = int(diag.get("non_sync_probe_count") or 0)
+    total = len(diag.get("probes") or [])
+    if total <= 0:
+        return _html_badge("Probe sync: unavailable", "#E8EDF2", "#44515E")
+    if non_sync <= 0:
+        return _html_badge(f"Probe sync: {total}/{total} clean", "#D7F0DD", "#123A20")
+    return _html_badge(f"Probe sync: {non_sync} off-pattern", "#FFF0C7", "#6A4D00")
+
+
+def _header_rich_text(match: Dict[str, Any]) -> str:
+    alignment = match.get("alignment") or {}
+    inner_merge = alignment.get("inner_merge") or {}
+    review = match.get("review") or {}
+    merge_start = inner_merge.get("inner_merge_start_sec")
+    merge_end = inner_merge.get("inner_merge_end_sec")
+    merge_duration = inner_merge.get("inner_merge_duration_sec")
+    merge_text = "Common time window unavailable."
+    if isinstance(merge_start, (int, float)) and isinstance(merge_end, (int, float)) and isinstance(merge_duration, (int, float)):
+        merge_text = f"Common time window: {merge_start:.3f}s to {merge_end:.3f}s ({merge_duration:.3f}s)"
+    match_title = f"Match {int(match.get('match_id') or 0):03d}"
+    line1 = " ".join(
+        [
+            _review_status_badge(match),
+            _certainty_badge(match.get("certainty")),
+            _exportable_badge(match),
+            _probe_health_badge(match),
+        ]
+    )
+    line2 = (
+        f"{_html_muted('Decision source')} <b>{html.escape(str(review.get('decision_source') or 'automatic'))}</b>"
+        f" &nbsp;&nbsp; {_html_muted('Merge window')} <b>{html.escape(merge_text)}</b>"
+    )
+    return (
+        f'<div style="font-size:18px; font-weight:700; color:#13202E;">{html.escape(match_title)}</div>'
+        f'<div style="margin-top:6px;">{line1}</div>'
+        f'<div style="margin-top:8px; font-size:13px;">{line2}</div>'
+    )
+
+
+def _progress_rich_text(
+    reviewed_count: int,
+    total_count: int,
+    user_accept_count: int,
+    user_reject_count: int,
+    free_c3d: int,
+    free_otb4: int,
+    free_tsv: int,
+) -> str:
+    parts = [
+        _html_badge(f"Reviewed {reviewed_count}/{total_count}", "#DCEEFF", "#154463"),
+        _html_badge(f"User accepted {user_accept_count}", "#D7F0DD", "#123A20"),
+        _html_badge(f"User rejected {user_reject_count}", "#F6D9D9", "#5B1F1F"),
+        _html_badge(f"Free C3D {free_c3d}", "#EEF2F6", "#44515E"),
+        _html_badge(f"Free OTB4 {free_otb4}", "#EEF2F6", "#44515E"),
+        _html_badge(f"Free TSV {free_tsv}", "#EEF2F6", "#44515E"),
+    ]
+    helper = _html_muted("Auto-accept expects excellent raw agreement and strong OTB4/C3D sync.")
+    return f'<div style="line-height:1.8;">{" ".join(parts)}</div><div style="margin-top:6px;">{helper}</div>'
+
+
+def _scan_notes_rich_text(notes: Sequence[str]) -> str:
+    if not notes:
+        return '<span style="color:#5F6B7A;">No scan notes were recorded for this review.</span>'
+    items = "".join(
+        f'<li style="margin:4px 0;">{html.escape(str(note))}</li>'
+        for note in notes
+        if str(note).strip()
+    )
+    return f'<div style="font-weight:700; color:#13202E;">Important scan notes</div><ul style="margin:8px 0 0 18px;">{items}</ul>'
+
+
+def _sync_info_rich_text(match: Dict[str, Any], dedicated: Dict[str, Any]) -> str:
+    alignment = match.get("alignment") or {}
+    quality = str(dedicated.get("quality") or "missing")
+    pair_quality = str(dedicated.get("pair_quality") or "insufficient")
+    mean_abs = dedicated.get("mean_abs_delta_ms")
+    max_abs = dedicated.get("max_abs_delta_ms")
+    spike_count = int(dedicated.get("spike_count") or 0)
+    diag = _otb4_probe_sync_diagnostics(match)
+    non_sync = int(diag.get("non_sync_probe_count") or 0)
+    bits = [f"<b>Dedicated sync:</b> {html.escape(quality)}"]
+    if isinstance(mean_abs, (int, float)):
+        bits.append(f"<b>Mean abs:</b> {float(mean_abs):.3f} ms")
+    if isinstance(max_abs, (int, float)):
+        bits.append(f"<b>Max abs:</b> {float(max_abs):.3f} ms")
+    if spike_count:
+        bits.append(f"<b>Spikes:</b> {spike_count}")
+    bits.append(f"<b>Pair quality:</b> {html.escape(pair_quality)}")
+    if non_sync:
+        bits.append(f"<b>Probe warning:</b> {non_sync} off-pattern")
+    helper = html.escape(_repair_status_text(match))
+    if alignment.get("dedicated_sync_quality") == "missing_tsv_sync":
+        helper += "<br><span style='color:#7A5A00;'>TSV dedicated sync missing, so raw alignment matters more here.</span>"
+    return (
+        '<div style="font-size:14px; font-weight:700; color:#123A20;">Sync evidence</div>'
+        f'<div style="margin-top:6px; line-height:1.7;">{" &nbsp;&nbsp; ".join(bits)}</div>'
+        f'<div style="margin-top:8px; color:#3D4955;">{helper}</div>'
+    )
+
+
+def _raw_info_rich_text(match: Dict[str, Any], missing_reason: Optional[str] = None) -> str:
+    alignment = match.get("alignment") or {}
+    if missing_reason:
+        return (
+            '<div style="font-size:14px; font-weight:700; color:#7A1F1F;">Raw evidence unavailable</div>'
+            f'<div style="margin-top:6px; color:#4B5563;">{html.escape(missing_reason)}</div>'
+        )
+    corr = alignment.get("raw_alignment_corr")
+    lag_sec = alignment.get("raw_alignment_lag_sec")
+    quality = str(alignment.get("raw_alignment_quality") or "missing")
+    bits = [f"<b>Raw match:</b> {html.escape(quality)}"]
+    if isinstance(corr, (int, float)):
+        bits.append(f"<b>Corr:</b> {float(corr):.6f}")
+    if isinstance(lag_sec, (int, float)):
+        bits.append(f"<b>Lag:</b> {float(lag_sec):.3f}s")
+    bits.append(f"<b>C3D:</b> {html.escape(str(alignment.get('raw_label_match_c3d') or 'missing'))}")
+    bits.append(f"<b>TSV:</b> {html.escape(str(alignment.get('raw_label_match_tsv') or 'missing'))}")
+    return (
+        '<div style="font-size:14px; font-weight:700; color:#154463;">Raw evidence</div>'
+        f'<div style="margin-top:6px; line-height:1.7;">{" &nbsp;&nbsp; ".join(bits)}</div>'
+    )
+
+
+def _queue_summary_rich_text(mapping: Dict[str, Any], matches: Sequence[Dict[str, Any]]) -> str:
+    total = len(matches)
+    user_accept = sum(1 for match in matches if _review_status_key(match) == "user_accept")
+    user_reject = sum(1 for match in matches if _review_status_key(match) == "user_reject")
+    auto_accept = sum(1 for match in matches if _review_status_key(match) == "auto_accept")
+    auto_reject = sum(1 for match in matches if _review_status_key(match) == "auto_reject")
+    return (
+        '<div style="line-height:1.8;">'
+        + " ".join(
+            [
+                _html_badge(f"Total {total}", "#DCEEFF", "#154463"),
+                _html_badge(f"Auto accept {auto_accept}", "#D7F0DD", "#123A20"),
+                _html_badge(f"Auto reject {auto_reject}", "#F6D9D9", "#5B1F1F"),
+                _html_badge(f"User accept {user_accept}", "#1E6B2D", "#FFFFFF"),
+                _html_badge(f"User reject {user_reject}", "#8B1E1E", "#FFFFFF"),
+            ]
+        )
+        + "</div>"
+    )
+
+
+def _queue_code_legend_text() -> str:
+    return (
+        "Queue codes:\n"
+        "AA = auto-accepted\n"
+        "AR = auto-rejected\n"
+        "UA = user-accepted\n"
+        "UR = user-rejected\n"
+        "RV = review/manual state\n"
+        "M = manual create/reassignment involved\n"
+        "[C] = certain, [U] = uncertain, [P] = possible\n"
+        "S: = dedicated sync quality\n"
+        "R: = raw-alignment quality\n"
+        "P!: = non-sync probe count"
+    )
+
+
 def _review_item_text(match: Dict[str, Any]) -> str:
     status = _review_status_label(match)
     quality = (match.get("alignment") or {}).get("dedicated_sync_quality")
     raw_q = (match.get("alignment") or {}).get("raw_alignment_quality")
-    manual = " | MANUAL" if (
+    certainty = str(match.get("certainty") or "?")
+    diag = _otb4_probe_sync_diagnostics(match)
+    probe_warn = int(diag.get("non_sync_probe_count") or 0)
+    manual = " M" if (
         match.get("manual_selection")
         or ((match.get("alignment") or {}).get("manual_selection"))
         or ((match.get("alignment") or {}).get("manual_reassignment"))
     ) else ""
-    text = f"{match['match_id']:03d} | {status}{manual} | sync={quality} | raw={raw_q} | {Path(match['otb4']['path']).name}"
+    status_short = {
+        "AUTO-ACCEPT": "AA",
+        "AUTO-REJECT": "AR",
+        "USER-ACCEPT": "UA",
+        "USER-REJECT": "UR",
+        "REVIEW": "RV",
+    }.get(status, status[:2])
+    certainty_short = {
+        "certain": "C",
+        "uncertain": "U",
+        "possible": "P",
+    }.get(certainty.lower(), certainty[:1].upper() if certainty else "?")
+    primary_name = (
+        Path(str((match.get("otb4") or {}).get("path") or "")).name
+        or Path(str((match.get("c3d") or {}).get("path") or "")).name
+        or "missing"
+    )
+    text = (
+        f"{match['match_id']:03d} {status_short}{manual} [{certainty_short}] "
+        f"S:{quality or '-'} R:{raw_q or '-'} P!:{probe_warn} | {primary_name}"
+    )
     if match.get("tsv"):
         text += f" | {Path(match['tsv']['path']).name}"
     else:
-        text += " | TSV missing"
+        text += " | TSV:-"
     return text
 
 
@@ -4588,17 +6813,20 @@ _PICKER_CLEAR = object()
 
 
 class PlotRowWidget:
-    def __init__(self, viewer, title: str, series_specs: Optional[List[Dict[str, Any]]] = None, row_role: str = "custom"):
+    def __init__(self, viewer, title: str, series_specs: Optional[List[Dict[str, Any]]] = None, row_role: str = "custom", *, auto_generated: bool = False, context: Optional[Dict[str, Any]] = None):
         from PySide6 import QtWidgets
         import pyqtgraph as pg
 
         self.viewer = viewer
         self.title = title
         self.row_role = row_role
+        self.auto_generated = bool(auto_generated)
+        self.context = dict(context or {})
         self.series_specs: List[Dict[str, Any]] = list(series_specs or [])
         self.match: Optional[Dict[str, Any]] = None
         self.widget = QtWidgets.QFrame()
         self.widget.setFrameShape(QtWidgets.QFrame.Shape.StyledPanel)
+        self.widget.setSizePolicy(QtWidgets.QSizePolicy.Policy.Preferred, QtWidgets.QSizePolicy.Policy.Maximum)
         layout = QtWidgets.QVBoxLayout(self.widget)
         top = QtWidgets.QHBoxLayout()
         self.label = QtWidgets.QLabel(title)
@@ -4611,10 +6839,11 @@ class PlotRowWidget:
         layout.addLayout(top)
         self.plot = pg.PlotWidget()
         self.plot.showGrid(x=True, y=True, alpha=0.25)
+        self.plot.setMinimumHeight(250)
         layout.addWidget(self.plot)
         self.status = QtWidgets.QLabel("")
         self.status.setWordWrap(True)
-        self.status.setStyleSheet("QLabel { color: #404040; padding-top: 4px; }")
+        self.status.setStyleSheet("QLabel { color: #404040; padding-top: 2px; font-size: 11px; line-height: 1.05em; }")
         layout.addWidget(self.status)
         self.add_row_btn.clicked.connect(self._request_new_row)
         self.add_overlay_btn.clicked.connect(self._request_overlay)
@@ -4647,15 +6876,23 @@ class PlotRowWidget:
             return
 
         if self.row_role == "sync":
-            text = "Dedicated sync overlay | light-green band = common matched time window"
+            text = (
+                "Dedicated sync overlay | dotted expected lines: "
+                "green=confirmed, amber=partial, red=missing | green bars=start/end"
+            )
             if _repair_gap_regions(self.match):
                 text += " | pink/amber bands = OTB4 repaired or detected gap zones"
             self.label.setText(text)
         elif self.row_role == "raw":
-            text = "Matched raw overlay | light-green band = common matched time window"
+            text = "Matched raw overlay | green bars=start/end of common matched time window"
             if _repair_gap_regions(self.match):
                 text += " | pink/amber bands = OTB4 repaired or detected gap zones"
             self.label.setText(text)
+        elif self.row_role == "probe_detail":
+            device = str(self.context.get("device") or "")
+            self.label.setText(
+                f"Probe sync detail | {device} buffer + ramp | dotted expected lines: green=detected, red=missing | green bars=start/end"
+            )
         else:
             series_names = ", ".join(_series_label(spec) for spec in self.series_specs) if self.series_specs else "No channels selected"
             self.label.setText(f"{self.title} | {series_names}")
@@ -4675,7 +6912,7 @@ class PlotRowWidget:
             if len(t) == 0:
                 missing.append(f"{_series_label(spec)} unavailable: empty data")
                 continue
-            if self.row_role == "raw":
+            if self.row_role in {"raw", "probe_detail"}:
                 y = _normalize_unit_interval(y)
             color = _overlay_series_color(spec, plotted, len(self.series_specs))
             self.plot.plot(t, y, pen=pg.mkPen(color=color, width=1.4), name=_series_label(spec))
@@ -4692,6 +6929,7 @@ class PlotRowWidget:
             self.plot.setLabel("bottom", "Aligned time", units="s")
             y_label, y_units = _y_axis_label(self.row_role, self.series_specs)
             self.plot.setLabel("left", y_label, units=y_units)
+            self.plot.setMinimumHeight(320 if self.row_role == "probe_detail" else 280)
             if x_min is not None and x_max is not None and np.isfinite(x_min) and np.isfinite(x_max) and x_max > x_min:
                 self.plot.setXRange(x_min, x_max, padding=0.03)
             else:
@@ -4705,6 +6943,15 @@ class PlotRowWidget:
                 for line in region.lines:
                     line.setPen(pg.mkPen(color="#9FD89F", width=1.0, style=QtCore.Qt.PenStyle.DashLine))
                 self.plot.addItem(region)
+                for boundary in (float(merge_start), float(merge_end)):
+                    boundary_line = pg.InfiniteLine(
+                        pos=boundary,
+                        angle=90,
+                        movable=False,
+                        pen=pg.mkPen(color="#1F7A4D", width=3.0),
+                    )
+                    boundary_line.setZValue(-5)
+                    self.plot.addItem(boundary_line)
             gap_brush, gap_line = _repair_gap_style(self.match)
             for gap_start, gap_end in _repair_gap_regions(self.match):
                 region = pg.LinearRegionItem(values=(gap_start, gap_end), movable=False, brush=gap_brush)
@@ -4712,6 +6959,28 @@ class PlotRowWidget:
                 for line in region.lines:
                     line.setPen(pg.mkPen(color=gap_line, width=1.0, style=QtCore.Qt.PenStyle.DashLine))
                 self.plot.addItem(region)
+            if self.row_role in {"sync", "probe_detail"}:
+                device = str(self.context.get("device") or "") if self.row_role == "probe_detail" else None
+                marker_colors = {
+                    "confirmed": "#1F7A4D",
+                    "partial": "#A06A00",
+                    "missing": "#B42318",
+                }
+                shift = float(_match_plot_shifts(self.match).get("otb4", 0.0))
+                for marker in _expected_sync_markers(self.match, device=device):
+                    status = str(marker.get("status") or "missing")
+                    line = pg.InfiniteLine(
+                        pos=float(marker.get("time_sec") or 0.0) + shift,
+                        angle=90,
+                        movable=False,
+                        pen=pg.mkPen(
+                            color=marker_colors.get(status, "#7D8597"),
+                            width=2.0,
+                            style=QtCore.Qt.PenStyle.DotLine,
+                        ),
+                    )
+                    line.setZValue(-6)
+                    self.plot.addItem(line)
             footer_lines.append(_plot_source_files_text(self.match, self.row_role, self.series_specs))
             footer_lines.append(_plot_decision_context_text(self.match, self.row_role, self.series_specs))
         else:
@@ -4720,6 +6989,10 @@ class PlotRowWidget:
         if missing:
             footer_lines.append("Unavailable: " + " | ".join(missing))
         self.status.setText("\n".join(line for line in footer_lines if line))
+        base_height = 365 if self.row_role == "probe_detail" else 330
+        extra_lines = max(0, self.status.text().count("\n"))
+        self.widget.setMinimumHeight(base_height + extra_lines * 16)
+        self.widget.updateGeometry()
 
 
 class ViewerWindow:
@@ -4732,39 +7005,111 @@ class ViewerWindow:
         self.window = QtWidgets.QMainWindow()
         self.window.setWindowTitle("Sync Alignment Review")
         self.window.resize(1700, 1000)
+        self.window.setStyleSheet(
+            "QMainWindow, QWidget { background:#F5F7FA; color:#17212B; }"
+            "QGroupBox { background:#FFFFFF; border:1px solid #D6DFE8; border-radius:12px; margin-top:12px; font-weight:700; }"
+            "QGroupBox::title { subcontrol-origin: margin; left:12px; padding:0 6px; color:#253341; }"
+            "QPushButton { background:#E9EEF5; border:1px solid #C8D3DF; border-radius:8px; padding:7px 12px; font-weight:600; }"
+            "QPushButton:hover { background:#DEE7F0; }"
+            "QPushButton:disabled { background:#EFF3F7; color:#8894A0; border-color:#D7DEE6; }"
+            "QScrollArea { border:none; background:transparent; }"
+            "QProgressBar { border:1px solid #C8D3DF; border-radius:8px; text-align:center; background:#EEF2F6; min-height:20px; }"
+            "QProgressBar::chunk { background:#2D6A4F; border-radius:7px; }"
+        )
         self.window.closeEvent = self._close_event
         self.window.resizeEvent = self._resize_event
         self._windowed_geometry = None
         central = QtWidgets.QWidget()
         self.window.setCentralWidget(central)
         layout = QtWidgets.QHBoxLayout(central)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(10)
 
         left_panel = QtWidgets.QWidget()
         left_layout = QtWidgets.QVBoxLayout(left_panel)
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(8)
+        self.actions_group = QtWidgets.QGroupBox("Review Actions")
+        actions_layout = QtWidgets.QGridLayout(self.actions_group)
+        actions_layout.setContentsMargins(10, 12, 10, 10)
+        actions_layout.setHorizontalSpacing(8)
+        actions_layout.setVerticalSpacing(8)
+        self.accept_btn = QtWidgets.QPushButton("Accept -> Next")
+        self.reject_btn = QtWidgets.QPushButton("Reject -> Next")
+        self.reset_decision_btn = QtWidgets.QPushButton("Reset To Auto")
+        self.prev_btn = QtWidgets.QPushButton("Previous")
+        self.next_btn = QtWidgets.QPushButton("Next")
+        self.add_row_btn = QtWidgets.QPushButton("+ Row")
+        self.manual_match_btn = QtWidgets.QPushButton("Create Manual Match")
+        self.edit_match_btn = QtWidgets.QPushButton("Set/Change Match Files")
+        self.exit_btn = QtWidgets.QPushButton("Exit")
+        self.export_mat_btn = QtWidgets.QPushButton("Export accepted MATs + full-rate traceBio")
+        self.parallel_export_chk = QtWidgets.QCheckBox("Parallel export")
+        self.parallel_export_chk.setChecked(True)
+        self.worker_spin = QtWidgets.QSpinBox()
+        self.worker_spin.setRange(1, 64)
+        self.worker_spin.setValue(6)
+        self.worker_spin.setEnabled(True)
+        self.reset_btn = QtWidgets.QPushButton("Reset Plots")
+        actions_layout.addWidget(self.accept_btn, 0, 0)
+        actions_layout.addWidget(self.reject_btn, 0, 1)
+        actions_layout.addWidget(self.reset_decision_btn, 0, 2)
+        actions_layout.addWidget(self.prev_btn, 1, 0)
+        actions_layout.addWidget(self.next_btn, 1, 1)
+        actions_layout.addWidget(self.add_row_btn, 1, 2)
+        actions_layout.addWidget(self.manual_match_btn, 2, 0)
+        actions_layout.addWidget(self.edit_match_btn, 2, 1)
+        actions_layout.addWidget(self.reset_btn, 2, 2)
+        actions_layout.addWidget(self.exit_btn, 3, 0)
+        actions_layout.addWidget(self.export_mat_btn, 3, 1)
+        actions_layout.addWidget(self.parallel_export_chk, 3, 2)
+        actions_layout.addWidget(self.worker_spin, 4, 2)
+        left_layout.addWidget(self.actions_group, 0)
+        self.left_scroll = QtWidgets.QScrollArea()
+        self.left_scroll.setWidgetResizable(True)
+        self.left_scroll_inner = QtWidgets.QWidget()
+        left_scroll_layout = QtWidgets.QVBoxLayout(self.left_scroll_inner)
+        left_scroll_layout.setContentsMargins(0, 0, 0, 0)
+        left_scroll_layout.setSpacing(8)
+        self.queue_group = QtWidgets.QGroupBox("Review Queue")
+        self.queue_group.setToolTip(_queue_code_legend_text())
+        queue_layout = QtWidgets.QVBoxLayout(self.queue_group)
+        queue_layout.setContentsMargins(10, 12, 10, 10)
+        queue_layout.setSpacing(8)
+        self.queue_summary = QtWidgets.QLabel("")
+        self.queue_summary.setWordWrap(True)
+        self.queue_summary.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        queue_layout.addWidget(self.queue_summary, 0)
         self.list_widget = QtWidgets.QListWidget()
+        self.list_widget.setUniformItemSizes(True)
+        self.list_widget.setTextElideMode(QtCore.Qt.TextElideMode.ElideMiddle)
         self.list_widget.setStyleSheet(
-            "QListWidget { selection-background-color: rgba(0,0,0,0); selection-color: black; }"
-            "QListWidget::item { padding: 6px; }"
-            "QListWidget::item:selected:active { background-color: rgba(0,0,0,0); color: black; border: 2px solid black; }"
-            "QListWidget::item:selected:!active { background-color: rgba(0,0,0,0); color: black; border: 2px solid black; }"
+            "QListWidget { background:#FFFFFF; border:1px solid #D6DFE8; border-radius:10px; selection-background-color: rgba(0,0,0,0); }"
+            "QListWidget::item { padding: 4px 6px; margin:1px 0; border-radius:6px; }"
+            "QListWidget::item:selected:active { background-color: rgba(0,0,0,0); border: 2px solid #17212B; }"
+            "QListWidget::item:selected:!active { background-color: rgba(0,0,0,0); border: 2px solid #17212B; }"
         )
         palette = self.list_widget.palette()
         palette.setColor(QtGui.QPalette.ColorRole.Highlight, QtGui.QColor(0, 0, 0, 0))
-        palette.setColor(QtGui.QPalette.ColorRole.HighlightedText, QtGui.QColor("#000000"))
         self.list_widget.setPalette(palette)
-        left_layout.addWidget(self.list_widget, 0)
+        self.list_widget.setToolTip(_queue_code_legend_text())
+        queue_layout.addWidget(self.list_widget, 0)
+        left_scroll_layout.addWidget(self.queue_group, 0)
+        self.notes_group = QtWidgets.QGroupBox("Scan Notes")
+        notes_layout = QtWidgets.QVBoxLayout(self.notes_group)
+        notes_layout.setContentsMargins(10, 12, 10, 10)
+        notes_layout.setSpacing(6)
         self.scan_notes = QtWidgets.QLabel("")
         self.scan_notes.setWordWrap(True)
         self.scan_notes.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop | QtCore.Qt.AlignmentFlag.AlignLeft)
-        self.scan_notes.setStyleSheet("QLabel { background: #f4f4f4; border: 1px solid #d0d0d0; padding: 8px; }")
-        left_layout.addWidget(self.scan_notes, 0)
-        left_layout.addStretch(1)
+        self.scan_notes.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.scan_notes.setStyleSheet("QLabel { background:#F8FAFC; border:1px solid #D6DFE8; border-radius:10px; padding:10px; }")
+        notes_layout.addWidget(self.scan_notes, 0)
+        left_scroll_layout.addWidget(self.notes_group, 0)
         self.match_report_group = QtWidgets.QGroupBox("Match Report")
         self.match_report_layout = QtWidgets.QVBoxLayout(self.match_report_group)
-        self.match_report_layout.setContentsMargins(8, 10, 8, 8)
-        self.match_report_layout.setSpacing(6)
+        self.match_report_layout.setContentsMargins(10, 12, 10, 10)
+        self.match_report_layout.setSpacing(8)
         self.sync_info = QtWidgets.QLabel("")
         self.sync_info.setWordWrap(True)
         self.sync_info.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -4785,16 +7130,27 @@ class ViewerWindow:
         self.task_progress.setValue(0)
         self.task_progress.setFormat("Idle")
         self.match_report_layout.addWidget(self.task_progress, 0)
-        left_layout.addWidget(self.match_report_group, 0)
+        left_scroll_layout.addWidget(self.match_report_group, 0)
+        left_scroll_layout.addStretch(1)
+        self.left_scroll.setWidget(self.left_scroll_inner)
+        left_layout.addWidget(self.left_scroll, 1)
         self.detail = QtWidgets.QScrollArea()
         self.detail.setWidgetResizable(True)
         self.detail_inner = QtWidgets.QWidget()
+        self.detail_inner.setSizePolicy(QtWidgets.QSizePolicy.Policy.Preferred, QtWidgets.QSizePolicy.Policy.Maximum)
         self.detail_layout = QtWidgets.QVBoxLayout(self.detail_inner)
         self.detail_layout.setContentsMargins(8, 8, 8, 8)
         self.detail_layout.setSpacing(10)
+        self.detail_layout.setSizeConstraint(QtWidgets.QLayout.SizeConstraint.SetMinAndMaxSize)
         self.detail.setWidget(self.detail_inner)
-        layout.addWidget(left_panel, 1)
-        layout.addWidget(self.detail, 4)
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(False)
+        splitter.addWidget(left_panel)
+        splitter.addWidget(self.detail)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 4)
+        splitter.setSizes([430, 1270])
+        layout.addWidget(splitter, 1)
 
         self.mapping = _load_mapping(mapping_path)
         self.matches = self.mapping.get("matches", [])
@@ -4812,55 +7168,32 @@ class ViewerWindow:
 
         self.header = QtWidgets.QLabel("")
         self.header.setWordWrap(True)
+        self.header.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.header.setStyleSheet("QLabel { background:#FFFFFF; border:1px solid #D6DFE8; border-radius:12px; padding:12px; }")
         self.detail_layout.addWidget(self.header)
         self.match_files_info = QtWidgets.QLabel("")
         self.match_files_info.setWordWrap(False)
         self.match_files_info.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.match_files_info.setStyleSheet("QLabel { background:#EEF2F6; border:1px solid #D6DFE8; border-radius:10px; padding:4px 8px; color:#243240; font-size:11px; }")
+        self.match_files_info.setMaximumHeight(28)
+        self.match_files_info.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Fixed)
         self.detail_layout.addWidget(self.match_files_info)
-
-        review_controls = QtWidgets.QHBoxLayout()
-        self.accept_btn = QtWidgets.QPushButton("Accept -> Next")
-        self.reject_btn = QtWidgets.QPushButton("Reject -> Next")
-        self.reset_decision_btn = QtWidgets.QPushButton("Reset To Auto")
-        self.prev_btn = QtWidgets.QPushButton("Previous")
-        self.next_btn = QtWidgets.QPushButton("Next")
-        review_controls.addWidget(self.accept_btn)
-        review_controls.addWidget(self.reject_btn)
-        review_controls.addWidget(self.reset_decision_btn)
-        review_controls.addStretch(1)
-        review_controls.addWidget(self.prev_btn)
-        review_controls.addWidget(self.next_btn)
-        self.detail_layout.addLayout(review_controls)
+        self.plot_rows_host = QtWidgets.QWidget()
+        self.plot_rows_layout = QtWidgets.QVBoxLayout(self.plot_rows_host)
+        self.plot_rows_layout.setContentsMargins(0, 0, 0, 0)
+        self.plot_rows_layout.setSpacing(10)
+        self.plot_rows_layout.setSizeConstraint(QtWidgets.QLayout.SizeConstraint.SetMinAndMaxSize)
+        self.detail_layout.addWidget(self.plot_rows_host)
 
         self.accept_btn.clicked.connect(lambda: self._decide_and_advance(True))
         self.reject_btn.clicked.connect(lambda: self._decide_and_advance(False))
         self.reset_decision_btn.clicked.connect(self.reset_user_decision)
         self.prev_btn.clicked.connect(lambda: self._move_selection(-1))
         self.next_btn.clicked.connect(lambda: self._move_selection(1))
-
-        controls = QtWidgets.QHBoxLayout()
-        self.add_row_btn = QtWidgets.QPushButton("+ Row")
-        self.manual_match_btn = QtWidgets.QPushButton("Create Manual Match")
-        self.edit_match_btn = QtWidgets.QPushButton("Set/Change Match Files")
-        self.export_mat_btn = QtWidgets.QPushButton("Export accepted to .mat")
-        self.parallel_export_chk = QtWidgets.QCheckBox("Parallel export")
-        self.parallel_export_chk.setChecked(True)
-        self.worker_spin = QtWidgets.QSpinBox()
-        self.worker_spin.setRange(1, 64)
-        self.worker_spin.setValue(6)
-        self.worker_spin.setEnabled(True)
-        self.reset_btn = QtWidgets.QPushButton("Reset")
-        controls.addWidget(self.add_row_btn)
-        controls.addWidget(self.manual_match_btn)
-        controls.addWidget(self.edit_match_btn)
-        controls.addWidget(self.export_mat_btn)
-        controls.addWidget(self.parallel_export_chk)
-        controls.addWidget(self.worker_spin)
-        controls.addWidget(self.reset_btn)
-        self.detail_layout.addLayout(controls)
         self.add_row_btn.clicked.connect(self.add_plot_row)
         self.manual_match_btn.clicked.connect(self.add_manual_match)
         self.edit_match_btn.clicked.connect(self.edit_current_match)
+        self.exit_btn.clicked.connect(self.window.close)
         self.export_mat_btn.clicked.connect(self.export_current_mat)
         self.parallel_export_chk.toggled.connect(self.worker_spin.setEnabled)
         self.reset_btn.clicked.connect(self.reset_rows)
@@ -4875,6 +7208,7 @@ class ViewerWindow:
             current = self.list_widget.currentItem()
             if current is not None:
                 self._on_select(current, None)
+        QtCore.QTimer.singleShot(0, self._resolve_tracebio_files_on_startup)
 
     def _refresh_match_list(self, selected_row: Optional[int] = None, preserve_selection: bool = True) -> None:
         from PySide6 import QtWidgets, QtGui, QtCore
@@ -4883,8 +7217,16 @@ class ViewerWindow:
         self.list_widget.clear()
         target_row = 0 if selected_row is None else max(0, int(selected_row))
         for row, match in enumerate(self.matches):
-            item = QtWidgets.QListWidgetItem(_review_item_text(match))
+            item_text = _review_item_text(match)
+            item = QtWidgets.QListWidgetItem(item_text)
             item.setData(QtCore.Qt.ItemDataRole.UserRole, row)
+            item.setToolTip(
+                f"{item_text}\n\n"
+                f"{_queue_code_legend_text()}\n\n"
+                f"C3D: {Path(str((match.get('c3d') or {}).get('path') or '')).name or 'missing'}\n"
+                f"OTB4: {Path(str((match.get('otb4') or {}).get('path') or '')).name or 'missing'}\n"
+                f"TSV: {Path(str((match.get('tsv') or {}).get('path') or '')).name if match.get('tsv') else 'missing'}"
+            )
             item.setBackground(QtGui.QColor(_review_status_color(match)))
             item.setForeground(QtGui.QColor(_review_status_text_color(match, selected=False)))
             self.list_widget.addItem(item)
@@ -4896,6 +7238,8 @@ class ViewerWindow:
             self.list_widget.setCurrentRow(target_row)
             self.list_widget.blockSignals(was_blocked)
             self.current_match = self.matches[target_row]
+            _ensure_otb4_repair_applied(self.current_match, [])
+            _apply_review_defaults(self.current_match)
         else:
             self.current_match = None
         self._apply_list_item_styles()
@@ -4913,6 +7257,7 @@ class ViewerWindow:
             self.add_row_btn,
             self.manual_match_btn,
             self.edit_match_btn,
+            self.exit_btn,
             self.export_mat_btn,
             self.parallel_export_chk,
             self.worker_spin,
@@ -4954,6 +7299,188 @@ class ViewerWindow:
         text = "Scan notes for this review:\n\n" + "\n".join(f"- {msg}" for msg in messages)
         self._show_copyable_message("Scan Notes", text)
 
+    def _set_tracebio_startup_messages(self, issues: Sequence[str]) -> None:
+        prefix = "traceBio: "
+        preserved = [
+            str(msg)
+            for msg in (self.mapping.get("startup_messages") or [])
+            if str(msg).strip() and not str(msg).startswith(prefix)
+        ]
+        preserved.extend(f"{prefix}{issue}" for issue in issues if str(issue).strip())
+        self.mapping["startup_messages"] = preserved
+
+    def _tracebio_match_label(self, match: Dict[str, Any]) -> str:
+        tsv_name = Path(str((match.get("tsv") or {}).get("path") or "")).name
+        if tsv_name:
+            return tsv_name
+        c3d_name = Path(str((match.get("c3d") or {}).get("path") or "")).name
+        if c3d_name:
+            return c3d_name
+        return f"match {int(match.get('match_id') or 0):03d}"
+
+    def _prompt_for_tracebio_settings_file(self, match: Dict[str, Any]) -> Optional[Path]:
+        from PySide6 import QtWidgets
+
+        label = self._tracebio_match_label(match)
+        expected = _tsv_sidecar_json_path(match)
+        start_dir = (
+            expected.parent
+            if expected is not None
+            else Path(self.mapping.get("source_root") or self.mapping_path.parent)
+        )
+        msg = QtWidgets.QMessageBox(self.window)
+        msg.setIcon(QtWidgets.QMessageBox.Icon.Warning)
+        msg.setWindowTitle("Missing traceBio Settings")
+        msg.setText(f"The traceBio settings JSON for '{label}' was not found.")
+        msg.setInformativeText("Choose the matching traceBioRTFB JSON file, or cancel for now.")
+        browse_btn = msg.addButton("Choose Settings JSON...", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+        msg.addButton(QtWidgets.QMessageBox.StandardButton.Cancel)
+        msg.exec()
+        if msg.clickedButton() is not browse_btn:
+            return None
+        chosen, _filter = QtWidgets.QFileDialog.getOpenFileName(
+            self.window,
+            f"Select traceBio settings for {label}",
+            str(start_dir),
+            "JSON files (*.json);;All files (*)",
+        )
+        if not chosen:
+            return None
+        chosen_path = Path(chosen)
+        try:
+            json.loads(chosen_path.read_text(encoding="utf-8-sig"))
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(
+                self.window,
+                "Invalid Settings JSON",
+                f"The selected settings file could not be used:\n{exc}",
+            )
+            return None
+        return chosen_path
+
+    def _prompt_for_tracebio_path_file(self, match: Dict[str, Any], settings: Dict[str, Any]) -> Optional[Path]:
+        from PySide6 import QtWidgets
+
+        selected = str(settings.get("SelectedPath") or "").strip() or "(missing SelectedPath)"
+        roots = _tracebio_paths_roots(match)
+        start_dir = roots[0] if roots else Path(self.mapping.get("source_root") or self.mapping_path.parent)
+        msg = QtWidgets.QMessageBox(self.window)
+        msg.setIcon(QtWidgets.QMessageBox.Icon.Warning)
+        msg.setWindowTitle("Missing traceBio Path")
+        msg.setText(f"The traceBio path file for '{selected}' was not found.")
+        msg.setInformativeText("Choose the correct path TSV file, or cancel for now.")
+        browse_btn = msg.addButton("Choose Path File...", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+        msg.addButton(QtWidgets.QMessageBox.StandardButton.Cancel)
+        msg.exec()
+        if msg.clickedButton() is not browse_btn:
+            return None
+        chosen, _filter = QtWidgets.QFileDialog.getOpenFileName(
+            self.window,
+            f"Select traceBio path for {selected}",
+            str(start_dir),
+            "TSV files (*.tsv);;All files (*)",
+        )
+        if not chosen:
+            return None
+        chosen_path = Path(chosen)
+        try:
+            _load_tracebio_path_vertices(chosen_path)
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(
+                self.window,
+                "Invalid Path File",
+                f"The selected path file could not be used:\n{exc}",
+            )
+            return None
+        return chosen_path
+
+    def _ensure_tracebio_required_files(
+        self,
+        matches: Sequence[Dict[str, Any]],
+        *,
+        prompt_user: bool,
+    ) -> List[str]:
+        chosen_settings_by_tsv: Dict[str, Path] = {}
+        chosen_paths_by_selected: Dict[str, Path] = {}
+        unresolved: List[str] = []
+        changed = False
+
+        for match in matches:
+            if not match.get("tsv"):
+                continue
+            label = self._tracebio_match_label(match)
+            tsv_key = str(Path(str((match.get("tsv") or {}).get("path") or "")).with_suffix(".json")).lower()
+
+            settings: Optional[Dict[str, Any]] = None
+            try:
+                settings = _load_tracebio_settings(match)
+            except Exception:
+                if prompt_user:
+                    chosen_settings = chosen_settings_by_tsv.get(tsv_key)
+                    if chosen_settings is None or not chosen_settings.exists():
+                        chosen_settings = self._prompt_for_tracebio_settings_file(match)
+                        if chosen_settings is not None:
+                            chosen_settings_by_tsv[tsv_key] = chosen_settings
+                    if chosen_settings is not None:
+                        _set_tracebio_settings_path_override(match, chosen_settings)
+                        changed = True
+                        try:
+                            settings = _load_tracebio_settings(match)
+                        except Exception as exc:
+                            unresolved.append(f"{label}: traceBio settings JSON is still unusable ({exc}).")
+                            continue
+                    else:
+                        unresolved.append(f"{label}: missing traceBio settings JSON.")
+                        continue
+                else:
+                    unresolved.append(f"{label}: missing traceBio settings JSON.")
+                    continue
+
+            try:
+                _tracebio_selected_path_file(match, settings)
+            except Exception:
+                if prompt_user:
+                    selected = str(settings.get("SelectedPath") or "").strip() or "(missing SelectedPath)"
+                    selected_key = selected.lower()
+                    chosen_path = chosen_paths_by_selected.get(selected_key)
+                    if chosen_path is None or not chosen_path.exists():
+                        chosen_path = self._prompt_for_tracebio_path_file(match, settings)
+                        if chosen_path is not None:
+                            chosen_paths_by_selected[selected_key] = chosen_path
+                    if chosen_path is not None:
+                        _set_tracebio_selected_path_override(match, chosen_path)
+                        changed = True
+                        try:
+                            refreshed_settings = _load_tracebio_settings(match)
+                            _tracebio_selected_path_file(match, refreshed_settings)
+                        except Exception as exc:
+                            unresolved.append(f"{label}: traceBio path TSV is still unusable ({exc}).")
+                    else:
+                        unresolved.append(f"{label}: missing traceBio path TSV for '{selected}'.")
+                else:
+                    selected = str(settings.get("SelectedPath") or "").strip() or "(missing SelectedPath)"
+                    unresolved.append(f"{label}: missing traceBio path TSV for '{selected}'.")
+
+        self._set_tracebio_startup_messages(unresolved)
+        if changed:
+            self._save_reviews()
+        if changed or unresolved:
+            self._update_header()
+        return unresolved
+
+    def _resolve_tracebio_files_on_startup(self) -> None:
+        from PySide6 import QtWidgets
+
+        unresolved = self._ensure_tracebio_required_files(self.matches, prompt_user=True)
+        if not unresolved:
+            return
+        QtWidgets.QMessageBox.warning(
+            self.window,
+            "traceBio Files Missing",
+            "Some traceBio companion files are still missing. MAT export will stay blocked until they are resolved.\n\n"
+            + "\n".join(unresolved[:12]),
+        )
+
     def _apply_list_item_styles(self) -> None:
         from PySide6 import QtGui
 
@@ -4970,9 +7497,16 @@ class ViewerWindow:
             item.setForeground(QtGui.QColor(_review_status_text_color(match, selected=(row == current_row))))
 
     def _apply_left_panel_sizing(self) -> None:
-        target_height = max(360, int(self.window.height() * 0.58))
+        target_height = max(300, int(self.window.height() * 0.46))
         self.list_widget.setMinimumHeight(target_height)
         self.list_widget.setMaximumHeight(target_height)
+
+    def _refresh_scroll_geometry(self) -> None:
+        self.plot_rows_host.adjustSize()
+        self.detail_inner.adjustSize()
+        self.detail_inner.updateGeometry()
+        self.left_scroll_inner.adjustSize()
+        self.left_scroll_inner.updateGeometry()
 
     def _resize_event(self, event) -> None:
         from PySide6 import QtWidgets
@@ -4994,6 +7528,7 @@ class ViewerWindow:
             self.header.setText("")
             self.progress.setText("")
             self.scan_notes.setText("")
+            self.queue_summary.setText("")
             self.match_files_info.setText("")
             self.sync_info.setText("")
             self.raw_info.setText("")
@@ -5002,17 +7537,7 @@ class ViewerWindow:
         alignment = self.current_match.get("alignment") or {}
         inner_merge = alignment.get("inner_merge") or {}
         review = self.current_match.get("review") or {}
-        merge_start = inner_merge.get("inner_merge_start_sec")
-        merge_end = inner_merge.get("inner_merge_end_sec")
-        merge_duration = inner_merge.get("inner_merge_duration_sec")
-        merge_text = "Common time window unavailable."
-        if isinstance(merge_start, (int, float)) and isinstance(merge_end, (int, float)) and isinstance(merge_duration, (int, float)):
-            merge_text = f"Common time window: {merge_start:.3f}s to {merge_end:.3f}s ({merge_duration:.3f}s)"
-        self.header.setText(
-            f"{_review_status_label(self.current_match)} | decision source: {review.get('decision_source')} | "
-            f"certainty={self.current_match.get('certainty')} | exportable={'yes' if self.current_match.get('tsv') else 'no'}\n"
-            f"{merge_text}"
-        )
+        self.header.setText(_header_rich_text(self.current_match))
         reviewed_count, total_count = _review_progress(self.mapping)
         user_accept_count = sum(1 for match in self.matches if (match.get("review") or {}).get("user_decision") is True)
         user_reject_count = sum(1 for match in self.matches if (match.get("review") or {}).get("user_decision") is False)
@@ -5023,24 +7548,34 @@ class ViewerWindow:
             for rec in (self.source_records.get("tsv", []) or [])
             if str(rec.get("path") or "") not in self._source_usage_map("tsv")
         )
-        self.progress.setText(
-            f"Reviewed {reviewed_count}/{total_count}. User accepted={user_accept_count}, user rejected={user_reject_count}. "
-            f"Unassociated files: C3D={free_c3d}, OTB4={free_otb4}, TSV={free_tsv}. "
-            f"Auto-accept suggests matches with excellent raw agreement and strong OTB4/C3D sync."
-        )
+        self.queue_summary.setText(_queue_summary_rich_text(self.mapping, self.matches))
+        self.progress.setText(_progress_rich_text(reviewed_count, total_count, user_accept_count, user_reject_count, free_c3d, free_otb4, free_tsv))
+        self.progress.setStyleSheet(_report_label_style("#FFFFFF", "#D6DFE8"))
         notes = [str(msg) for msg in (self.mapping.get("startup_messages") or []) if str(msg).strip()]
-        self.scan_notes.setText(
-            ("Scan notes:\n" + "\n".join(f"- {msg}" for msg in notes)) if notes else "Scan notes: none."
-        )
+        self.scan_notes.setText(_scan_notes_rich_text(notes))
         self.match_files_info.setText(_match_files_line(self.current_match))
+        self.match_files_info.setToolTip(_match_files_line(self.current_match))
         dedicated = _dedicated_sync_agreement(self.current_match)
-        self.sync_info.setText(f"Sync: {_sync_status_text(self.current_match, dedicated)}\n{_repair_status_text(self.current_match)}")
-        self.raw_info.setText(f"Raw: {_raw_status_text(self.current_match)}")
+        self.sync_info.setText(_sync_info_rich_text(self.current_match, dedicated))
+        sync_tone_bg = "#EAF7EE" if int(_otb4_probe_sync_diagnostics(self.current_match).get("non_sync_probe_count") or 0) == 0 else "#FFF7E6"
+        sync_tone_border = "#B9DEC4" if sync_tone_bg == "#EAF7EE" else "#E7C87B"
+        self.sync_info.setStyleSheet(_report_label_style(sync_tone_bg, sync_tone_border))
+        self.raw_info.setText(_raw_info_rich_text(self.current_match))
+        raw_quality = str(alignment.get("raw_alignment_quality") or "missing")
+        raw_bg = "#EAF2FF" if raw_quality in {"excellent", "good"} else "#FFF7E6" if raw_quality == "fair" else "#FBEAEA"
+        raw_border = "#BED0F5" if raw_quality in {"excellent", "good"} else "#E7C87B" if raw_quality == "fair" else "#E3B8B8"
+        self.raw_info.setStyleSheet(_report_label_style(raw_bg, raw_border))
         if not self.current_match.get("tsv"):
             reason = (alignment.get("tsv_skip_reason") or "No TSV match reason recorded.")
-            self.raw_info.setText(f"TSV missing: {reason}")
+            self.raw_info.setText(_raw_info_rich_text(self.current_match, f"TSV missing: {reason}"))
+            self.raw_info.setStyleSheet(_report_label_style("#FBEAEA", "#E3B8B8"))
         self.decision_info.setText(_decision_reason_rich_text(self.current_match))
+        decision_key = _review_status_key(self.current_match)
+        decision_bg = "#EAF7EE" if "accept" in decision_key else "#FBEAEA"
+        decision_border = "#B9DEC4" if "accept" in decision_key else "#E3B8B8"
+        self.decision_info.setStyleSheet(_report_label_style(decision_bg, decision_border))
         self._update_review_controls()
+        self._refresh_scroll_geometry()
 
     def _current_index(self) -> int:
         item = self.list_widget.currentItem()
@@ -5128,9 +7663,7 @@ class ViewerWindow:
         next_row = current_row
         if current_row >= 0 and self.list_widget.count():
             next_row = min(self.list_widget.count() - 1, current_row + 1)
-        self.set_user_decision(accepted, selected_row=current_row)
-        if self.list_widget.count():
-            self.list_widget.setCurrentRow(next_row)
+        self.set_user_decision(accepted, selected_row=next_row)
 
     def set_user_decision(self, accepted: bool, selected_row: Optional[int] = None) -> None:
         if self.current_match is None or self._busy:
@@ -5173,21 +7706,64 @@ class ViewerWindow:
             row.widget.deleteLater()
         self.plot_rows = []
         gc.collect()
+        self._refresh_scroll_geometry()
+
+    def _remove_auto_rows(self) -> None:
+        kept: List[PlotRowWidget] = []
+        for row in self.plot_rows:
+            if row.auto_generated:
+                row.widget.setParent(None)
+                row.widget.deleteLater()
+            else:
+                kept.append(row)
+        self.plot_rows = kept
+        gc.collect()
+
+    def _rebuild_auto_rows(self) -> None:
+        if self.current_match is None:
+            return
+        self._remove_auto_rows()
+        auto_rows: List[PlotRowWidget] = [
+            PlotRowWidget(self, "Dedicated sync overlay", _sync_series_specs(self.current_match), row_role="sync", auto_generated=True),
+            PlotRowWidget(self, "Matched raw overlay", _raw_series_specs(self.current_match), row_role="raw", auto_generated=True),
+        ]
+        diag = _otb4_probe_sync_diagnostics(self.current_match)
+        for probe in (diag.get("probes") or []):
+            if not probe.get("non_sync"):
+                continue
+            device = str(probe.get("device") or "").strip()
+            if not device:
+                continue
+            specs = _probe_detail_series_specs(self.current_match, device)
+            if not specs:
+                continue
+            auto_rows.append(
+                PlotRowWidget(
+                    self,
+                    f"{device} probe sync detail",
+                    specs,
+                    row_role="probe_detail",
+                    auto_generated=True,
+                    context={"device": device},
+                )
+            )
+        for idx, row in enumerate(auto_rows):
+            self.plot_rows_layout.insertWidget(idx, row.widget)
+        self.plot_rows = auto_rows + self.plot_rows
+        self._refresh_scroll_geometry()
 
     def _ensure_default_rows(self) -> None:
-        if self.current_match is None or self.plot_rows:
+        if self.current_match is None:
             return
-        sync_row = PlotRowWidget(self, "Dedicated sync overlay", _sync_series_specs(self.current_match), row_role="sync")
-        raw_row = PlotRowWidget(self, "Matched raw overlay", _raw_series_specs(self.current_match), row_role="raw")
-        self.plot_rows.extend([sync_row, raw_row])
-        self.detail_layout.addWidget(sync_row.widget)
-        self.detail_layout.addWidget(raw_row.widget)
+        if any(row.auto_generated for row in self.plot_rows):
+            return
+        self._rebuild_auto_rows()
 
     def reset_rows(self) -> None:
         if self.current_match is None or self._busy:
             return
         self._clear_rows()
-        self._ensure_default_rows()
+        self._rebuild_auto_rows()
         self._refresh_rows()
 
     def _source_usage_map(self, key: str, *, exclude_rows: Optional[Sequence[int]] = None) -> Dict[str, List[int]]:
@@ -5714,7 +8290,7 @@ class ViewerWindow:
             return
         accepted_matches = [
             match for match in self.matches
-            if (match.get("review") or {}).get("final_accept") and match.get("tsv")
+            if (match.get("review") or {}).get("final_accept") and match.get("otb4") and match.get("c3d") and match.get("tsv")
         ]
         if not accepted_matches:
             QtWidgets.QMessageBox.information(
@@ -5728,6 +8304,18 @@ class ViewerWindow:
         written: List[str] = []
         self._set_busy(True)
         try:
+            for match in accepted_matches:
+                _ensure_otb4_repair_applied(match, [])
+            unresolved = self._ensure_tracebio_required_files(accepted_matches, prompt_user=True)
+            if unresolved:
+                QtWidgets.QMessageBox.critical(
+                    self.window,
+                    "MAT Export Blocked",
+                    "MAT export cannot continue while required traceBio files are missing.\n\n"
+                    + "\n".join(unresolved[:12]),
+                )
+                self._set_progress(1, 1, "Ready")
+                return
             self._set_progress(0, len(accepted_matches), "Exporting accepted MAT files %v/%m")
             use_parallel = self.parallel_export_chk.isChecked() and len(accepted_matches) > 1
             n_workers = min(self.worker_spin.value(), len(accepted_matches))
@@ -5787,7 +8375,8 @@ class ViewerWindow:
             QtWidgets.QMessageBox.information(
                 self.window,
                 "MAT Exported",
-                "Wrote per accepted triplet: .mat, _4pipe.mat, and _4pipe.json\n" + "\n".join(written),
+                "Wrote per accepted triplet: .mat with tsv_reconstructed, _4pipe.mat with authoritative full-rate path channels, and _4pipe.json\n"
+                + "\n".join(written),
             )
         finally:
             self._set_busy(False)
@@ -5805,16 +8394,18 @@ class ViewerWindow:
         finally:
             self._set_busy(False)
             self._update_review_controls()
+            self._refresh_scroll_geometry()
 
     def add_plot_row(self) -> None:
         if self.current_match is None or self._busy:
             return
         row = PlotRowWidget(self, f"Plot row {len(self.plot_rows) - 1}")
-        insert_at = self.detail_layout.count()
+        insert_at = self.plot_rows_layout.count()
         self.plot_rows.append(row)
-        self.detail_layout.insertWidget(insert_at, row.widget)
+        self.plot_rows_layout.insertWidget(insert_at, row.widget)
         row.set_match(self.current_match)
         self.add_series_to_row(row, replace=True)
+        self._refresh_scroll_geometry()
 
     def add_series_to_row(self, row: PlotRowWidget, replace: bool = False) -> None:
         if self.current_match is None or self._busy:
@@ -5849,6 +8440,7 @@ class ViewerWindow:
             row.series_specs.append(lookup[choice])
         row.match = self.current_match
         row.refresh()
+        self._refresh_scroll_geometry()
 
     def _on_select(self, current, previous):
         from PySide6 import QtCore
@@ -5860,9 +8452,10 @@ class ViewerWindow:
             return
         match = self.matches[int(row)]
         self.current_match = match
+        _ensure_otb4_repair_applied(self.current_match, [])
+        _apply_review_defaults(self.current_match)
         self._apply_list_item_styles()
-        if not self.plot_rows:
-            self._ensure_default_rows()
+        self._rebuild_auto_rows()
         self._refresh_rows()
         self._update_header()
 
@@ -5872,22 +8465,40 @@ class ViewerWindow:
         return self.app.exec()
 
     def _close_event(self, event) -> None:
-        from PySide6 import QtWidgets
+        from PySide6 import QtCore, QtWidgets
 
-        reviewed_count, total_count = _review_progress(self.mapping)
-        if total_count > 0 and reviewed_count < total_count:
-            answer = QtWidgets.QMessageBox.warning(
-                self.window,
-                "Quit Early?",
-                f"Only {reviewed_count}/{total_count} matches have been reviewed. Quit anyway?",
-                QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
-                QtWidgets.QMessageBox.StandardButton.No,
-            )
-            if answer != QtWidgets.QMessageBox.StandardButton.Yes:
-                event.ignore()
-                return
-        self._save_reviews()
+        try:
+            reviewed_count, total_count = _review_progress(self.mapping)
+            if total_count > 0 and reviewed_count < total_count:
+                answer = QtWidgets.QMessageBox.warning(
+                    self.window,
+                    "Quit Early?",
+                    f"Only {reviewed_count}/{total_count} matches have been reviewed. Quit anyway?",
+                    QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+                    QtWidgets.QMessageBox.StandardButton.No,
+                )
+                if answer != QtWidgets.QMessageBox.StandardButton.Yes:
+                    event.ignore()
+                    return
+            try:
+                self._save_reviews()
+            except Exception as exc:
+                answer = QtWidgets.QMessageBox.warning(
+                    self.window,
+                    "Close Without Saving?",
+                    f"Saving review state failed:\n{exc}\n\nClose anyway?",
+                    QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+                    QtWidgets.QMessageBox.StandardButton.No,
+                )
+                if answer != QtWidgets.QMessageBox.StandardButton.Yes:
+                    event.ignore()
+                    return
+        except Exception:
+            event.accept()
+            QtCore.QTimer.singleShot(0, lambda: self.app.exit(0))
+            return
         event.accept()
+        QtCore.QTimer.singleShot(0, lambda: self.app.exit(0))
 
 
 def build_parser() -> argparse.ArgumentParser:
