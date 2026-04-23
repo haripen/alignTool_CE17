@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import concurrent.futures
 import gc
 import html
@@ -6910,7 +6911,7 @@ def _review_item_text(match: Dict[str, Any]) -> str:
     return text
 
 
-def _save_mapping_bundle(mapping_path: Path, mapping: Dict[str, Any]) -> None:
+def _save_mapping_bundle(mapping_path: Path, mapping: Dict[str, Any], *, write_review_outputs: bool = True) -> None:
     saved_at = mapping.get("saved_at") or _format_file_stamp()
     mapping["saved_at"] = saved_at
     export_root = Path(mapping.get("export_root") or mapping_path.parent)
@@ -6918,7 +6919,8 @@ def _save_mapping_bundle(mapping_path: Path, mapping: Dict[str, Any]) -> None:
         _attach_export_plan(match, export_root, saved_at)
     _write_repair_jsons(export_root, mapping)
     mapping_path.write_text(json.dumps(mapping, indent=2, ensure_ascii=False), encoding="utf-8")
-    _write_review_outputs(export_root, mapping, saved_at)
+    if write_review_outputs:
+        _write_review_outputs(export_root, mapping, saved_at)
     mapping_path.write_text(json.dumps(mapping, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
@@ -6951,6 +6953,10 @@ def _prefetch_match_plot_data(match: Dict[str, Any]) -> None:
             desired_specs.extend(_probe_detail_series_specs(match, device))
         except Exception:
             continue
+
+
+def _save_mapping_bundle_snapshot(mapping_path: Path, mapping_snapshot: Dict[str, Any], *, write_review_outputs: bool) -> None:
+    _save_mapping_bundle(mapping_path, mapping_snapshot, write_review_outputs=write_review_outputs)
     seen: set[Tuple[str, str, str, str]] = set()
     for spec in desired_specs:
         key = (
@@ -7398,6 +7404,13 @@ class ViewerWindow:
         self._busy = False
         self._prefetch_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
         self._prefetch_futures: Dict[int, concurrent.futures.Future[None]] = {}
+        self._save_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        self._save_future: Optional[concurrent.futures.Future[None]] = None
+        self._queued_review_output_save = False
+        self._save_error: Optional[str] = None
+        self._save_timer = QtCore.QTimer(self.window)
+        self._save_timer.setSingleShot(True)
+        self._save_timer.timeout.connect(self._dispatch_async_save)
         self._recompute_source_availability()
 
         self.header = QtWidgets.QLabel("")
@@ -7718,7 +7731,7 @@ class ViewerWindow:
 
         self._set_tracebio_startup_messages(unresolved)
         if changed:
-            self._save_reviews()
+            self._save_reviews(write_review_outputs=False)
         if changed or unresolved:
             self._update_header()
         return unresolved
@@ -7866,7 +7879,7 @@ class ViewerWindow:
         idx = max(0, min(self.list_widget.count() - 1, idx + delta))
         self.list_widget.setCurrentRow(idx)
 
-    def _save_reviews(self) -> None:
+    def _save_reviews(self, *, write_review_outputs: bool = True) -> None:
         _ensure_unique_source_assignments(self.matches)
         self.mapping["matches"] = self.matches
         self.mapping["unmatched_c3d_records"] = self.unmatched_c3d_records
@@ -7878,7 +7891,54 @@ class ViewerWindow:
         self.mapping.setdefault("summary", {})["final_accept_count"] = sum(
             1 for match in self.matches if (match.get("review") or {}).get("final_accept")
         )
-        _save_mapping_bundle(self.mapping_path, self.mapping)
+        _save_mapping_bundle(self.mapping_path, self.mapping, write_review_outputs=write_review_outputs)
+
+    def _queue_save_reviews(self, *, write_review_outputs: bool = False, delay_ms: int = 250) -> None:
+        self._queued_review_output_save = self._queued_review_output_save or bool(write_review_outputs)
+        self._save_timer.start(max(0, int(delay_ms)))
+
+    def _dispatch_async_save(self) -> None:
+        self._ensure_async_save_finished()
+        try:
+            _ensure_unique_source_assignments(self.matches)
+            self.mapping["matches"] = self.matches
+            self.mapping["unmatched_c3d_records"] = self.unmatched_c3d_records
+            self.mapping["source_records"] = self.source_records
+            self.mapping["unmatched_otb4_records"] = self.unmatched_otb4_records
+            _refresh_mapping_summary(self.mapping)
+            reviewed_count, total_count = _review_progress(self.mapping)
+            self.mapping.setdefault("summary", {})["reviewed_count"] = reviewed_count
+            self.mapping.setdefault("summary", {})["final_accept_count"] = sum(
+                1 for match in self.matches if (match.get("review") or {}).get("final_accept")
+            )
+            snapshot = copy.deepcopy(self.mapping)
+            write_review_outputs = bool(self._queued_review_output_save)
+            self._queued_review_output_save = False
+            self._save_future = self._save_executor.submit(
+                _save_mapping_bundle_snapshot,
+                self.mapping_path,
+                snapshot,
+                write_review_outputs=write_review_outputs,
+            )
+        except Exception as exc:
+            self._save_error = str(exc)
+
+    def _ensure_async_save_finished(self) -> None:
+        if self._save_future is None:
+            return
+        try:
+            self._save_future.result()
+        finally:
+            self._save_future = None
+
+    def _flush_pending_saves(self, *, write_review_outputs: bool = True) -> None:
+        self._save_timer.stop()
+        self._ensure_async_save_finished()
+        if self._save_error:
+            err = self._save_error
+            self._save_error = None
+            raise RuntimeError(err)
+        self._save_reviews(write_review_outputs=write_review_outputs)
 
     def _set_progress(self, value: int, maximum: int, text_format: str) -> None:
         maximum = max(1, int(maximum))
@@ -7916,19 +7976,24 @@ class ViewerWindow:
         *,
         rebuild_list: bool = True,
         rows_to_update: Optional[Sequence[int]] = None,
+        defer_save: bool = False,
     ) -> None:
         from PySide6 import QtWidgets
 
         self._set_busy(True)
         previous_row = self._current_index()
         try:
-            self._set_progress(0, 1, "Writing review outputs")
-            try:
-                self._save_reviews()
-            except Exception as exc:
-                self._set_progress(0, 1, "Save failed")
-                QtWidgets.QMessageBox.critical(self.window, "Save Failed", str(exc))
-                return
+            if defer_save:
+                self._set_progress(0, 1, "Updating review")
+                self._queue_save_reviews(write_review_outputs=False)
+            else:
+                self._set_progress(0, 1, "Writing review outputs")
+                try:
+                    self._flush_pending_saves(write_review_outputs=True)
+                except Exception as exc:
+                    self._set_progress(0, 1, "Save failed")
+                    QtWidgets.QMessageBox.critical(self.window, "Save Failed", str(exc))
+                    return
             if rebuild_list:
                 self._refresh_match_list(selected_row=selected_row)
             else:
@@ -7985,7 +8050,7 @@ class ViewerWindow:
             review["user_decision"] = bool(accepted)
             review["user_touched"] = True
             _apply_review_defaults(self.matches[row])
-        self._persist_refresh_and_maybe_finish(selected_row=selected_row, rebuild_list=False, rows_to_update=rows)
+        self._persist_refresh_and_maybe_finish(selected_row=selected_row, rebuild_list=False, rows_to_update=rows, defer_save=True)
 
     def reset_user_decision(self) -> None:
         if self.current_match is None or self._busy:
@@ -7999,7 +8064,7 @@ class ViewerWindow:
             review["user_decision"] = None
             review["user_touched"] = True
             _apply_review_defaults(self.matches[row])
-        self._persist_refresh_and_maybe_finish(selected_row=current_row, rebuild_list=False, rows_to_update=rows)
+        self._persist_refresh_and_maybe_finish(selected_row=current_row, rebuild_list=False, rows_to_update=rows, defer_save=True)
 
     def _maybe_finish_review(self) -> None:
         from PySide6 import QtWidgets
@@ -8663,6 +8728,7 @@ class ViewerWindow:
         written: List[str] = []
         self._set_busy(True)
         try:
+            self._flush_pending_saves(write_review_outputs=False)
             for match in accepted_matches:
                 _ensure_otb4_repair_applied(match, [])
             unresolved = self._ensure_tracebio_required_files(accepted_matches, prompt_user=True)
@@ -8729,7 +8795,7 @@ class ViewerWindow:
                     review_outputs["pipe_json_export"] = str(pipe_json_path)
                     written.extend([str(out_path), str(pipe_mat_path), str(pipe_json_path)])
                     self._set_progress(idx, len(accepted_matches), "Exporting accepted MAT files %v/%m")
-            self._save_reviews()
+            self._flush_pending_saves(write_review_outputs=True)
             self._set_progress(1, 1, "Ready")
             QtWidgets.QMessageBox.information(
                 self.window,
@@ -8841,7 +8907,7 @@ class ViewerWindow:
                     event.ignore()
                     return
             try:
-                self._save_reviews()
+                self._flush_pending_saves(write_review_outputs=True)
             except Exception as exc:
                 answer = QtWidgets.QMessageBox.warning(
                     self.window,
@@ -8855,10 +8921,14 @@ class ViewerWindow:
                     return
         except Exception:
             event.accept()
+            self._save_timer.stop()
+            self._save_executor.shutdown(wait=False, cancel_futures=True)
             self._prefetch_executor.shutdown(wait=False, cancel_futures=True)
             QtCore.QTimer.singleShot(0, lambda: self.app.exit(0))
             return
         event.accept()
+        self._save_timer.stop()
+        self._save_executor.shutdown(wait=False, cancel_futures=True)
         self._prefetch_executor.shutdown(wait=False, cancel_futures=True)
         QtCore.QTimer.singleShot(0, lambda: self.app.exit(0))
 
