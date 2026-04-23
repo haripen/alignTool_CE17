@@ -4427,6 +4427,22 @@ def _mat_export_name(match: Dict[str, Any], saved_stamp: str) -> str:
     return f"{_match_base_name(match, saved_stamp)}.mat"
 
 
+def _match_source_keys(match: Dict[str, Any]) -> Tuple[str, ...]:
+    return tuple(key for key in ("otb4", "c3d", "tsv") if match.get(key))
+
+
+def _mat_export_supported(match: Dict[str, Any]) -> bool:
+    return len(_match_source_keys(match)) >= 2
+
+
+def _tracebio_reconstruction_supported(match: Dict[str, Any]) -> bool:
+    return bool(match.get("c3d") and match.get("tsv"))
+
+
+def _pipe_export_supported(match: Dict[str, Any]) -> bool:
+    return bool(match.get("otb4") and match.get("c3d"))
+
+
 def _match_base_name(match: Dict[str, Any], saved_stamp: str) -> str:
     stamp = saved_stamp
     tsv = match.get("tsv") or {}
@@ -5151,14 +5167,20 @@ def export_match_mat(match: Dict[str, Any], export_root: Path) -> Path:
     end_sec = inner_merge.get("inner_merge_end_sec")
     if not isinstance(start_sec, (int, float)) or not isinstance(end_sec, (int, float)) or end_sec <= start_sec:
         raise ValueError("Common matched time window is unavailable.")
+    if not _mat_export_supported(match):
+        raise ValueError("MAT export requires at least two synchronized source files.")
     saved_stamp = match.get("saved_at") or _format_file_stamp()
     file_name = (((match.get("export_plan") or {}).get("mat") or {}).get("filename") or _mat_export_name(match, saved_stamp))
     out_path = Path(export_root) / file_name
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    otb4_struct = _build_otb4_mat_struct(match, float(start_sec), float(end_sec))
-    c3d_struct = _build_c3d_mat_struct(match, float(start_sec), float(end_sec))
+    otb4_struct = _build_otb4_mat_struct(match, float(start_sec), float(end_sec)) if match.get("otb4") else {}
+    c3d_struct = _build_c3d_mat_struct(match, float(start_sec), float(end_sec)) if match.get("c3d") else {}
     tsv_struct = _build_tsv_mat_struct(match, float(start_sec), float(end_sec)) if match.get("tsv") else {}
-    tracebio_struct = _build_tracebio_fullrate_struct(match, float(start_sec), float(end_sec)) if match.get("tsv") else {}
+    tracebio_struct = (
+        _build_tracebio_fullrate_struct(match, float(start_sec), float(end_sec))
+        if _tracebio_reconstruction_supported(match)
+        else {}
+    )
     mat_dict = {
         "meta": {
             "match_id": int(match["match_id"]),
@@ -5188,13 +5210,17 @@ def export_match_mat(match: Dict[str, Any], export_root: Path) -> Path:
             "inner_merge": inner_merge,
             "otb4_repair": (match.get("alignment") or {}).get("otb4_repair") or {},
         },
-        "otb4": otb4_struct,
-        "c3d_analog": c3d_struct["analog"],
-        "c3d_point": c3d_struct["point"],
-        "c3d_cop": c3d_struct["cop"],
-        "tsv": tsv_struct,
-        "tsv_reconstructed": tracebio_struct,
     }
+    if otb4_struct:
+        mat_dict["otb4"] = otb4_struct
+    if c3d_struct:
+        mat_dict["c3d_analog"] = c3d_struct["analog"]
+        mat_dict["c3d_point"] = c3d_struct["point"]
+        mat_dict["c3d_cop"] = c3d_struct["cop"]
+    if tsv_struct:
+        mat_dict["tsv"] = tsv_struct
+    if tracebio_struct:
+        mat_dict["tsv_reconstructed"] = tracebio_struct
     savemat(str(out_path), _mat_safe(mat_dict), long_field_names=True, do_compression=True)
     _write_merge_info_txt(out_path, match)
     return out_path
@@ -5204,12 +5230,14 @@ def _export_match_mat_task(args: Tuple[Dict[str, Any], str]) -> Dict[str, str]:
     match, export_root = args
     export_root_path = Path(export_root)
     base_mat = export_match_mat(match, export_root_path)
-    pipe_mat, pipe_json = export_match_pipe_bundle(match, export_root_path)
-    return {
+    outputs = {
         "mat_export": str(base_mat),
-        "pipe_mat_export": str(pipe_mat),
-        "pipe_json_export": str(pipe_json),
     }
+    if _pipe_export_supported(match):
+        pipe_mat, pipe_json = export_match_pipe_bundle(match, export_root_path)
+        outputs["pipe_mat_export"] = str(pipe_mat)
+        outputs["pipe_json_export"] = str(pipe_json)
+    return outputs
 
 
 def _pipe_mat_path(mat_path: Path) -> Path:
@@ -5375,10 +5403,11 @@ def _build_pipe_extra_specs(match: Dict[str, Any]) -> List[Tuple[str, Dict[str, 
     if original_col:
         specs.append(("Original Path", {"source": "tsv", "channel": original_col}))
 
-    for ch in _channel_list_for_record(tsv_record):
-        if ch in {performed_col, original_col}:
-            continue
-        specs.append((f"TSV {ch}", {"source": "tsv", "channel": ch}))
+    if tsv_record.get("kind") == "tsv":
+        for ch in _channel_list_for_record(tsv_record):
+            if ch in {performed_col, original_col}:
+                continue
+            specs.append((f"TSV {ch}", {"source": "tsv", "channel": ch}))
 
     for ch in c3d_record.get("channel_names") or []:
         specs.append((f"C3D Analog {ch}", {"source": "c3d", "channel": ch, "kind": "analog"}))
@@ -5864,13 +5893,19 @@ def _build_common_c3d_target(match: Dict[str, Any]) -> Dict[str, Any]:
     if not np.any(mask):
         raise ValueError("No C3D analog samples in common matched time window.")
 
-    otb_path = Path(match["otb4"]["path"])
-    otb_data, otb_time, descs, otb_fs, _name, _size = load_otb4_file(str(otb_path))
-    otb_data = np.asarray(otb_data, dtype=float)
-    labels = _description_texts(descs)
-    full_len = _max_otb_repaired_length(match, int(otb_data.shape[1]), labels)
-    otb_aligned_time = np.arange(full_len, dtype=float) / float(otb_fs) + float(_match_plot_shifts(match).get("otb4", 0.0))
     target_t = aligned_time[mask]
+    otb_path: Optional[Path] = None
+    otb_data = np.empty((0, 0), dtype=float)
+    labels: List[str] = []
+    full_len = 0
+    otb_aligned_time = np.empty(0, dtype=float)
+    if match.get("otb4"):
+        otb_path = Path(match["otb4"]["path"])
+        loaded_otb_data, _otb_time, descs, otb_fs, _name, _size = load_otb4_file(str(otb_path))
+        otb_data = np.asarray(loaded_otb_data, dtype=float)
+        labels = _description_texts(descs)
+        full_len = _max_otb_repaired_length(match, int(otb_data.shape[1]), labels)
+        otb_aligned_time = np.arange(full_len, dtype=float) / float(otb_fs) + float(_match_plot_shifts(match).get("otb4", 0.0))
     return {
         "start_sec": float(start_sec),
         "end_sec": float(end_sec),
@@ -6701,7 +6736,7 @@ def _certainty_badge(certainty: Any) -> str:
 
 
 def _exportable_badge(match: Dict[str, Any]) -> str:
-    exportable = bool(match.get("otb4") and match.get("c3d") and match.get("tsv"))
+    exportable = _mat_export_supported(match)
     return _html_badge(
         "Exportable MAT" if exportable else "Review only",
         "#DCEEFF" if exportable else "#F6D9D9",
@@ -8714,13 +8749,13 @@ class ViewerWindow:
             return
         accepted_matches = [
             match for match in self.matches
-            if (match.get("review") or {}).get("final_accept") and match.get("otb4") and match.get("c3d") and match.get("tsv")
+            if (match.get("review") or {}).get("final_accept") and _mat_export_supported(match)
         ]
         if not accepted_matches:
             QtWidgets.QMessageBox.information(
                 self.window,
                 "No Accepted Matches",
-                "No accepted triplets with TSV/OTB4/C3D are available for MAT export.",
+                "No accepted synchronized doublets or triplets are available for MAT export.",
             )
             return
         export_root = Path(self.mapping.get("export_root") or self.mapping_path.parent) / "matched"
@@ -8731,7 +8766,8 @@ class ViewerWindow:
             self._flush_pending_saves(write_review_outputs=False)
             for match in accepted_matches:
                 _ensure_otb4_repair_applied(match, [])
-            unresolved = self._ensure_tracebio_required_files(accepted_matches, prompt_user=True)
+            tracebio_matches = [match for match in accepted_matches if _tracebio_reconstruction_supported(match)]
+            unresolved = self._ensure_tracebio_required_files(tracebio_matches, prompt_user=True)
             if unresolved:
                 QtWidgets.QMessageBox.critical(
                     self.window,
@@ -8765,7 +8801,14 @@ class ViewerWindow:
                                 )
                                 return
                             match.setdefault("review_outputs", {}).update(outputs)
-                            written.extend([outputs["mat_export"], outputs["pipe_mat_export"], outputs["pipe_json_export"]])
+                            if "pipe_mat_export" not in outputs:
+                                match.setdefault("review_outputs", {}).pop("pipe_mat_export", None)
+                                match.setdefault("review_outputs", {}).pop("pipe_json_export", None)
+                            written.extend(
+                                outputs[key]
+                                for key in ("mat_export", "pipe_mat_export", "pipe_json_export")
+                                if key in outputs
+                            )
                             completed += 1
                             self._set_progress(completed, len(accepted_matches), "Exporting accepted MAT files %v/%m")
                 except Exception as exc:
@@ -8780,7 +8823,10 @@ class ViewerWindow:
                 for idx, match in enumerate(accepted_matches, start=1):
                     try:
                         out_path = export_match_mat(match, export_root)
-                        pipe_mat_path, pipe_json_path = export_match_pipe_bundle(match, export_root)
+                        pipe_mat_path: Optional[Path] = None
+                        pipe_json_path: Optional[Path] = None
+                        if _pipe_export_supported(match):
+                            pipe_mat_path, pipe_json_path = export_match_pipe_bundle(match, export_root)
                     except Exception as exc:
                         self._set_progress(0, 1, "MAT export failed")
                         QtWidgets.QMessageBox.critical(
@@ -8791,16 +8837,23 @@ class ViewerWindow:
                         return
                     review_outputs = match.setdefault("review_outputs", {})
                     review_outputs["mat_export"] = str(out_path)
-                    review_outputs["pipe_mat_export"] = str(pipe_mat_path)
-                    review_outputs["pipe_json_export"] = str(pipe_json_path)
-                    written.extend([str(out_path), str(pipe_mat_path), str(pipe_json_path)])
+                    if pipe_mat_path is not None and pipe_json_path is not None:
+                        review_outputs["pipe_mat_export"] = str(pipe_mat_path)
+                        review_outputs["pipe_json_export"] = str(pipe_json_path)
+                        written.extend([str(out_path), str(pipe_mat_path), str(pipe_json_path)])
+                    else:
+                        review_outputs.pop("pipe_mat_export", None)
+                        review_outputs.pop("pipe_json_export", None)
+                        written.append(str(out_path))
                     self._set_progress(idx, len(accepted_matches), "Exporting accepted MAT files %v/%m")
             self._flush_pending_saves(write_review_outputs=True)
             self._set_progress(1, 1, "Ready")
             QtWidgets.QMessageBox.information(
                 self.window,
                 "MAT Exported",
-                "Wrote per accepted triplet: .mat with tsv_reconstructed, _4pipe.mat with authoritative full-rate path channels, and _4pipe.json\n"
+                "Wrote .mat for each accepted synchronized doublet or triplet. "
+                "tsv_reconstructed is included when C3D and TSV are present. "
+                "_4pipe.mat and _4pipe.json are written only for OTB4+C3D exports.\n"
                 + "\n".join(written),
             )
         finally:
