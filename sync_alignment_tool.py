@@ -6050,22 +6050,36 @@ def _series_color(spec: Dict[str, Any]) -> str:
     return {"otb4": "#00A6D6", "c3d": "#7F7F7F", "tsv": "#8E7DBE"}.get(spec["source"], "#444444")
 
 
+def _series_identity_key(spec: Dict[str, Any]) -> str:
+    return "|".join(
+        [
+            str(spec.get("source") or ""),
+            str(spec.get("kind") or ""),
+            str(spec.get("channel") or ""),
+            str(spec.get("device") or ""),
+            str(spec.get("subtitle") or ""),
+        ]
+    )
+
+
+def _stable_series_palette_color(spec: Dict[str, Any]) -> str:
+    source = str(spec.get("source") or "")
+    palettes = {
+        "otb4": ["#0B84A5", "#4E79A7", "#76B7B2", "#2F6690", "#1D4E89"],
+        "c3d": ["#59A14F", "#8CD17D", "#4E9F3D", "#2A9D8F", "#6BA368"],
+        "tsv": ["#B07AA1", "#AF52DE", "#9C6ADE", "#7B61A8", "#C08497"],
+    }
+    palette = palettes.get(source, ["#0B84A5", "#F28E2B", "#59A14F", "#E15759", "#4E79A7", "#B07AA1"])
+    key = _series_identity_key(spec)
+    checksum = sum((idx + 1) * ord(ch) for idx, ch in enumerate(key))
+    return palette[checksum % len(palette)]
+
+
 def _overlay_series_color(spec: Dict[str, Any], idx: int, total: int) -> str:
-    if total <= 1:
+    kind = str(spec.get("kind") or "")
+    if kind in {"probe_buffer", "probe_ramp", "sync", "point", "cop", "raw"}:
         return _series_color(spec)
-    palette = [
-        "#0B84A5",
-        "#F28E2B",
-        "#59A14F",
-        "#E15759",
-        "#4E79A7",
-        "#EDC948",
-        "#B07AA1",
-        "#76B7B2",
-        "#FF9DA7",
-        "#9C755F",
-    ]
-    return palette[idx % len(palette)]
+    return _stable_series_palette_color(spec)
 
 
 def _raw_overlay_summary(match: Dict[str, Any]) -> str:
@@ -6462,10 +6476,22 @@ def _review_status_color(match: Dict[str, Any]) -> str:
     return _review_status_color_from_review(match.get("review") or {})
 
 
-def _review_status_text_color(match: Dict[str, Any], selected: bool = False) -> str:
-    if selected:
-        return "#FFFFFF" if _review_status_key(match) in {"user_accept", "user_reject"} else "#000000"
-    return "#FFFFFF" if _review_status_key(match) in {"user_accept", "user_reject"} else "#000000"
+def _review_queue_background_color(match: Dict[str, Any]) -> str:
+    return {
+        "auto_accept": "#E4F4E6",
+        "user_accept": "#D7F0DD",
+        "auto_reject": "#F8E4E4",
+        "user_reject": "#F4D9D9",
+    }[_review_status_key(match)]
+
+
+def _review_queue_text_color(match: Dict[str, Any], selected: bool = False) -> str:
+    return {
+        "auto_accept": "#123A20",
+        "user_accept": "#123A20",
+        "auto_reject": "#5B1F1F",
+        "user_reject": "#5B1F1F",
+    }[_review_status_key(match)]
 
 
 def _style_button(button, bg_color: str, fg_color: str) -> None:
@@ -6736,6 +6762,52 @@ def _save_mapping_bundle(mapping_path: Path, mapping: Dict[str, Any]) -> None:
     mapping_path.write_text(json.dumps(mapping, indent=2, ensure_ascii=False), encoding="utf-8")
     _write_review_outputs(export_root, mapping, saved_at)
     mapping_path.write_text(json.dumps(mapping, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def _prefetch_match_plot_data(match: Dict[str, Any]) -> None:
+    try:
+        _ensure_otb4_repair_applied(match, [])
+    except Exception:
+        pass
+    try:
+        _apply_review_defaults(match)
+    except Exception:
+        pass
+    try:
+        diag = _otb4_probe_sync_diagnostics(match)
+    except Exception:
+        diag = {}
+    desired_specs: List[Dict[str, Any]] = []
+    try:
+        desired_specs.extend(_sync_series_specs(match))
+        desired_specs.extend(_raw_series_specs(match))
+    except Exception:
+        pass
+    for probe in (diag.get("probes") or []):
+        if not probe.get("non_sync"):
+            continue
+        device = str(probe.get("device") or "").strip()
+        if not device:
+            continue
+        try:
+            desired_specs.extend(_probe_detail_series_specs(match, device))
+        except Exception:
+            continue
+    seen: set[Tuple[str, str, str, str]] = set()
+    for spec in desired_specs:
+        key = (
+            str(spec.get("source") or ""),
+            str(spec.get("channel") or ""),
+            str(spec.get("device") or ""),
+            str(spec.get("subtitle") or ""),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            _load_series_for_spec(match, spec)
+        except Exception:
+            continue
 
 
 def _review_progress(mapping: Dict[str, Any]) -> Tuple[int, int]:
@@ -7164,6 +7236,8 @@ class ViewerWindow:
         self._completed_notified = False
         self.completion_message: Optional[str] = None
         self._busy = False
+        self._prefetch_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+        self._prefetch_futures: Dict[int, concurrent.futures.Future[None]] = {}
         self._recompute_source_availability()
 
         self.header = QtWidgets.QLabel("")
@@ -7227,8 +7301,8 @@ class ViewerWindow:
                 f"OTB4: {Path(str((match.get('otb4') or {}).get('path') or '')).name or 'missing'}\n"
                 f"TSV: {Path(str((match.get('tsv') or {}).get('path') or '')).name if match.get('tsv') else 'missing'}"
             )
-            item.setBackground(QtGui.QColor(_review_status_color(match)))
-            item.setForeground(QtGui.QColor(_review_status_text_color(match, selected=False)))
+            item.setBackground(QtGui.QColor(_review_queue_background_color(match)))
+            item.setForeground(QtGui.QColor(_review_queue_text_color(match, selected=False)))
             self.list_widget.addItem(item)
             if selected_row is None and preserve_selection and current_match_id is not None and match.get("match_id") == current_match_id:
                 target_row = row
@@ -7243,6 +7317,27 @@ class ViewerWindow:
         else:
             self.current_match = None
         self._apply_list_item_styles()
+
+    def _update_match_list_row(self, row: int) -> None:
+        from PySide6 import QtGui
+
+        if row < 0 or row >= len(self.matches):
+            return
+        item = self.list_widget.item(row)
+        if item is None:
+            return
+        match = self.matches[row]
+        item_text = _review_item_text(match)
+        item.setText(item_text)
+        item.setToolTip(
+            f"{item_text}\n\n"
+            f"{_queue_code_legend_text()}\n\n"
+            f"C3D: {Path(str((match.get('c3d') or {}).get('path') or '')).name or 'missing'}\n"
+            f"OTB4: {Path(str((match.get('otb4') or {}).get('path') or '')).name or 'missing'}\n"
+            f"TSV: {Path(str((match.get('tsv') or {}).get('path') or '')).name if match.get('tsv') else 'missing'}"
+        )
+        item.setBackground(QtGui.QColor(_review_queue_background_color(match)))
+        item.setForeground(QtGui.QColor(_review_queue_text_color(match, selected=(row == self._current_index()))))
 
     def _set_busy(self, busy: bool) -> None:
         self._busy = bool(busy)
@@ -7493,8 +7588,8 @@ class ViewerWindow:
             font = item.font()
             font.setBold(row == current_row)
             item.setFont(font)
-            item.setBackground(QtGui.QColor(_review_status_color(match)))
-            item.setForeground(QtGui.QColor(_review_status_text_color(match, selected=(row == current_row))))
+            item.setBackground(QtGui.QColor(_review_queue_background_color(match)))
+            item.setForeground(QtGui.QColor(_review_queue_text_color(match, selected=(row == current_row))))
 
     def _apply_left_panel_sizing(self) -> None:
         target_height = max(300, int(self.window.height() * 0.46))
@@ -7507,6 +7602,20 @@ class ViewerWindow:
         self.detail_inner.updateGeometry()
         self.left_scroll_inner.adjustSize()
         self.left_scroll_inner.updateGeometry()
+
+    def _schedule_prefetch_rows(self, *rows: int) -> None:
+        done_ids = [match_id for match_id, future in self._prefetch_futures.items() if future.done()]
+        for match_id in done_ids:
+            self._prefetch_futures.pop(match_id, None)
+        for row in rows:
+            if row < 0 or row >= len(self.matches):
+                continue
+            match = self.matches[row]
+            match_id = int(match.get("match_id") or row + 1)
+            future = self._prefetch_futures.get(match_id)
+            if future is not None and not future.done():
+                continue
+            self._prefetch_futures[match_id] = self._prefetch_executor.submit(_prefetch_match_plot_data, match)
 
     def _resize_event(self, event) -> None:
         from PySide6 import QtWidgets
@@ -7634,10 +7743,11 @@ class ViewerWindow:
         _style_button(self.reset_decision_btn, "#E6E6E6", "#000000")
         self.reset_decision_btn.setEnabled(self.current_match is not None and review.get("user_decision") is not None)
 
-    def _persist_refresh_and_maybe_finish(self, selected_row: Optional[int] = None) -> None:
+    def _persist_refresh_and_maybe_finish(self, selected_row: Optional[int] = None, *, rebuild_list: bool = True) -> None:
         from PySide6 import QtWidgets
 
         self._set_busy(True)
+        previous_row = self._current_index()
         try:
             self._set_progress(0, 1, "Writing review outputs")
             try:
@@ -7646,7 +7756,28 @@ class ViewerWindow:
                 self._set_progress(0, 1, "Save failed")
                 QtWidgets.QMessageBox.critical(self.window, "Save Failed", str(exc))
                 return
-            self._refresh_match_list(selected_row=selected_row)
+            if rebuild_list:
+                self._refresh_match_list(selected_row=selected_row)
+            else:
+                scroll_bar = self.list_widget.verticalScrollBar()
+                scroll_value = scroll_bar.value()
+                self._update_match_list_row(previous_row)
+                if selected_row is not None and selected_row != previous_row:
+                    self._update_match_list_row(selected_row)
+                target_row = previous_row if selected_row is None else max(0, min(self.list_widget.count() - 1, int(selected_row)))
+                if self.list_widget.count():
+                    was_blocked = self.list_widget.blockSignals(True)
+                    self.list_widget.setCurrentRow(target_row)
+                    self.list_widget.blockSignals(was_blocked)
+                    self.current_match = self.matches[target_row]
+                    _ensure_otb4_repair_applied(self.current_match, [])
+                    _apply_review_defaults(self.current_match)
+                    self._apply_list_item_styles()
+                    self._sync_auto_rows()
+                    scroll_bar.setValue(scroll_value)
+                    current_item = self.list_widget.currentItem()
+                    if current_item is not None:
+                        self.list_widget.scrollToItem(current_item, QtWidgets.QAbstractItemView.ScrollHint.EnsureVisible)
             if self.current_match is not None and self.plot_rows:
                 self._refresh_rows()
             self._update_header()
@@ -7672,7 +7803,7 @@ class ViewerWindow:
         review["user_decision"] = bool(accepted)
         review["user_touched"] = True
         _apply_review_defaults(self.current_match)
-        self._persist_refresh_and_maybe_finish(selected_row=selected_row)
+        self._persist_refresh_and_maybe_finish(selected_row=selected_row, rebuild_list=False)
 
     def reset_user_decision(self) -> None:
         if self.current_match is None or self._busy:
@@ -7719,13 +7850,12 @@ class ViewerWindow:
         self.plot_rows = kept
         gc.collect()
 
-    def _rebuild_auto_rows(self) -> None:
+    def _desired_auto_row_defs(self) -> List[Dict[str, Any]]:
         if self.current_match is None:
-            return
-        self._remove_auto_rows()
-        auto_rows: List[PlotRowWidget] = [
-            PlotRowWidget(self, "Dedicated sync overlay", _sync_series_specs(self.current_match), row_role="sync", auto_generated=True),
-            PlotRowWidget(self, "Matched raw overlay", _raw_series_specs(self.current_match), row_role="raw", auto_generated=True),
+            return []
+        defs: List[Dict[str, Any]] = [
+            {"key": ("sync", ""), "title": "Dedicated sync overlay", "series_specs": _sync_series_specs(self.current_match), "row_role": "sync", "context": {}},
+            {"key": ("raw", ""), "title": "Matched raw overlay", "series_specs": _raw_series_specs(self.current_match), "row_role": "raw", "context": {}},
         ]
         diag = _otb4_probe_sync_diagnostics(self.current_match)
         for probe in (diag.get("probes") or []):
@@ -7737,20 +7867,63 @@ class ViewerWindow:
             specs = _probe_detail_series_specs(self.current_match, device)
             if not specs:
                 continue
-            auto_rows.append(
-                PlotRowWidget(
-                    self,
-                    f"{device} probe sync detail",
-                    specs,
-                    row_role="probe_detail",
-                    auto_generated=True,
-                    context={"device": device},
-                )
+            defs.append(
+                {
+                    "key": ("probe_detail", device),
+                    "title": f"{device} probe sync detail",
+                    "series_specs": specs,
+                    "row_role": "probe_detail",
+                    "context": {"device": device},
+                }
             )
-        for idx, row in enumerate(auto_rows):
+        return defs
+
+    def _sync_auto_rows(self) -> None:
+        custom_rows = [row for row in self.plot_rows if not row.auto_generated]
+        existing_auto: Dict[Tuple[str, str], PlotRowWidget] = {}
+        for row in self.plot_rows:
+            if not row.auto_generated:
+                continue
+            key = (str(row.row_role), str((row.context or {}).get("device") or ""))
+            existing_auto[key] = row
+
+        desired_rows: List[PlotRowWidget] = []
+        keep_keys: set[Tuple[str, str]] = set()
+        for desc in self._desired_auto_row_defs():
+            key = tuple(desc["key"])
+            keep_keys.add(key)  # type: ignore[arg-type]
+            row = existing_auto.get(key)
+            if row is None:
+                row = PlotRowWidget(
+                    self,
+                    str(desc["title"]),
+                    list(desc["series_specs"]),
+                    row_role=str(desc["row_role"]),
+                    auto_generated=True,
+                    context=dict(desc["context"]),
+                )
+            else:
+                row.title = str(desc["title"])
+                row.row_role = str(desc["row_role"])
+                row.context = dict(desc["context"])
+                row.series_specs = list(desc["series_specs"])
+            desired_rows.append(row)
+
+        for key, row in existing_auto.items():
+            if key in keep_keys:
+                continue
+            row.widget.setParent(None)
+            row.widget.deleteLater()
+
+        self.plot_rows = desired_rows + custom_rows
+        for idx, row in enumerate(self.plot_rows):
             self.plot_rows_layout.insertWidget(idx, row.widget)
-        self.plot_rows = auto_rows + self.plot_rows
         self._refresh_scroll_geometry()
+
+    def _rebuild_auto_rows(self) -> None:
+        if self.current_match is None:
+            return
+        self._sync_auto_rows()
 
     def _ensure_default_rows(self) -> None:
         if self.current_match is None:
@@ -8455,9 +8628,10 @@ class ViewerWindow:
         _ensure_otb4_repair_applied(self.current_match, [])
         _apply_review_defaults(self.current_match)
         self._apply_list_item_styles()
-        self._rebuild_auto_rows()
+        self._sync_auto_rows()
         self._refresh_rows()
         self._update_header()
+        self._schedule_prefetch_rows(int(row) + 1, int(row) + 2)
 
     def run(self) -> int:
         self._windowed_geometry = self.window.geometry()
@@ -8495,9 +8669,11 @@ class ViewerWindow:
                     return
         except Exception:
             event.accept()
+            self._prefetch_executor.shutdown(wait=False, cancel_futures=True)
             QtCore.QTimer.singleShot(0, lambda: self.app.exit(0))
             return
         event.accept()
+        self._prefetch_executor.shutdown(wait=False, cancel_futures=True)
         QtCore.QTimer.singleShot(0, lambda: self.app.exit(0))
 
 
