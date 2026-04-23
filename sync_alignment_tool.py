@@ -7301,8 +7301,9 @@ class ViewerWindow:
         left_scroll_layout = QtWidgets.QVBoxLayout(self.left_scroll_inner)
         left_scroll_layout.setContentsMargins(0, 0, 0, 0)
         left_scroll_layout.setSpacing(8)
+        queue_tip = _queue_code_legend_text() + "\n\nCtrl/Shift-select multiple rows, then use Accept or Reject to apply the decision to all selected matches."
         self.queue_group = QtWidgets.QGroupBox("Review Queue")
-        self.queue_group.setToolTip(_queue_code_legend_text())
+        self.queue_group.setToolTip(queue_tip)
         queue_layout = QtWidgets.QVBoxLayout(self.queue_group)
         queue_layout.setContentsMargins(10, 12, 10, 10)
         queue_layout.setSpacing(8)
@@ -7312,6 +7313,7 @@ class ViewerWindow:
         queue_layout.addWidget(self.queue_summary, 0)
         self.list_widget = QtWidgets.QListWidget()
         self.list_widget.setUniformItemSizes(True)
+        self.list_widget.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
         self.list_widget.setTextElideMode(QtCore.Qt.TextElideMode.ElideMiddle)
         self.list_widget.setStyleSheet(
             "QListWidget { background:#FFFFFF; border:1px solid #D6DFE8; border-radius:10px; selection-background-color: rgba(0,0,0,0); }"
@@ -7322,7 +7324,7 @@ class ViewerWindow:
         palette = self.list_widget.palette()
         palette.setColor(QtGui.QPalette.ColorRole.Highlight, QtGui.QColor(0, 0, 0, 0))
         self.list_widget.setPalette(palette)
-        self.list_widget.setToolTip(_queue_code_legend_text())
+        self.list_widget.setToolTip(queue_tip)
         queue_layout.addWidget(self.list_widget, 0)
         left_scroll_layout.addWidget(self.queue_group, 0)
         self.notes_group = QtWidgets.QGroupBox("Scan Notes")
@@ -7848,6 +7850,13 @@ class ViewerWindow:
         item = self.list_widget.currentItem()
         return self.list_widget.row(item) if item is not None else -1
 
+    def _selected_rows(self) -> List[int]:
+        rows = sorted({int(index.row()) for index in self.list_widget.selectedIndexes()})
+        if rows:
+            return rows
+        current = self._current_index()
+        return [current] if current >= 0 else []
+
     def _move_selection(self, delta: int) -> None:
         if self._busy or not self.list_widget.count():
             return
@@ -7901,7 +7910,13 @@ class ViewerWindow:
         _style_button(self.reset_decision_btn, "#E6E6E6", "#000000")
         self.reset_decision_btn.setEnabled(self.current_match is not None and review.get("user_decision") is not None)
 
-    def _persist_refresh_and_maybe_finish(self, selected_row: Optional[int] = None, *, rebuild_list: bool = True) -> None:
+    def _persist_refresh_and_maybe_finish(
+        self,
+        selected_row: Optional[int] = None,
+        *,
+        rebuild_list: bool = True,
+        rows_to_update: Optional[Sequence[int]] = None,
+    ) -> None:
         from PySide6 import QtWidgets
 
         self._set_busy(True)
@@ -7919,9 +7934,12 @@ class ViewerWindow:
             else:
                 scroll_bar = self.list_widget.verticalScrollBar()
                 scroll_value = scroll_bar.value()
-                self._update_match_list_row(previous_row)
-                if selected_row is not None and selected_row != previous_row:
-                    self._update_match_list_row(selected_row)
+                pending_rows = sorted({row for row in (rows_to_update or []) if row is not None and row >= 0})
+                pending_rows.extend(
+                    row for row in [previous_row, selected_row] if row is not None and row >= 0 and row not in pending_rows
+                )
+                for row in pending_rows:
+                    self._update_match_list_row(int(row))
                 target_row = previous_row if selected_row is None else max(0, min(self.list_widget.count() - 1, int(selected_row)))
                 if self.list_widget.count():
                     was_blocked = self.list_widget.blockSignals(True)
@@ -7948,30 +7966,40 @@ class ViewerWindow:
     def _decide_and_advance(self, accepted: bool) -> None:
         if self.current_match is None or self._busy:
             return
-        current_row = self._current_index()
-        next_row = current_row
-        if current_row >= 0 and self.list_widget.count():
-            next_row = min(self.list_widget.count() - 1, current_row + 1)
-        self.set_user_decision(accepted, selected_row=next_row)
+        selected_rows = self._selected_rows()
+        if not selected_rows:
+            return
+        next_row = selected_rows[-1]
+        if self.list_widget.count():
+            next_row = min(self.list_widget.count() - 1, selected_rows[-1] + 1)
+        self.set_user_decision(accepted, selected_row=next_row, selected_rows=selected_rows)
 
-    def set_user_decision(self, accepted: bool, selected_row: Optional[int] = None) -> None:
+    def set_user_decision(self, accepted: bool, selected_row: Optional[int] = None, selected_rows: Optional[Sequence[int]] = None) -> None:
         if self.current_match is None or self._busy:
             return
-        review = self.current_match.setdefault("review", {})
-        review["user_decision"] = bool(accepted)
-        review["user_touched"] = True
-        _apply_review_defaults(self.current_match)
-        self._persist_refresh_and_maybe_finish(selected_row=selected_row, rebuild_list=False)
+        rows = sorted({int(row) for row in (selected_rows or self._selected_rows()) if 0 <= int(row) < len(self.matches)})
+        if not rows:
+            return
+        for row in rows:
+            review = self.matches[row].setdefault("review", {})
+            review["user_decision"] = bool(accepted)
+            review["user_touched"] = True
+            _apply_review_defaults(self.matches[row])
+        self._persist_refresh_and_maybe_finish(selected_row=selected_row, rebuild_list=False, rows_to_update=rows)
 
     def reset_user_decision(self) -> None:
         if self.current_match is None or self._busy:
             return
-        current_row = self._current_index()
-        review = self.current_match.setdefault("review", {})
-        review["user_decision"] = None
-        review["user_touched"] = True
-        _apply_review_defaults(self.current_match)
-        self._persist_refresh_and_maybe_finish(selected_row=current_row)
+        rows = self._selected_rows()
+        if not rows:
+            return
+        current_row = rows[0]
+        for row in rows:
+            review = self.matches[row].setdefault("review", {})
+            review["user_decision"] = None
+            review["user_touched"] = True
+            _apply_review_defaults(self.matches[row])
+        self._persist_refresh_and_maybe_finish(selected_row=current_row, rebuild_list=False, rows_to_update=rows)
 
     def _maybe_finish_review(self) -> None:
         from PySide6 import QtWidgets
