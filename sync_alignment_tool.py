@@ -6184,19 +6184,27 @@ def _series_label(spec: Dict[str, Any]) -> str:
     return f"{prefix}: {channel}"
 
 
+def _source_plot_color(source: str) -> str:
+    return {
+        "c3d": "#3A86FF",
+        "tsv": "#7B61A8",
+        "otb4": "#F28E2B",
+    }.get(str(source or "").lower(), "#444444")
+
+
 def _series_color(spec: Dict[str, Any]) -> str:
     if spec.get("kind") == "probe_buffer":
         return "#0A9396"
     if spec.get("kind") == "probe_ramp":
         return "#AE2012"
     if spec.get("kind") == "sync":
-        return {"otb4": "#0B84A5", "c3d": "#F6C85F", "tsv": "#6F4E7C"}.get(spec["source"], "#666666")
+        return _source_plot_color(str(spec.get("source") or ""))
     if spec.get("kind") == "point":
         return "#D45087"
     if spec.get("kind") == "cop":
         return "#3A86FF"
     if spec.get("kind") == "raw":
-        return {"c3d": "#005F73", "tsv": "#EE6C4D"}.get(spec["source"], "#A23B72")
+        return _source_plot_color(str(spec.get("source") or ""))
     return {"otb4": "#00A6D6", "c3d": "#7F7F7F", "tsv": "#8E7DBE"}.get(spec["source"], "#444444")
 
 
