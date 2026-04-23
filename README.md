@@ -9,6 +9,11 @@ PySide6 workflow for matching `.otb4`, `.c3d`, and `.tsv` recordings by shared s
 - That vendored OTB4 reader is a local derivative for this project. It is not treated as upstream-compatible with the `hdsemg-pipe` workflow or with the original `hdsemg-shared` package.
 - For now, changes to the vendored OTB4 reader should be treated as local-only unless they are explicitly revalidated against the other repositories.
 
+## Notes
+
+- [MAT export full-rate traceBio spec](./MAT_EXPORT_TRACEBIO_SPEC.md)
+- [traceBio corridor visualization and exact corridor reconstruction](./TRACEBIO_CORRIDOR_VISUALIZATION.md)
+
 ## What It Does
 
 - Scans a selected source directory recursively.

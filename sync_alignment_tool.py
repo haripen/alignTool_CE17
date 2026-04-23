@@ -5655,6 +5655,152 @@ def _load_tracebio_path_vertices(path: Path) -> Tuple[np.ndarray, np.ndarray]:
     return t[order], y[order]
 
 
+def _tracebio_offset_segment_line(
+    t0: float,
+    y0: float,
+    t1: float,
+    y1: float,
+    radius: float,
+    side: float,
+) -> Dict[str, float]:
+    dt = float(t1) - float(t0)
+    dy = float(y1) - float(y0)
+    seg_len = float(np.hypot(dt, dy))
+    if not np.isfinite(seg_len) or seg_len <= 1e-12:
+        seg_len = 1.0
+    nx = -dy / seg_len
+    ny = dt / seg_len
+    mx = 0.5 * (float(t0) + float(t1))
+    my = 0.5 * (float(y0) + float(y1))
+    ox = mx + float(side) * float(radius) * nx
+    oy = my + float(side) * float(radius) * ny
+    a = -dy
+    b = dt
+    d = a * ox + b * oy
+    return {
+        "a": float(a),
+        "b": float(b),
+        "d": float(d),
+        "nx": float(nx),
+        "ny": float(ny),
+        "t0": float(t0),
+        "y0": float(y0),
+        "t1": float(t1),
+        "y1": float(y1),
+    }
+
+
+def _tracebio_intersect_vertical(line: Dict[str, float], x: float, radius: float, side: float, t_base: float, y_base: float) -> Tuple[float, float]:
+    a = float(line["a"])
+    b = float(line["b"])
+    d = float(line["d"])
+    if np.isfinite(b) and abs(b) > 1e-12:
+        y = (d - a * float(x)) / b
+        if np.isfinite(y):
+            return float(x), float(y)
+    return (
+        float(t_base) + float(side) * float(radius) * float(line["nx"]),
+        float(y_base) + float(side) * float(radius) * float(line["ny"]),
+    )
+
+
+def _tracebio_build_offset_path(path_t: np.ndarray, path_y: np.ndarray, radius: float, side: float) -> Tuple[np.ndarray, np.ndarray]:
+    t = np.asarray(path_t, dtype=float).reshape(-1)
+    y = np.asarray(path_y, dtype=float).reshape(-1)
+    if t.size != y.size or t.size < 2:
+        raise ValueError("traceBio offset path requires at least two path vertices.")
+    if not np.isfinite(radius):
+        raise ValueError("traceBio corridor half-width is not finite.")
+
+    segment_lines = [
+        _tracebio_offset_segment_line(t[idx], y[idx], t[idx + 1], y[idx + 1], float(radius), float(side))
+        for idx in range(t.size - 1)
+    ]
+
+    out_t = np.empty(t.size, dtype=float)
+    out_y = np.empty(y.size, dtype=float)
+    out_t[0], out_y[0] = _tracebio_intersect_vertical(segment_lines[0], float(t[0]), radius, side, float(t[0]), float(y[0]))
+    out_t[-1], out_y[-1] = _tracebio_intersect_vertical(segment_lines[-1], float(t[-1]), radius, side, float(t[-1]), float(y[-1]))
+
+    for idx in range(1, t.size - 1):
+        prev_line = segment_lines[idx - 1]
+        next_line = segment_lines[idx]
+        a1, b1, d1 = float(prev_line["a"]), float(prev_line["b"]), float(prev_line["d"])
+        a2, b2, d2 = float(next_line["a"]), float(next_line["b"]), float(next_line["d"])
+        det = a1 * b2 - a2 * b1
+        if np.isfinite(det) and abs(det) > 1e-12:
+            x = (d1 * b2 - d2 * b1) / det
+            yy = (a1 * d2 - a2 * d1) / det
+            if np.isfinite(x) and np.isfinite(yy):
+                out_t[idx] = float(x)
+                out_y[idx] = float(yy)
+                continue
+
+        ax = float(prev_line["nx"]) + float(next_line["nx"])
+        ay = float(prev_line["ny"]) + float(next_line["ny"])
+        alen = float(np.hypot(ax, ay))
+        if not np.isfinite(alen) or alen <= 1e-12:
+            ax = float(prev_line["nx"])
+            ay = float(prev_line["ny"])
+            alen = float(np.hypot(ax, ay))
+        if not np.isfinite(alen) or alen <= 1e-12:
+            ax, ay, alen = 0.0, 1.0, 1.0
+        ax /= alen
+        ay /= alen
+        out_t[idx] = float(t[idx]) + float(side) * float(radius) * ax
+        out_y[idx] = float(y[idx]) + float(side) * float(radius) * ay
+
+    return out_t, out_y
+
+
+def _tracebio_sample_offset_path(offset_t: np.ndarray, offset_y: np.ndarray, query_t: np.ndarray) -> np.ndarray:
+    xs = np.asarray(offset_t, dtype=float).reshape(-1)
+    ys = np.asarray(offset_y, dtype=float).reshape(-1)
+    q = np.asarray(query_t, dtype=float).reshape(-1)
+    if xs.size != ys.size or xs.size == 0:
+        return np.full(q.shape, np.nan, dtype=float)
+    if xs.size == 1:
+        return np.full(q.shape, float(ys[0]), dtype=float)
+
+    out = np.empty(q.shape, dtype=float)
+    segment_mins = np.minimum(xs[:-1], xs[1:])
+    segment_maxs = np.maximum(xs[:-1], xs[1:])
+    segment_mids = 0.5 * (xs[:-1] + xs[1:])
+    monotonic = bool(np.all(np.diff(xs) >= 0.0) or np.all(np.diff(xs) <= 0.0))
+
+    for idx, qt in enumerate(q):
+        if not np.isfinite(qt):
+            out[idx] = np.nan
+            continue
+        if monotonic:
+            out[idx] = float(np.interp(float(qt), xs, ys, left=float(ys[0]), right=float(ys[-1])))
+            continue
+
+        candidates: List[Tuple[float, float]] = []
+        for seg_idx in range(xs.size - 1):
+            lo = float(segment_mins[seg_idx])
+            hi = float(segment_maxs[seg_idx])
+            if float(qt) < lo or float(qt) > hi:
+                continue
+            x0 = float(xs[seg_idx])
+            x1 = float(xs[seg_idx + 1])
+            y0 = float(ys[seg_idx])
+            y1 = float(ys[seg_idx + 1])
+            if abs(x1 - x0) <= 1e-12:
+                yq = 0.5 * (y0 + y1)
+            else:
+                alpha = (float(qt) - x0) / (x1 - x0)
+                yq = y0 + alpha * (y1 - y0)
+            candidates.append((abs(float(qt) - float(segment_mids[seg_idx])), float(yq)))
+        if candidates:
+            candidates.sort(key=lambda item: item[0])
+            out[idx] = candidates[0][1]
+            continue
+        nearest_idx = int(np.argmin(np.abs(xs - float(qt))))
+        out[idx] = float(ys[nearest_idx])
+    return out
+
+
 def _tracebio_zero_offset_m(tsv_raw: np.ndarray, tsv_offset: np.ndarray, raw_m: np.ndarray) -> float:
     delta = np.asarray(tsv_raw, dtype=float) - np.asarray(tsv_offset, dtype=float)
     finite_delta = delta[np.isfinite(delta)]
@@ -5797,14 +5943,18 @@ def _build_tracebio_fullrate_struct(match: Dict[str, Any], start_sec: float, end
     path_relative_time = target_t - tsv_path_start_aligned
     desired = np.interp(path_relative_time, path_t, path_y, left=float(path_y[0]), right=float(path_y[-1]))
     corridor_half_width = float(_parse_tracebio_scalar(settings.get("CorridorHalfWidth")))
-    desired_upper = desired + corridor_half_width
-    desired_lower = desired - corridor_half_width
+    upper_t, upper_y = _tracebio_build_offset_path(path_t, path_y, corridor_half_width, +1.0)
+    lower_t, lower_y = _tracebio_build_offset_path(path_t, path_y, corridor_half_width, -1.0)
+    sampled_upper = _tracebio_sample_offset_path(upper_t, upper_y, path_relative_time)
+    sampled_lower = _tracebio_sample_offset_path(lower_t, lower_y, path_relative_time)
+    desired_upper = np.maximum(sampled_upper, sampled_lower)
+    desired_lower = np.minimum(sampled_upper, sampled_lower)
 
     label_map = {
         "performed_percent_unsmoothed": "Authoritative full-rate non-smoothed performed path in percent",
         "desired": "Exact desired path from SelectedPath vertices",
-        "desired_upper": "Desired upper corridor bound",
-        "desired_lower": "Desired lower corridor bound",
+        "desired_upper": "Desired upper corridor bound from exact offset-polyline construction",
+        "desired_lower": "Desired lower corridor bound from exact offset-polyline construction",
         "raw_m": raw_column,
         "offset_m": offset_column,
     }
