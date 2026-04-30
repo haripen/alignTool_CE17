@@ -1810,9 +1810,21 @@ def _select_otb4_c3d_edge_alignment(match: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _dedicated_sync_agreement(match: Dict[str, Any]) -> Dict[str, Any]:
-    tsv_sync_missing = bool(match.get("tsv") and not ((match["tsv"].get("sync_present")) and match["tsv"].get("sync_channel")))
+    if not match.get("otb4"):
+        return {
+            "quality": "not_applicable",
+            "pair_quality": "not_applicable",
+            "tsv_sync_missing": False,
+            "source_count": 0,
+            "spike_count": 0,
+            "mean_abs_delta_ms": None,
+            "max_abs_delta_ms": None,
+            "pairwise": {},
+            "basis": "raw_c3d_tsv_only",
+        }
+
     usable: List[Tuple[str, np.ndarray]] = []
-    for key in ("otb4", "c3d", "tsv"):
+    for key in ("otb4", "c3d"):
         rec = match.get(key)
         if rec and rec.get("sync_present") and rec.get("sync_channel"):
             edges = _aligned_sync_edges(match, key)
@@ -1822,9 +1834,7 @@ def _dedicated_sync_agreement(match: Dict[str, Any]) -> Dict[str, Any]:
             if edges.size >= 2:
                 usable.append((key, edges))
 
-    if tsv_sync_missing:
-        quality = "missing_tsv_sync"
-    elif len(usable) < 2:
+    if len(usable) < 2:
         quality = "insufficient"
     else:
         quality = "unknown"
@@ -1863,18 +1873,18 @@ def _dedicated_sync_agreement(match: Dict[str, Any]) -> Dict[str, Any]:
             pair_quality = "fair"
         else:
             pair_quality = "poor"
-        if not tsv_sync_missing:
-            quality = pair_quality
+        quality = pair_quality
 
     return {
         "quality": quality,
         "pair_quality": pair_quality,
-        "tsv_sync_missing": tsv_sync_missing,
+        "tsv_sync_missing": False,
         "source_count": len(usable),
         "spike_count": int(spike_count),
         "mean_abs_delta_ms": mean_abs,
         "max_abs_delta_ms": max_abs,
         "pairwise": pairwise,
+        "basis": "otb4_c3d_sync",
     }
 
 
@@ -3436,14 +3446,7 @@ def _auto_accept_match(match: Dict[str, Any]) -> bool:
     if not raw_ok and edge_align.get("basis") == "late_c3d_raw_bridge" and isinstance(raw_corr, (int, float)):
         raw_ok = abs(float(raw_corr)) >= 0.999
     if not match.get("otb4"):
-        c3d_tsv = (alignment.get("dedicated_sync_pairwise") or {}).get("c3d_vs_tsv") or {}
-        sync_ok = False
-        if int(c3d_tsv.get("count") or 0) > 0:
-            if int(c3d_tsv.get("matched_spikes_50ms") or 0) >= int(c3d_tsv.get("count") or 0):
-                sync_ok = True
-            elif isinstance(c3d_tsv.get("mean_abs_ms"), (int, float)) and isinstance(c3d_tsv.get("max_abs_ms"), (int, float)):
-                sync_ok = float(c3d_tsv.get("mean_abs_ms")) <= 20.0 and float(c3d_tsv.get("max_abs_ms")) <= 50.0
-        return match.get("certainty") == "certain" and (raw_ok or sync_ok)
+        return match.get("certainty") == "certain" and raw_ok
     return (
         match.get("certainty") == "certain"
         and raw_ok
@@ -3836,14 +3839,7 @@ def _evaluate_manual_tsv_selection(
     dedicated = _dedicated_sync_agreement(temp_match)
     corr_mag = abs(float(raw_corr)) if isinstance(raw_corr, (int, float)) else 0.0
     raw_penalty = (1.0 - corr_mag) * 40.0 + 0.15 * abs(float(raw_result.get("lag_sec") or 0.0))
-    sync_penalty = 0.5
-    if rec_json.get("sync_present") and rec_json.get("sync_channel"):
-        mean_abs = dedicated.get("mean_abs_delta_ms")
-        if mean_abs is None:
-            sync_penalty = 1.5
-        else:
-            sync_penalty = min(float(mean_abs) / 200.0, 3.0)
-    score = start_delta + end_delta + duration_penalty + 0.01 * filename_delta + raw_penalty + sync_penalty
+    score = start_delta + end_delta + duration_penalty + 0.01 * filename_delta + raw_penalty
     return {
         "rec_json": rec_json,
         "raw_result": raw_result,
@@ -5086,21 +5082,19 @@ def _build_c3d_mat_struct(match: Dict[str, Any], start_sec: float, end_sec: floa
 def _build_tsv_mat_struct(match: Dict[str, Any], start_sec: float, end_sec: float) -> Dict[str, Any]:
     record = match["tsv"]
     path = Path(record["path"])
-    df = pd.read_csv(path, sep="\t", decimal=",", encoding="utf-8-sig")
     used: set[str] = set()
     label_map: Dict[str, str] = {}
     out: Dict[str, Any] = {}
     channels = _channel_list_for_record(record)
-    if "t_rel" in df.columns:
-        base_t = pd.to_numeric(df["t_rel"], errors="coerce").to_numpy(dtype=float)
-    else:
-        base_t = np.arange(len(df), dtype=float)
     shift = float(_match_plot_shifts(match).get("tsv", 0.0))
-    base_t = base_t + shift
     for label in channels:
-        y = pd.to_numeric(df[label], errors="coerce").to_numpy(dtype=float)
+        try:
+            t, y = _load_tsv_channel(path, label)
+        except Exception:
+            continue
+        t = np.asarray(t, dtype=float) + shift
         y = np.nan_to_num(y, nan=np.nanmedian(y) if np.any(np.isfinite(y)) else 0.0)
-        t_crop, y_crop = _crop_aligned_series(base_t, y, start_sec, end_sec)
+        t_crop, y_crop = _crop_aligned_series(t, y, start_sec, end_sec)
         if t_crop.size == 0:
             continue
         if "time" not in out:
@@ -5831,7 +5825,36 @@ def _tracebio_sample_offset_path(offset_t: np.ndarray, offset_y: np.ndarray, que
     return out
 
 
-def _tracebio_zero_offset_m(tsv_raw: np.ndarray, tsv_offset: np.ndarray, raw_m: np.ndarray) -> float:
+def _tracebio_zero_offset_m(
+    tsv_raw: np.ndarray,
+    tsv_offset: np.ndarray,
+    raw_m: np.ndarray,
+    *,
+    tsv_time_aligned: Optional[np.ndarray] = None,
+    raw_time_aligned: Optional[np.ndarray] = None,
+) -> float:
+    if tsv_time_aligned is not None and raw_time_aligned is not None:
+        t_tsv = np.asarray(tsv_time_aligned, dtype=float).reshape(-1)
+        t_raw = np.asarray(raw_time_aligned, dtype=float).reshape(-1)
+        raw_arr = np.asarray(raw_m, dtype=float).reshape(-1)
+        offset_arr = np.asarray(tsv_offset, dtype=float).reshape(-1)
+        if t_tsv.size == offset_arr.size and t_raw.size == raw_arr.size and t_raw.size >= 2:
+            valid_raw = np.isfinite(t_raw) & np.isfinite(raw_arr)
+            valid_tsv = np.isfinite(t_tsv) & np.isfinite(offset_arr)
+            if int(np.sum(valid_raw)) >= 2 and int(np.sum(valid_tsv)) >= 2:
+                t_raw_valid = t_raw[valid_raw]
+                raw_valid = raw_arr[valid_raw]
+                order = np.argsort(t_raw_valid)
+                t_raw_valid = t_raw_valid[order]
+                raw_valid = raw_valid[order]
+                in_range = valid_tsv & (t_tsv >= float(t_raw_valid[0])) & (t_tsv <= float(t_raw_valid[-1]))
+                if int(np.sum(in_range)) >= 2:
+                    raw_at_tsv = np.interp(t_tsv[in_range], t_raw_valid, raw_valid)
+                    delta = raw_at_tsv - offset_arr[in_range]
+                    finite_delta = delta[np.isfinite(delta)]
+                    if finite_delta.size:
+                        return float(np.nanmedian(finite_delta))
+
     delta = np.asarray(tsv_raw, dtype=float) - np.asarray(tsv_offset, dtype=float)
     finite_delta = delta[np.isfinite(delta)]
     if finite_delta.size:
@@ -5872,6 +5895,42 @@ def _tracebio_resolve_record_limits(
 
     center = float(np.nanmedian(finite_offset)) if finite_offset.size else 0.0
     return center - 0.5, center + 0.5
+
+
+def _tracebio_relative_performed_percent(
+    offset_m: np.ndarray,
+    target_t: np.ndarray,
+    tsv_df: pd.DataFrame,
+    match: Dict[str, Any],
+) -> Optional[np.ndarray]:
+    if "performed" not in tsv_df.columns or "t_rel" not in tsv_df.columns:
+        return None
+    tsv_performed = _tsv_numeric_column(tsv_df, "performed")
+    tsv_t = pd.to_numeric(tsv_df["t_rel"], errors="coerce").to_numpy(dtype=float)
+    tsv_t = tsv_t + float(_match_plot_shifts(match).get("tsv", 0.0))
+    target_t = np.asarray(target_t, dtype=float).reshape(-1)
+    offset_m = np.asarray(offset_m, dtype=float).reshape(-1)
+    valid_target = np.isfinite(target_t) & np.isfinite(offset_m)
+    valid_tsv = np.isfinite(tsv_t) & np.isfinite(tsv_performed)
+    if int(np.sum(valid_target)) < 2 or int(np.sum(valid_tsv)) < 10:
+        return None
+    target_valid_t = target_t[valid_target]
+    target_valid_offset = offset_m[valid_target]
+    order = np.argsort(target_valid_t)
+    target_valid_t = target_valid_t[order]
+    target_valid_offset = target_valid_offset[order]
+    in_range = valid_tsv & (tsv_t >= float(target_valid_t[0])) & (tsv_t <= float(target_valid_t[-1]))
+    if int(np.sum(in_range)) < 10:
+        return None
+    offset_at_tsv = np.interp(tsv_t[in_range], target_valid_t, target_valid_offset)
+    y = tsv_performed[in_range]
+    fit_mask = np.isfinite(offset_at_tsv) & np.isfinite(y)
+    if int(np.sum(fit_mask)) < 10 or float(np.nanstd(offset_at_tsv[fit_mask])) <= 1e-12:
+        return None
+    design = np.column_stack([offset_at_tsv[fit_mask], np.ones(int(np.sum(fit_mask)), dtype=float)])
+    coef, *_ = np.linalg.lstsq(design, y[fit_mask], rcond=None)
+    out = coef[0] * offset_m + coef[1]
+    return np.clip(out, 0.0, 100.0)
 
 
 def _build_common_c3d_target(match: Dict[str, Any]) -> Dict[str, Any]:
@@ -5937,22 +5996,15 @@ def _build_tracebio_fullrate_struct(match: Dict[str, Any], start_sec: float, end
     selected_signal = str(settings.get("SelectedSignal") or "").strip()
     signal_key = selected_signal.lower()
     if "/cop/cy " in signal_key:
-        moment_label = "Moment.Mx1"
+        c3d_cop_label = "copy"
     elif "/cop/cx " in signal_key:
-        moment_label = "Moment.My1"
+        c3d_cop_label = "copx"
     else:
         raise ValueError(f"Unsupported traceBio SelectedSignal: {selected_signal}")
-    force_label = "Force.Fz1"
 
-    t_force, force_z = _load_c3d_analog_channel(c3d_path, force_label)
-    t_moment, moment = _load_c3d_analog_channel(c3d_path, moment_label)
-    t_force = t_force + c3d_shift
-    t_moment = t_moment + c3d_shift
-    force_full = _resample_to_target_time(target_t, t_force, force_z)
-    moment_full = _resample_to_target_time(target_t, t_moment, moment)
-    valid_force = np.abs(force_full) > 1e-9
-    raw_m = np.full(target_t.shape, np.nan, dtype=float)
-    raw_m[valid_force] = moment_full[valid_force] / force_full[valid_force] / 1000.0
+    t_cop, cop_m = _load_c3d_cop_channel(c3d_path, c3d_cop_label)
+    t_cop = t_cop + c3d_shift
+    raw_m = _resample_to_target_time(target_t, t_cop, cop_m)
 
     tsv_path = Path((match.get("tsv") or {})["path"])
     _cols, tsv_df = _read_tsv_table(tsv_path)
@@ -5964,11 +6016,25 @@ def _build_tracebio_fullrate_struct(match: Dict[str, Any], start_sec: float, end
         raise ValueError("TSV raw/offset columns for traceBio reconstruction are unavailable.")
     tsv_raw = _tsv_numeric_column(tsv_df, raw_column)
     tsv_offset = _tsv_numeric_column(tsv_df, offset_column)
-    zero_offset_m = _tracebio_zero_offset_m(tsv_raw, tsv_offset, raw_m)
+    tsv_time_aligned: Optional[np.ndarray] = None
+    if "t_rel" in tsv_df.columns:
+        tsv_time_aligned = pd.to_numeric(tsv_df["t_rel"], errors="coerce").to_numpy(dtype=float)
+        tsv_time_aligned = tsv_time_aligned + float(_match_plot_shifts(match).get("tsv", 0.0))
+    zero_offset_m = _tracebio_zero_offset_m(
+        tsv_raw,
+        tsv_offset,
+        raw_m,
+        tsv_time_aligned=tsv_time_aligned,
+        raw_time_aligned=target_t,
+    )
     offset_m = raw_m - zero_offset_m
 
     record_min_m, record_max_m = _tracebio_resolve_record_limits(settings, offset_m=offset_m, tsv_offset=tsv_offset)
     performed_percent_unsmoothed = np.clip(100.0 * (offset_m - record_min_m) / (record_max_m - record_min_m), 0.0, 100.0)
+    if bool(settings.get("RelativeMode")):
+        relative_performed = _tracebio_relative_performed_percent(offset_m, target_t, tsv_df, match)
+        if relative_performed is not None:
+            performed_percent_unsmoothed = relative_performed
 
     if "t_rel" in tsv_df.columns:
         tsv_rel = pd.to_numeric(tsv_df["t_rel"], errors="coerce").to_numpy(dtype=float)
@@ -5987,11 +6053,11 @@ def _build_tracebio_fullrate_struct(match: Dict[str, Any], start_sec: float, end
     desired_lower = np.minimum(sampled_upper, sampled_lower)
 
     label_map = {
-        "performed_percent_unsmoothed": "Authoritative full-rate non-smoothed performed path in percent",
+        "performed_percent_unsmoothed": "Full-rate C3D force-platform COP-derived non-smoothed performed path in percent",
         "desired": "Exact desired path from SelectedPath vertices",
         "desired_upper": "Desired upper corridor bound from exact offset-polyline construction",
         "desired_lower": "Desired lower corridor bound from exact offset-polyline construction",
-        "raw_m": raw_column,
+        "raw_m": c3d_cop_label,
         "offset_m": offset_column,
     }
     return {
@@ -6321,6 +6387,8 @@ def _sync_status_text(match: Dict[str, Any], dedicated: Dict[str, Any]) -> str:
     raw_text = f"raw {alignment.get('raw_alignment_quality')}"
     if isinstance(raw_corr, (int, float)):
         raw_text += f" corr {raw_corr:.3f}"
+    if not match.get("otb4"):
+        return f"C3D/TSV raw-correlation alignment | {raw_text}"
     if dedicated.get("tsv_sync_missing"):
         base = f"Dedicated sync missing in TSV | OTB4/C3D {dedicated.get('pair_quality')} | {raw_text}"
     else:
@@ -6586,21 +6654,17 @@ def _decision_reason_text(match: Dict[str, Any]) -> str:
                 f"Sync bridge used: late C3D start inferred from raw alignment; skipped {int(edge_align.get('otb4_skip') or 0)} leading OTB4 sync pulse(s)."
             )
     else:
-        lines.append("OTB4/C3D sync: unavailable")
-
-    if match.get("tsv"):
-        tsv_sync = pairwise.get("otb4_vs_tsv") or pairwise.get("c3d_vs_tsv") or {}
-        if alignment.get("dedicated_sync_quality") == "missing_tsv_sync":
-            lines.append("TSV dedicated sync channel is missing, so the decision relies on raw C3D/TSV agreement plus OTB4/C3D sync.")
-        elif tsv_sync:
-            lines.append(
-                f"TSV dedicated sync check: OTB4/TSV spikes within 50 ms={int((pairwise.get('otb4_vs_tsv') or {}).get('matched_spikes_50ms') or 0)}/{int((pairwise.get('otb4_vs_tsv') or {}).get('count') or 0)} | "
-                f"C3D/TSV spikes within 50 ms={int((pairwise.get('c3d_vs_tsv') or {}).get('matched_spikes_50ms') or 0)}/{int((pairwise.get('c3d_vs_tsv') or {}).get('count') or 0)}"
-            )
+        if match.get("otb4"):
+            lines.append("OTB4/C3D sync: unavailable")
+        else:
+            lines.append("Dedicated sync: not used for C3D/TSV doublets; raw C3D/TSV correlation is the alignment basis.")
 
     auto_accept = bool(review.get("auto_accept"))
     if auto_accept:
-        lines.append("Why accepted: the match is certain, the raw C3D/TSV channel agrees strongly, and the OTB4/C3D sync pulses are within the auto-accept tolerance.")
+        if match.get("otb4"):
+            lines.append("Why accepted: the match is certain, the raw C3D/TSV channel agrees strongly, and the OTB4/C3D sync pulses are within the auto-accept tolerance.")
+        else:
+            lines.append("Why accepted: the match is certain and the raw C3D/TSV channel agrees strongly.")
     else:
         fail_reasons: List[str] = []
         if match.get("certainty") != "certain":
@@ -6622,15 +6686,13 @@ def _decision_reason_text(match: Dict[str, Any]) -> str:
                 sync_ok = float(mean_ms) <= 20.0 and float(max_ms) <= 50.0
             if not sync_ok:
                 fail_reasons.append("OTB4/C3D sync stayed outside the auto-accept limit (mean <= 20 ms and max <= 50 ms, or all spikes matched)")
-        if alignment.get("dedicated_sync_quality") not in {"missing_tsv_sync", None}:
-            otb_tsv = pairwise.get("otb4_vs_tsv") or {}
-            c3d_tsv = pairwise.get("c3d_vs_tsv") or {}
-            if int(otb_tsv.get("matched_spikes_50ms") or 0) == 0 or int(c3d_tsv.get("matched_spikes_50ms") or 0) == 0:
-                fail_reasons.append("TSV dedicated sync spikes disagree strongly with OTB4/C3D")
         if fail_reasons:
             lines.append("Why rejected: " + " ".join(fail_reasons))
 
-    lines.append("Guide: accept if the sync overlay and raw overlay look physically consistent across the green common time window; reject if the overlays require implausible pulse pairing or obvious mis-timing.")
+    if match.get("otb4"):
+        lines.append("Guide: accept if OTB4/C3D sync and the raw C3D/TSV overlay are physically consistent across the green common time window.")
+    else:
+        lines.append("Guide: accept C3D/TSV doublets from the raw overlay; TSV/C3D sync pulses are diagnostic only and are not required to match.")
     return "\n".join(lines)
 
 
@@ -6826,19 +6888,23 @@ def _sync_info_rich_text(match: Dict[str, Any], dedicated: Dict[str, Any]) -> st
     spike_count = int(dedicated.get("spike_count") or 0)
     diag = _otb4_probe_sync_diagnostics(match)
     non_sync = int(diag.get("non_sync_probe_count") or 0)
-    bits = [f"<b>Dedicated sync:</b> {html.escape(quality)}"]
+    if not match.get("otb4"):
+        bits = ["<b>Dedicated sync:</b> not used for C3D/TSV doublets"]
+    else:
+        bits = [f"<b>Dedicated sync:</b> {html.escape(quality)}"]
     if isinstance(mean_abs, (int, float)):
         bits.append(f"<b>Mean abs:</b> {float(mean_abs):.3f} ms")
     if isinstance(max_abs, (int, float)):
         bits.append(f"<b>Max abs:</b> {float(max_abs):.3f} ms")
     if spike_count:
         bits.append(f"<b>Spikes:</b> {spike_count}")
-    bits.append(f"<b>Pair quality:</b> {html.escape(pair_quality)}")
+    if match.get("otb4"):
+        bits.append(f"<b>Pair quality:</b> {html.escape(pair_quality)}")
     if non_sync:
         bits.append(f"<b>Probe warning:</b> {non_sync} off-pattern")
     helper = html.escape(_repair_status_text(match))
-    if alignment.get("dedicated_sync_quality") == "missing_tsv_sync":
-        helper += "<br><span style='color:#7A5A00;'>TSV dedicated sync missing, so raw alignment matters more here.</span>"
+    if not match.get("otb4"):
+        helper += "<br><span style='color:#3D4955;'>C3D/TSV alignment uses raw-channel cross-correlation; sync pulses are diagnostic only.</span>"
     return (
         '<div style="font-size:14px; font-weight:700; color:#123A20;">Sync evidence</div>'
         f'<div style="margin-top:6px; line-height:1.7;">{" &nbsp;&nbsp; ".join(bits)}</div>'

@@ -121,7 +121,7 @@ Do not downsample to TSV rate.
 
 ## Performed Path: Source Of Truth
 
-The full-rate non-smoothed performed path must be reconstructed from the high-rate C3D analog force/moment channels, not from TSV interpolation and not from a fitted `performed` model.
+The full-rate non-smoothed performed path must be reconstructed from the high-rate C3D force-platform CoP signal, not from TSV interpolation and not from a fitted `performed` model.
 
 ### Raw signal identity
 
@@ -130,23 +130,36 @@ Use the selected signal from the companion traceBio settings JSON:
 - `gaitway3D_total_force/CoP/Cy [Meter]`
 - `gaitway3D_total_force/CoP/Cx [Meter]`
 
-Map them as:
+Map them to the corresponding C3D force-platform CoP channels:
 
-- `Cy`: `raw_m = Moment_Mx1 / Force_Fz1 / 1000.0`
-- `Cx`: `raw_m = Moment_My1 / Force_Fz1 / 1000.0`
+- `Cy`: `raw_m = copy`
+- `Cx`: `raw_m = copx`
 
-This matches the validated matched exports.
+These C3D force-platform CoP channels already include Vicon force-platform calibration/origin handling and are the same channels used for raw TSV/C3D alignment.
 
 ### Zero correction
 
-Use the TSV raw/offset pair as the source of truth for the run-specific zero level:
+Use the aligned C3D raw CoP and TSV offset as the source of truth for the run-specific zero level:
 
 ```text
-zero_offset_m = median(tsv_raw - tsv_offset)
+zero_offset_m = median(c3d_raw_at_tsv_times - tsv_offset)
 offset_m = raw_m - zero_offset_m
 ```
 
-This is deterministic and tied to the actual saved run.
+This removes any constant C3D force-platform origin offset while preserving the full-rate unsmoothed C3D signal shape. If aligned C3D/TSV samples are unavailable, fall back to `median(tsv_raw - tsv_offset)`.
+
+### Relative Mode Percent Calibration
+
+When traceBio `RelativeMode` is true, the displayed/exported `performed` percent is not the absolute record-range percent. It is a relative percent path anchored to the traceBio run/path scale, so the full-rate C3D-derived `offset_m` must be calibrated to the TSV `performed` percent scale.
+
+For relative-mode runs:
+
+1. sample full-rate C3D-derived `offset_m` at aligned TSV times
+2. fit an affine map from sampled `offset_m` to finite TSV `performed`
+3. apply that affine map to the full-rate unsmoothed C3D `offset_m`
+4. clamp the result to `[0, 100]`
+
+This keeps the full-rate unsmoothed C3D signal as the data source while preserving the percent scale used by traceBio.
 
 ### Percent conversion
 
@@ -298,7 +311,7 @@ That builder should:
 1. load the companion traceBio settings JSON
 2. load or embed the exact selected path definition
 3. construct the aligned full-rate C3D time base
-4. derive `raw_m` from C3D analog channels
+4. derive `raw_m` from C3D force-platform CoP channels
 5. derive `zero_offset_m` from TSV raw-offset
 6. compute `offset_m`
 7. compute `performed_percent_unsmoothed`

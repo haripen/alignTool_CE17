@@ -22,6 +22,7 @@ PySide6 workflow for matching `.otb4`, `.c3d`, and `.tsv` recordings by shared s
   - OTB4: `Syncstation AUX 2 [V]`
   - C3D: `Voltage.2_Sync`
   - TSV: `2_Sync [Volt] [sync]`
+- Uses dedicated sync pulses only for OTB4/C3D alignment checks. C3D/TSV doublets and TSV attachment are aligned by raw-channel cross-correlation.
 - Verifies raw agreement using exact same-signal CoP pairs:
   - TSV `.../CoP/Cx [Meter] [raw]` <-> C3D `copx`
   - TSV `.../CoP/Cy [Meter] [raw]` <-> C3D `copy`
@@ -66,7 +67,7 @@ If you try to close the UI before reviewing all matches, the tool warns you.
 
 ## Review Rules
 
-- Automatic `accept` is suggested when the raw C3D/TSV match is excellent and the OTB4/C3D dedicated sync is still strong, even if the TSV dedicated sync is weak.
+- Automatic `accept` is suggested when the raw C3D/TSV match is excellent. For matches with OTB4, OTB4/C3D dedicated sync must also be strong.
 - User review can overwrite the automatic decision.
 - The JSON stores both the automatic decision and the user-reviewed final decision.
 - Review colors:
@@ -74,7 +75,7 @@ If you try to close the UI before reviewing all matches, the tool warns you.
   - dark green: user-accept
   - light red: auto-reject
   - dark red: user-reject
-- Missing TSV dedicated sync is not by itself an auto-reject reason.
+- TSV dedicated sync is diagnostic only and is not an auto-reject reason.
 
 ## Outputs
 
