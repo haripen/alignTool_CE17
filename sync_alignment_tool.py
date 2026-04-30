@@ -5446,6 +5446,27 @@ def _parse_tracebio_scalar(value: Any) -> Any:
     return value
 
 
+def _tracebio_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"true", "1", "yes", "y", "on"}:
+            return True
+        if text in {"false", "0", "no", "n", "off", ""}:
+            return False
+    return bool(value)
+
+
+def _tracebio_finite_float(value: Any) -> Optional[float]:
+    parsed = _parse_tracebio_scalar(value)
+    if isinstance(parsed, (int, float, np.integer, np.floating)):
+        out = float(parsed)
+        if np.isfinite(out):
+            return out
+    return None
+
+
 def _tracebio_settings_path(match: Dict[str, Any]) -> Optional[Path]:
     override = _tracebio_settings_path_override(match)
     if override is not None:
@@ -5933,6 +5954,70 @@ def _tracebio_relative_performed_percent(
     return np.clip(out, 0.0, 100.0)
 
 
+def _tracebio_sidecar_performed_transform(settings: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    version = _tracebio_finite_float(settings.get("PerformedTransformVersion"))
+    if version is None or version < 2:
+        return None
+    if not _tracebio_bool(settings.get("RelativeMode")):
+        return None
+
+    performed_input = str(settings.get("PerformedInput") or "").strip().lower()
+    supported_inputs = {
+        "",
+        "offset",
+        "offset_m",
+        "selected_offset_m",
+        "smoothed_offset_m",
+        "smoothed_selected_offset_m",
+        "raw_m_minus_zero_offset_m",
+    }
+    if performed_input not in supported_inputs:
+        return None
+
+    clamp_min = _tracebio_finite_float(settings.get("PerformedClampMin"))
+    clamp_max = _tracebio_finite_float(settings.get("PerformedClampMax"))
+    if clamp_min is None:
+        clamp_min = 0.0
+    if clamp_max is None:
+        clamp_max = 100.0
+    if clamp_max <= clamp_min:
+        return None
+
+    range_min = _tracebio_finite_float(settings.get("ActiveRelativeRangeMin"))
+    range_max = _tracebio_finite_float(settings.get("ActiveRelativeRangeMax"))
+    gain = _tracebio_finite_float(settings.get("PerformedPercentGain"))
+    bias = _tracebio_finite_float(settings.get("PerformedPercentBias"))
+
+    if gain is None or bias is None:
+        if range_min is None or range_max is None or range_max <= range_min:
+            return None
+        gain = (clamp_max - clamp_min) / (range_max - range_min)
+        bias = clamp_min - (range_min * gain)
+    elif abs(gain) <= 1e-12:
+        return None
+
+    if range_min is None or range_max is None or range_max <= range_min:
+        if gain <= 0:
+            return None
+        range_min = (clamp_min - bias) / gain
+        range_max = (clamp_max - bias) / gain
+        if not np.isfinite(range_min) or not np.isfinite(range_max) or range_max <= range_min:
+            return None
+
+    source = str(settings.get("ActiveRelativeRangeSource") or "sidecar_v2").strip() or "sidecar_v2"
+    return {
+        "version": int(round(version)),
+        "performed_input": performed_input or "offset_m",
+        "range_min_m": float(range_min),
+        "range_max_m": float(range_max),
+        "source": source,
+        "gain": float(gain),
+        "bias": float(bias),
+        "clamp_min": float(clamp_min),
+        "clamp_max": float(clamp_max),
+    }
+
+
 def _build_common_c3d_target(match: Dict[str, Any]) -> Dict[str, Any]:
     inner_merge = ((match.get("alignment") or {}).get("inner_merge") or {})
     start_sec = inner_merge.get("inner_merge_start_sec")
@@ -6029,12 +6114,40 @@ def _build_tracebio_fullrate_struct(match: Dict[str, Any], start_sec: float, end
     )
     offset_m = raw_m - zero_offset_m
 
-    record_min_m, record_max_m = _tracebio_resolve_record_limits(settings, offset_m=offset_m, tsv_offset=tsv_offset)
-    performed_percent_unsmoothed = np.clip(100.0 * (offset_m - record_min_m) / (record_max_m - record_min_m), 0.0, 100.0)
-    if bool(settings.get("RelativeMode")):
-        relative_performed = _tracebio_relative_performed_percent(offset_m, target_t, tsv_df, match)
-        if relative_performed is not None:
-            performed_percent_unsmoothed = relative_performed
+    relative_mode = _tracebio_bool(settings.get("RelativeMode"))
+    sidecar_transform = _tracebio_sidecar_performed_transform(settings)
+    performed_percent_source = "record_limits"
+    performed_transform_version = int(sidecar_transform["version"]) if sidecar_transform else 1
+    performed_transform_gain = np.nan
+    performed_transform_bias = np.nan
+    performed_transform_range_source = ""
+    performed_transform_input = ""
+    performed_transform_clamp_min = 0.0
+    performed_transform_clamp_max = 100.0
+
+    if sidecar_transform is not None:
+        record_min_m = float(sidecar_transform["range_min_m"])
+        record_max_m = float(sidecar_transform["range_max_m"])
+        performed_transform_gain = float(sidecar_transform["gain"])
+        performed_transform_bias = float(sidecar_transform["bias"])
+        performed_transform_range_source = str(sidecar_transform["source"])
+        performed_transform_input = str(sidecar_transform["performed_input"])
+        performed_transform_clamp_min = float(sidecar_transform["clamp_min"])
+        performed_transform_clamp_max = float(sidecar_transform["clamp_max"])
+        performed_percent_unsmoothed = np.clip(
+            (performed_transform_gain * offset_m) + performed_transform_bias,
+            performed_transform_clamp_min,
+            performed_transform_clamp_max,
+        )
+        performed_percent_source = "sidecar_v2_transform"
+    else:
+        record_min_m, record_max_m = _tracebio_resolve_record_limits(settings, offset_m=offset_m, tsv_offset=tsv_offset)
+        performed_percent_unsmoothed = np.clip(100.0 * (offset_m - record_min_m) / (record_max_m - record_min_m), 0.0, 100.0)
+        if relative_mode:
+            relative_performed = _tracebio_relative_performed_percent(offset_m, target_t, tsv_df, match)
+            if relative_performed is not None:
+                performed_percent_unsmoothed = relative_performed
+                performed_percent_source = "tsv_fit_fallback"
 
     if "t_rel" in tsv_df.columns:
         tsv_rel = pd.to_numeric(tsv_df["t_rel"], errors="coerce").to_numpy(dtype=float)
@@ -6059,6 +6172,7 @@ def _build_tracebio_fullrate_struct(match: Dict[str, Any], start_sec: float, end
         "desired_lower": "Desired lower corridor bound from exact offset-polyline construction",
         "raw_m": c3d_cop_label,
         "offset_m": offset_column,
+        "performed_percent_source": "sidecar_v2_transform when PerformedTransformVersion>=2 is usable; otherwise legacy TSV-fit or record-limit fallback",
     }
     return {
         "time": out_time,
@@ -6077,9 +6191,17 @@ def _build_tracebio_fullrate_struct(match: Dict[str, Any], start_sec: float, end
         "selected_path": str(settings.get("SelectedPath") or ""),
         "selected_path_source": str(path_file),
         "corridor_half_width": float(corridor_half_width),
-        "relative_mode": bool(settings.get("RelativeMode")),
+        "relative_mode": bool(relative_mode),
         "smoothing_method": str(settings.get("SmoothingMethod") or ""),
         "smoothing_frames": int(_parse_tracebio_scalar(settings.get("SmoothingFrames")) or 0),
+        "performed_percent_source": performed_percent_source,
+        "performed_transform_version": int(performed_transform_version),
+        "performed_transform_input": performed_transform_input,
+        "performed_transform_range_source": performed_transform_range_source,
+        "performed_transform_gain": float(performed_transform_gain),
+        "performed_transform_bias": float(performed_transform_bias),
+        "performed_transform_clamp_min": float(performed_transform_clamp_min),
+        "performed_transform_clamp_max": float(performed_transform_clamp_max),
         "label_map": label_map,
     }
 

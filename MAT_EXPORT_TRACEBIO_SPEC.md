@@ -74,6 +74,14 @@ It must contain at minimum:
 - `relative_mode`
 - `smoothing_method`
 - `smoothing_frames`
+- `performed_percent_source`
+- `performed_transform_version`
+- `performed_transform_input`
+- `performed_transform_range_source`
+- `performed_transform_gain`
+- `performed_transform_bias`
+- `performed_transform_clamp_min`
+- `performed_transform_clamp_max`
 - `label_map`
 
 The four main exported traces
@@ -150,16 +158,22 @@ This removes any constant C3D force-platform origin offset while preserving the 
 
 ### Relative Mode Percent Calibration
 
-When traceBio `RelativeMode` is true, the displayed/exported `performed` percent is not the absolute record-range percent. It is a relative percent path anchored to the traceBio run/path scale, so the full-rate C3D-derived `offset_m` must be calibrated to the TSV `performed` percent scale.
+When traceBio `RelativeMode` is true, the displayed/exported `performed` percent is not always the absolute raw record-range percent. Newer traceBio sidecar JSON files can export the exact active display transform. Older files do not, so the full-rate C3D-derived `offset_m` must be calibrated to the TSV `performed` percent scale.
 
-For relative-mode runs:
+For relative-mode runs with `PerformedTransformVersion >= 2`, prefer the sidecar transform:
+
+1. read `ActiveRelativeRangeMin` / `ActiveRelativeRangeMax` and/or `PerformedPercentGain` / `PerformedPercentBias`
+2. apply the affine transform directly to full-rate C3D-derived unsmoothed `offset_m`
+3. clamp the result to `PerformedClampMin` / `PerformedClampMax` (`[0, 100]` by default)
+
+For legacy relative-mode runs without a usable sidecar transform:
 
 1. sample full-rate C3D-derived `offset_m` at aligned TSV times
 2. fit an affine map from sampled `offset_m` to finite TSV `performed`
 3. apply that affine map to the full-rate unsmoothed C3D `offset_m`
 4. clamp the result to `[0, 100]`
 
-This keeps the full-rate unsmoothed C3D signal as the data source while preserving the percent scale used by traceBio.
+Both workflows keep the full-rate unsmoothed C3D signal as the data source while preserving the percent scale used by traceBio. MAT exports include `performed_percent_source` to indicate whether `sidecar_v2_transform`, `tsv_fit_fallback`, or `record_limits` was used.
 
 ### Percent conversion
 
@@ -178,10 +192,11 @@ performed_percent_unsmoothed =
 Important:
 
 - do **not** smooth `offset_m` before writing `performed_percent_unsmoothed`
-- do **not** use `_fit_tsv_performed_model(...)`
+- for relative-mode files, prefer the explicit sidecar v2 display transform when available
+- for legacy relative-mode files, use the TSV affine fit fallback described above
 - do **not** use `_synth_tsv_performed_values(...)`
 
-Those fitted helpers are acceptable for preview fallback behavior, but not for authoritative MAT export.
+The fitted fallback is only for legacy JSON files that do not contain the active display transform.
 
 ## Desired Path: Source Of Truth
 
