@@ -1875,6 +1875,34 @@ def _select_otb4_c3d_edge_alignment(match: Dict[str, Any]) -> Dict[str, Any]:
             )
         ):
             best = best_late
+
+    if base_is_clearly_bad and best["basis"] != "late_c3d_raw_bridge":
+        # The SyncMini decrement pattern repeats, so if the OTB4 and C3D
+        # capture windows start at different points in the cycle, the true
+        # alignment can require skipping several leading edges on *either*
+        # side (not just OTB4, and not just 0-2 edges as a narrow search
+        # would assume). Only accept a wider-skip candidate that reaches a
+        # genuinely good absolute quality bar on a real number of matched
+        # edges -- guards against a spurious few-point coincidental match
+        # winning just because the naive (0,0) base happened to be bad.
+        min_matched = 6
+        max_skip = 10
+        for drop_otb in range(0, min(max_skip, len(otb_edges) - 2) + 1):
+            for drop_c3d in range(0, min(max_skip, len(c3d_edges) - 2) + 1):
+                if drop_otb == 0 and drop_c3d == 0:
+                    continue
+                cand = _eval(drop_otb, drop_c3d)
+                if cand is None or cand["matched_count"] < min_matched:
+                    continue
+                if not (
+                    isinstance(cand.get("mean_abs_ms"), (int, float))
+                    and isinstance(cand.get("max_abs_ms"), (int, float))
+                    and float(cand["mean_abs_ms"]) <= 20.0
+                    and float(cand["max_abs_ms"]) <= 50.0
+                ):
+                    continue
+                if cand["score"] < best["score"]:
+                    best = {**cand, "basis": "general_skip_search"}
     best["late_c3d_supported"] = late_c3d_supported
     return best
 
@@ -4464,6 +4492,12 @@ def _match_tsv_records(
         }
         match["alignment"]["otb4_c3d_edge_alignment"] = final_edge_align
         match["alignment"]["raw_alignment_quality"] = _effective_raw_quality(raw_result, final_edge_align)
+        # Recompute now that otb4_c3d_edge_alignment reflects final_edge_align
+        # (possibly a non-zero skip found above) -- the earlier `dedicated`
+        # was necessarily computed before that skip was known, so its
+        # internal _sync_edge_skip_count lookup would otherwise silently
+        # fall back to skip=0 and misreport dedicated-sync quality.
+        dedicated = _dedicated_sync_agreement(match)
         match["alignment"]["dedicated_sync_quality"] = dedicated.get("quality")
         match["alignment"]["dedicated_sync_pair_quality"] = dedicated.get("pair_quality")
         match["alignment"]["dedicated_sync_mean_abs_ms"] = dedicated.get("mean_abs_delta_ms")
