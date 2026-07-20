@@ -14,7 +14,7 @@ import tarfile
 import tempfile
 import uuid
 import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as _dataclass_replace
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
@@ -55,9 +55,75 @@ SYNC_OTB_LABEL = "Syncstation AUX 2 [V]"
 SYNC_C3D_LABEL = "2_Sync"
 SYNC_C3D_TSV_BRIDGE_LABEL = "3_Sync_50ms"
 SYNC_TSV_EXACT_SUFFIX = "3_Sync_50ms [Volt] [sync]"
+# Channel 1 is a session-bounds marker (one rising edge at start, one falling
+# edge at end), not a pulse train like channels 2/3. It is diagnostic-only:
+# used to log/sanity-check overall session bounds, never to gate matching.
+SYNC_OTB_TTL_SUBTITLE = "AUX 1"
+SYNC_C3D_TTL_LABEL = "1_TTL"
+SYNC_TSV_TTL_SUFFIX = "1_TTL [Volt] [sync]"
 TSV_RAW_SUFFIX = "[raw]"
 _OTB4_PROBE_DIAG_CACHE: Dict[str, Dict[str, Any]] = {}
 TRIPLET_SEED_LIMIT = 3
+
+_SYNC_CHANNEL_DEFAULTS: Dict[str, str] = {
+    "SYNC_OTB_DEVICE": SYNC_OTB_DEVICE,
+    "SYNC_OTB_SUBTITLE": SYNC_OTB_SUBTITLE,
+    "SYNC_OTB_LABEL": SYNC_OTB_LABEL,
+    "SYNC_C3D_LABEL": SYNC_C3D_LABEL,
+    "SYNC_C3D_TSV_BRIDGE_LABEL": SYNC_C3D_TSV_BRIDGE_LABEL,
+    "SYNC_TSV_EXACT_SUFFIX": SYNC_TSV_EXACT_SUFFIX,
+}
+
+
+def _apply_sync_channel_overrides(match_options: Optional[Dict[str, Any]]) -> None:
+    """Reassign the module-level sync-channel-name constants for this scan
+    from a confirmed channel map (see `_resolve_sync_channel_roles` and
+    match_files.py's Sync Channel Setup dialog, under
+    `match_options["sync_channel_map"]`).
+
+    Every function in this module that resolves a sync channel by name
+    (`_extract_otb4_record`, `_extract_c3d_record`, `_extract_tsv_record`,
+    `_read_otb4_scan_info`, the TSV-bridge lookups, and the MAT-export
+    channel matching) reads these as bare module globals rather than
+    receiving them as parameters, so reassigning them here once, before any
+    extraction runs, is sufficient to make every one of those call sites
+    respect a confirmed override -- without threading a parameter through
+    ~30 call sites across the file.
+
+    Always runs at the top of `analyze_folder`, unconditionally: with no
+    override present it resets to today's hardcoded defaults, so results
+    never depend on what a *previous* scan (of a different folder, with a
+    different confirmed mapping) happened to leave configured. This is the
+    single point where that global state is allowed to change.
+    """
+    global SYNC_OTB_DEVICE, SYNC_OTB_SUBTITLE, SYNC_OTB_LABEL
+    global SYNC_C3D_LABEL, SYNC_C3D_TSV_BRIDGE_LABEL, SYNC_TSV_EXACT_SUFFIX
+
+    channel_map = (match_options or {}).get("sync_channel_map") or {}
+    otb4_c3d = channel_map.get("otb4_c3d_sync") or {}
+    bridge = channel_map.get("tsv_bridge_sync") or {}
+
+    if otb4_c3d.get("otb4_device") and otb4_c3d.get("otb4_subtitle"):
+        SYNC_OTB_DEVICE = str(otb4_c3d["otb4_device"])
+        SYNC_OTB_SUBTITLE = str(otb4_c3d["otb4_subtitle"])
+        SYNC_OTB_LABEL = f"{SYNC_OTB_DEVICE} {SYNC_OTB_SUBTITLE} [V]"
+    else:
+        SYNC_OTB_DEVICE = _SYNC_CHANNEL_DEFAULTS["SYNC_OTB_DEVICE"]
+        SYNC_OTB_SUBTITLE = _SYNC_CHANNEL_DEFAULTS["SYNC_OTB_SUBTITLE"]
+        SYNC_OTB_LABEL = _SYNC_CHANNEL_DEFAULTS["SYNC_OTB_LABEL"]
+
+    SYNC_C3D_LABEL = str(otb4_c3d.get("c3d_label") or _SYNC_CHANNEL_DEFAULTS["SYNC_C3D_LABEL"])
+
+    if bridge.get("c3d_label"):
+        SYNC_C3D_TSV_BRIDGE_LABEL = str(bridge["c3d_label"])
+        # TSV's own column always carries this same fixed template appended
+        # to the underlying channel name (established by the existing
+        # "3_Sync_50ms [Volt] [sync]" convention) -- derive rather than
+        # require a raw TSV column name to be threaded through separately.
+        SYNC_TSV_EXACT_SUFFIX = f"{SYNC_C3D_TSV_BRIDGE_LABEL} [Volt] [sync]"
+    else:
+        SYNC_C3D_TSV_BRIDGE_LABEL = _SYNC_CHANNEL_DEFAULTS["SYNC_C3D_TSV_BRIDGE_LABEL"]
+        SYNC_TSV_EXACT_SUFFIX = _SYNC_CHANNEL_DEFAULTS["SYNC_TSV_EXACT_SUFFIX"]
 
 
 def _otb4_probe_diag_cache_key(path: str, step_sec: Optional[float] = None) -> str:
@@ -2586,6 +2652,106 @@ def _c3d_channel_edge_times(path: Path, channel_name: str) -> Tuple[float, ...]:
         return ()
 
 
+def _level_edge_bounds(x: np.ndarray, fs: float) -> Dict[str, Optional[float]]:
+    """Rising / falling transition times (sec) for a level-style marker
+    signal (one edge up at session start, one edge down at session end),
+    as opposed to a pulse train. Used for the channel-1 TTL session-bounds
+    diagnostic only. Either edge may be absent (e.g. a file's own recording
+    window ends before the TTL falls again) -- each is reported
+    independently rather than requiring both to trust either.
+
+    A median-centered amplitude threshold (as used for pulse trains) breaks
+    down here: if the TTL stays high for nearly the whole file, the median
+    itself sits at the "high" level, inverting which side looks like the
+    peak. Instead this looks directly at the derivative for the single
+    largest step up and single largest step down, which works regardless
+    of which level dominates the file's duration.
+    """
+    x = np.asarray(x, dtype=float).reshape(-1)
+    empty: Dict[str, Optional[float]] = {"rise_sec": None, "fall_sec": None}
+    if x.size < 3 or fs is None or float(fs) <= 0.0:
+        return empty
+    d = np.diff(x)
+    noise = float(np.std(d)) if d.size else 0.0
+    if noise <= 0.0:
+        return empty
+    rise_idx = int(np.argmax(d))
+    fall_idx = int(np.argmin(d))
+    out = dict(empty)
+    if float(d[rise_idx]) >= noise * 6.0:
+        out["rise_sec"] = float(rise_idx + 1) / float(fs)
+    if float(-d[fall_idx]) >= noise * 6.0:
+        out["fall_sec"] = float(fall_idx + 1) / float(fs)
+    if out["rise_sec"] is not None and out["fall_sec"] is not None and out["rise_sec"] >= out["fall_sec"]:
+        # The two largest steps don't form a plausible rise-then-fall pair
+        # (e.g. both are noise near the same transient) -- don't trust either.
+        return empty
+    return out
+
+
+def _log_ttl_session_bounds(kind: str, path: Path, log_lines: List[str]) -> None:
+    """Best-effort channel-1 (1_TTL) session-bounds diagnostic. Purely
+    informational -- never gates matching or repair decisions. On the
+    2026-07 dataset most files only expose a single TTL edge, so a full
+    start+end bound frequently cannot be validated; that is expected and
+    logged as such rather than treated as an error.
+    """
+    try:
+        if kind == "otb4":
+            _t, x, meta = _load_otb4_aux_channel(path, device=SYNC_OTB_DEVICE, subtitle=SYNC_OTB_TTL_SUBTITLE)
+            fs = float(meta.get("sampling_frequency") or 0.0)
+        elif kind == "c3d":
+            c3d = ezc3d.c3d(str(path), extract_forceplat_data=False)
+            labels = list(c3d["parameters"]["ANALOG"]["LABELS"]["value"])
+            if SYNC_C3D_TTL_LABEL not in labels:
+                log_lines.append(f"[ttl] {path.name}: {SYNC_C3D_TTL_LABEL} channel not found; session bounds unavailable.")
+                return
+            fs = float(c3d["parameters"]["ANALOG"]["RATE"]["value"][0])
+            idx = labels.index(SYNC_C3D_TTL_LABEL)
+            arr = np.asarray(c3d["data"]["analogs"], dtype=float)
+            subframes, n_channels, n_frames = arr.shape
+            x = np.transpose(arr, (2, 0, 1)).reshape(n_frames * subframes, n_channels)[:, idx]
+        elif kind == "tsv":
+            cols, df = _read_tsv_table(path)
+            sync_cols = [c for c in cols if str(c).endswith(SYNC_TSV_TTL_SUFFIX)]
+            if not sync_cols or "t_rel" not in df.columns:
+                log_lines.append(f"[ttl] {path.name}: {SYNC_TSV_TTL_SUFFIX} column not found; session bounds unavailable.")
+                return
+            t_rel = pd.to_numeric(df["t_rel"], errors="coerce").to_numpy(dtype=float)
+            x = pd.to_numeric(df[sync_cols[0]], errors="coerce").to_numpy(dtype=float)
+            finite = np.isfinite(t_rel) & np.isfinite(x)
+            if int(np.sum(finite)) < 2:
+                log_lines.append(f"[ttl] {path.name}: insufficient TTL samples; session bounds unavailable.")
+                return
+            t_rel = t_rel[finite]
+            x = x[finite]
+            dt = float(np.median(np.diff(t_rel))) if t_rel.size >= 2 else 0.0
+            fs = 1.0 / dt if dt > 0 else 0.0
+        else:
+            return
+        bounds = _level_edge_bounds(x, fs)
+        start_sec, end_sec = bounds.get("rise_sec"), bounds.get("fall_sec")
+        if start_sec is not None and end_sec is not None:
+            log_lines.append(
+                f"[ttl] {path.name}: session bounds start={start_sec:.3f}s end={end_sec:.3f}s "
+                f"duration={end_sec - start_sec:.3f}s (diagnostic only)."
+            )
+        elif start_sec is not None:
+            log_lines.append(
+                f"[ttl] {path.name}: channel-1 rising edge at start={start_sec:.3f}s, but no falling edge was "
+                f"found in this file (recording likely ends before session end)."
+            )
+        elif end_sec is not None:
+            log_lines.append(
+                f"[ttl] {path.name}: channel-1 falling edge at end={end_sec:.3f}s, but no rising edge was "
+                f"found in this file (recording likely starts after session start)."
+            )
+        else:
+            log_lines.append(f"[ttl] {path.name}: {kind} channel-1 edge not detected; session bounds unavailable.")
+    except Exception as exc:
+        log_lines.append(f"[ttl] {path.name}: session-bounds check unavailable ({exc}).")
+
+
 def _tsv_bridge_sync_alignment(
     tsv_edges: Sequence[float],
     other_edges: Sequence[float],
@@ -2938,6 +3104,297 @@ def _extract_tsv_record(path: Path) -> SyncRecord:
     )
 
 
+def _pulse_train_signature_from_events(event_times_sec: Sequence[float]) -> Optional[Dict[str, Any]]:
+    """Score an already-detected sequence of pulse-edge times for the
+    descending-interval signature shared by SyncMini/Syncstation-style
+    dedicated sync channels (2_Sync, 3_Sync_50ms), independent of the
+    channel's name. Callers detect edges with whichever spike-detector
+    already suits that source type (`_detect_sparse_spikes` for OTB4/C3D,
+    `_detect_tsv_spikes_with_template` for TSV) so discovery scoring uses
+    the exact same, already-proven detection machinery as real extraction
+    rather than a cruder from-scratch edge finder.
+
+    Real dedicated-sync channels occasionally drop a pulse (2_Sync's RF
+    probe path is expected to -- "ok to miss some as long as the data is
+    complete in between"), which merges two consecutive gaps into one and
+    corrupts a naive linear trend correlation with ~2x outlier gaps. This
+    instead looks at gap-to-gap ratios: a "continuation" (no pulse missed
+    between the two gaps) has a ratio near 1; a missed pulse lands the
+    ratio near an integer >= ~1.6. Only continuation transitions are used
+    to judge the decrement trend, so occasional drops don't hide a real
+    pattern or fabricate a fake one.
+    """
+    times = sorted(float(v) for v in event_times_sec)
+    if len(times) < 5:
+        return None
+    gaps = np.diff(times)
+    if len(gaps) < 4 or float(np.std(gaps)) < 1e-6:
+        return None
+    ratios = gaps[1:] / gaps[:-1]
+    continuation = np.abs(ratios - 1.0) <= 0.3
+    if int(continuation.sum()) < 3:
+        return None
+    diffs_ms = (gaps[1:] - gaps[:-1])[continuation] * 1000.0
+    median_step_ms = float(np.median(diffs_ms))
+    spread_ms = float(np.median(np.abs(diffs_ms - median_step_ms)))
+    descending = bool(median_step_ms < -5.0 and spread_ms <= max(20.0, abs(median_step_ms) * 0.6))
+    return {
+        "edge_count": len(times),
+        "decrement_ms": round(-median_step_ms, 3),
+        "step_consistency_ms": round(spread_ms, 3),
+        "skipped_transitions": int(continuation.size - continuation.sum()),
+        "descending_pattern": descending,
+    }
+
+
+def _summarize_channel_candidates(scored: Dict[Any, Dict[str, Any]], *, label_fn) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for key, entry in scored.items():
+        samples = entry.get("samples") or []
+        if not samples:
+            continue
+        descending_votes = sum(1 for s in samples if s.get("descending_pattern"))
+        descending_decrements = [float(s["decrement_ms"]) for s in samples if s.get("descending_pattern")]
+        widths = [float(w) for w in (entry.get("pulse_widths_ms") or []) if w is not None]
+        # Require the descending pattern in a majority of *and at least two*
+        # sampled files before trusting it -- a single-file "1.0 confidence"
+        # is not statistically meaningful and was producing false positives
+        # on noisy/short channels (eye tracking, etc.).
+        confidence = (descending_votes / len(samples)) if len(samples) >= 2 else 0.0
+        out.append(
+            {
+                "label": label_fn(key, entry),
+                "device": entry.get("device"),
+                "subtitle": entry.get("subtitle"),
+                "sample_count": len(samples),
+                "descending_pattern_votes": descending_votes,
+                "pulse_width_ms": round(float(np.median(widths)), 3) if widths else None,
+                "decrement_ms": round(
+                    float(np.median(descending_decrements or [s["decrement_ms"] for s in samples])), 3
+                ),
+                "median_edge_count": round(float(np.median([s["edge_count"] for s in samples])), 1),
+                "confidence": round(confidence, 3),
+                # Dedicated trigger inputs (e.g. Syncstation AUX N) are the
+                # right channel for the OTB4<->C3D/TSV-bridge role even when
+                # a probe's own Buffer/Ramp control channel shows the same
+                # pattern by virtue of being locked to the same clock -- so
+                # this outranks raw statistical confidence, not just ties.
+                "is_trigger_like": bool(entry.get("is_trigger_like")),
+            }
+        )
+    out.sort(
+        key=lambda item: (
+            0 if item["is_trigger_like"] else 1,
+            -item["confidence"],
+            -item["sample_count"],
+            -item["median_edge_count"],
+        )
+    )
+    return out
+
+
+def _otb4_sync_channel_candidates(paths: Sequence[Path], *, sample_limit: int = 3) -> List[Dict[str, Any]]:
+    scored: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for path in list(paths)[:sample_limit]:
+        try:
+            tracks_data = _load_otb4_track_data(path)
+        except Exception:
+            continue
+        for _offset, track, raw_arr in tracks_data:
+            if int(track.get("NumberOfChannels", 0) or 0) != 1:
+                continue
+            raw = raw_arr[0]
+            if _is_counter_track(track, raw):
+                continue
+            device = str(track.get("Device") or "").strip()
+            subtitle = str(track.get("SubTitle") or "").strip()
+            fs = float(track.get("SamplingFrequency") or 0.0)
+            if fs <= 0.0:
+                continue
+            x = raw.astype(float)
+            sig_x = _orient_signal(x)
+            amp = float(np.nanmax(sig_x)) if sig_x.size else 0.0
+            event_times_sec = _detect_sparse_spikes(
+                x,
+                fs,
+                prominence_grid=[max(float(np.std(sig_x)) * 6.0, 1e-4), max(amp * 0.15, 1e-4), max(amp * 0.25, 1e-4)],
+                distance_grid_sec=[0.8, 1.0, 1.2],
+            )
+            sig = _pulse_train_signature_from_events(event_times_sec)
+            if sig is None:
+                continue
+            key = (device, subtitle)
+            entry = scored.setdefault(
+                key,
+                {
+                    "device": device,
+                    "subtitle": subtitle,
+                    "samples": [],
+                    "pulse_widths_ms": [],
+                    "is_trigger_like": _track_prefers_voltage_units(track),
+                },
+            )
+            entry["samples"].append(sig)
+            width_info = _infer_pulse_duration_ms(x, fs)
+            if width_info.get("observed_width_ms_mode") is not None:
+                entry["pulse_widths_ms"].append(float(width_info["observed_width_ms_mode"]))
+    return _summarize_channel_candidates(scored, label_fn=lambda _k, v: f"{v['device']} {v['subtitle']}".strip())
+
+
+def _c3d_sync_channel_candidates(paths: Sequence[Path], *, sample_limit: int = 3) -> List[Dict[str, Any]]:
+    scored: Dict[str, Dict[str, Any]] = {}
+    for path in list(paths)[:sample_limit]:
+        try:
+            c3d = ezc3d.c3d(str(path), extract_forceplat_data=False)
+            labels = list(c3d["parameters"]["ANALOG"]["LABELS"]["value"])
+            rate = float(c3d["parameters"]["ANALOG"]["RATE"]["value"][0])
+            arr = np.asarray(c3d["data"]["analogs"], dtype=float)
+        except Exception:
+            continue
+        subframes, n_channels, n_frames = arr.shape
+        flat = np.transpose(arr, (2, 0, 1)).reshape(n_frames * subframes, n_channels)
+        for idx, label in enumerate(labels):
+            x = flat[:, idx]
+            sig_x = _orient_signal(x)
+            event_times_sec = _detect_sparse_spikes(
+                x,
+                rate,
+                prominence_grid=[
+                    max(float(np.std(sig_x)) * 6.0, 1e-6),
+                    max(float(np.max(sig_x)) * 0.15, 1e-6) if sig_x.size else 1e-6,
+                    max(float(np.max(sig_x)) * 0.25, 1e-6) if sig_x.size else 1e-6,
+                ],
+                distance_grid_sec=[0.8, 1.0, 1.2],
+            )
+            sig = _pulse_train_signature_from_events(event_times_sec)
+            if sig is None:
+                continue
+            entry = scored.setdefault(label, {"label": label, "samples": [], "pulse_widths_ms": []})
+            entry["samples"].append(sig)
+            width_info = _infer_pulse_duration_ms(x, rate)
+            if width_info.get("observed_width_ms_mode") is not None:
+                entry["pulse_widths_ms"].append(float(width_info["observed_width_ms_mode"]))
+    return _summarize_channel_candidates(scored, label_fn=lambda k, _v: str(k))
+
+
+def _tsv_sync_channel_candidates(paths: Sequence[Path], *, sample_limit: int = 3) -> List[Dict[str, Any]]:
+    scored: Dict[str, Dict[str, Any]] = {}
+    for path in list(paths)[:sample_limit]:
+        try:
+            cols, df = _read_tsv_table(path)
+        except Exception:
+            continue
+        if df.empty or "t_rel" not in df.columns:
+            continue
+        t_rel = pd.to_numeric(df["t_rel"], errors="coerce").to_numpy(dtype=float)
+        if len(t_rel) < 3 or not np.all(np.isfinite(t_rel[:3])):
+            continue
+        for col in cols:
+            col_l = str(col).lower()
+            if "[sync]" not in col_l and "volt" not in col_l:
+                continue
+            x = pd.to_numeric(df[col], errors="coerce").to_numpy(dtype=float)
+            med = float(np.nanmedian(x)) if np.any(np.isfinite(x)) else 0.0
+            x = np.nan_to_num(x, nan=med)
+            event_times_sec = _detect_tsv_spikes_with_template(x, t_rel)
+            sig = _pulse_train_signature_from_events(event_times_sec)
+            if sig is None:
+                continue
+            entry = scored.setdefault(str(col), {"label": str(col), "samples": [], "pulse_widths_ms": []})
+            entry["samples"].append(sig)
+    return _summarize_channel_candidates(scored, label_fn=lambda k, _v: str(k))
+
+
+def _discover_sync_channel_candidates(folder: Path, *, sample_limit: int = 3) -> Dict[str, Any]:
+    """Scan a sample of files per source type and rank channels by how much
+    they look like a dedicated sync pulse train (see
+    `_pulse_train_signature_from_events`), independent of channel *name*. Surfaces
+    candidates for the OTB4<->C3D dedicated-sync role and the TSV<->C3D/OTB4
+    bridge role without assuming today's fixed labels, so a future device
+    naming change can be caught (and picked from) instead of silently
+    producing zero matches.
+    """
+    excluded = ("matched", "accepted", "__pycache__", ".git")
+    otb4_paths = _iter_source_files(folder, ".otb4", excluded_dir_names=excluded)
+    c3d_paths = _iter_source_files(folder, ".c3d", excluded_dir_names=excluded)
+    tsv_paths = _iter_source_files(folder, ".tsv", excluded_dir_names=excluded)
+    return {
+        "otb4_candidates": _otb4_sync_channel_candidates(otb4_paths, sample_limit=sample_limit) if otb4_paths else [],
+        "c3d_candidates": _c3d_sync_channel_candidates(c3d_paths, sample_limit=sample_limit) if c3d_paths else [],
+        "tsv_candidates": _tsv_sync_channel_candidates(tsv_paths, sample_limit=sample_limit) if tsv_paths else [],
+    }
+
+
+def _best_channel_by_decrement(
+    reference: Dict[str, Any], pool: Sequence[Dict[str, Any]], exclude_labels: set
+) -> Optional[Dict[str, Any]]:
+    """Find the candidate in `pool` whose decrement-interval is closest to
+    `reference`'s -- the cross-source-type pairing signal used to match an
+    OTB4 track to a C3D label, or a C3D label to a TSV column, without
+    relying on any of them sharing a name.
+    """
+    ref_decrement = reference.get("decrement_ms")
+    if ref_decrement is None:
+        return None
+    best, best_score = None, None
+    for cand in pool:
+        if cand.get("label") in exclude_labels or cand.get("decrement_ms") is None:
+            continue
+        score = abs(float(ref_decrement) - float(cand["decrement_ms"]))
+        if best_score is None or score < best_score:
+            best, best_score = cand, score
+    return best if best_score is not None and best_score <= 10.0 else None
+
+
+def _resolve_sync_channel_roles(discovery: Dict[str, Any]) -> Dict[str, Any]:
+    """Pair up the best OTB4/C3D/TSV sync-channel candidates from
+    `_discover_sync_channel_candidates` into the two roles the matcher
+    actually needs: the OTB4<->C3D dedicated sync channel, and the
+    TSV<->C3D/OTB4 bridge channel (present only if a matching TSV
+    candidate exists). Candidates are paired by decrement-interval
+    similarity, not by name, so this keeps working if the channel names
+    change again -- it's the mechanism a Stage 2 confirmation dialog would
+    pre-select from.
+    """
+    otb4_candidates = discovery.get("otb4_candidates") or []
+    c3d_candidates = discovery.get("c3d_candidates") or []
+    tsv_candidates = discovery.get("tsv_candidates") or []
+
+    # Only consider OTB4 candidates that look like dedicated trigger inputs
+    # (falls back to all candidates if none were classified as trigger-like,
+    # e.g. a device naming scheme this heuristic doesn't recognize).
+    trigger_candidates = [c for c in otb4_candidates if c.get("is_trigger_like")] or otb4_candidates
+
+    used_c3d: set = set()
+    paired: List[Dict[str, Any]] = []
+    for otb4_cand in trigger_candidates:
+        c3d_match = _best_channel_by_decrement(otb4_cand, c3d_candidates, used_c3d)
+        if c3d_match is None:
+            continue
+        used_c3d.add(c3d_match["label"])
+        # Annotate every paired candidate with its own TSV match (if any) up
+        # front, not just the eventual recommendation -- a caller building a
+        # full candidate list (e.g. a confirmation dialog) needs accurate
+        # per-option info, not just the winner's.
+        tsv_match = _best_channel_by_decrement(c3d_match, tsv_candidates, set())
+        entry = {"otb4": otb4_cand, "c3d": c3d_match}
+        if tsv_match is not None:
+            entry["tsv"] = tsv_match
+        paired.append(entry)
+
+    bridge_pair = next((p for p in paired if "tsv" in p), None)
+    non_bridge_pairs = [
+        p for p in paired if bridge_pair is None or p["c3d"]["label"] != bridge_pair["c3d"]["label"]
+    ]
+    dedicated_pair = non_bridge_pairs[0] if non_bridge_pairs else (paired[0] if paired else None)
+
+    return {
+        "otb4_c3d_sync": dedicated_pair,
+        "tsv_bridge_sync": bridge_pair,
+        "all_paired_candidates": paired,
+    }
+
+
 def _apply_otb4_repairs(matches: List[Dict[str, Any]], log_lines: List[str]) -> None:
     for match in matches:
         if not (match.get("otb4") and match.get("c3d")):
@@ -3252,6 +3709,118 @@ def _ensure_otb4_repair_applied(match: Dict[str, Any], log_lines: Optional[List[
     alignment["otb4_repair_evaluated"] = True
 
 
+def _otb4_channel_edge_times(path: Path, device: str, subtitle: str) -> List[float]:
+    """Edge times (sec, own OTB4 sample clock) for an arbitrary AUX track,
+    mirroring `_c3d_channel_edge_times` so a non-primary OTB4 sync channel
+    (e.g. the 3_Sync_50ms bridge track) can be probed with comparable
+    detection quality to the dedicated channel-2 extraction.
+    """
+    try:
+        _t, x, meta = _load_otb4_aux_channel(path, device=device, subtitle=subtitle)
+    except Exception:
+        return []
+    fs = float(meta.get("sampling_frequency") or 0.0)
+    if fs <= 0.0:
+        return []
+    sig = _orient_signal(x)
+    amp = float(np.nanmax(sig)) if sig.size else 0.0
+    peaks_sec = _detect_sparse_spikes(
+        x,
+        fs,
+        prominence_grid=[max(float(np.std(sig)) * 6.0, 1e-4), max(amp * 0.15, 1e-4), max(amp * 0.25, 1e-4)],
+        distance_grid_sec=[0.8, 1.0, 1.2],
+    )
+    return [float(v) for v in peaks_sec]
+
+
+def _channel3_pairing_fallback(
+    otb4_records: Sequence[SyncRecord],
+    c3d_records: Sequence[SyncRecord],
+    already_paired: Sequence[Tuple[SyncRecord, SyncRecord, float]],
+    folder: Path,
+    log_lines: List[str],
+) -> List[Tuple[SyncRecord, SyncRecord, float]]:
+    """Secondary OTB4<->C3D pairing pass on the 50ms channel-3 bridge, used
+    only to rescue records the primary 1ms channel-2 dedicated sync
+    (`_pair_records` on `intervals_sec`) failed to pair. Channel 2 stays the
+    primary basis; this never overrides a pair channel 2 already found.
+    """
+    paired_otb4_ids = {id(o) for o, _c, _cost in already_paired}
+    paired_c3d_ids = {id(c) for _o, c, _cost in already_paired}
+    leftover_otb4 = [r for r in otb4_records if id(r) not in paired_otb4_ids]
+    leftover_c3d = [r for r in c3d_records if id(r) not in paired_c3d_ids]
+    if not leftover_otb4 or not leftover_c3d:
+        return []
+    try:
+        roles = _resolve_sync_channel_roles(_discover_sync_channel_candidates(folder))
+    except Exception as exc:
+        log_lines.append(f"[pairing] channel-3 fallback: sync channel discovery failed ({exc}); skipping.")
+        return []
+    bridge = roles.get("tsv_bridge_sync")
+    if not bridge or "otb4" not in bridge or "c3d" not in bridge:
+        log_lines.append(
+            f"[pairing] channel-3 fallback: {len(leftover_otb4)} OTB4 / {len(leftover_c3d)} C3D record(s) left "
+            f"unpaired by channel-2 sync, but no channel-3 bridge candidate could be resolved to attempt a fallback."
+        )
+        return []
+    otb4_device = str(bridge["otb4"].get("device") or "")
+    otb4_subtitle = str(bridge["otb4"].get("subtitle") or "")
+    c3d_label = str(bridge["c3d"].get("label") or "")
+    if not (otb4_device and otb4_subtitle and c3d_label):
+        return []
+
+    left_intervals: Dict[str, List[float]] = {}
+    for rec in leftover_otb4:
+        edges = sorted(_otb4_channel_edge_times(Path(rec.path), otb4_device, otb4_subtitle))
+        if len(edges) >= 2:
+            left_intervals[rec.path] = list(np.diff(edges))
+    right_intervals: Dict[str, List[float]] = {}
+    for rec in leftover_c3d:
+        edges = sorted(_c3d_channel_edge_times(Path(rec.path), c3d_label))
+        if len(edges) >= 2:
+            right_intervals[rec.path] = list(np.diff(edges))
+    if not left_intervals or not right_intervals:
+        return []
+
+    left_subs = [r for r in leftover_otb4 if r.path in left_intervals]
+    right_subs = [r for r in leftover_c3d if r.path in right_intervals]
+    left_view = [_dataclass_replace(r, intervals_sec=left_intervals[r.path]) for r in left_subs]
+    right_view = [_dataclass_replace(r, intervals_sec=right_intervals[r.path]) for r in right_subs]
+    fallback_pairs = _pair_records(left_view, right_view)
+    by_path_otb4 = {r.path: r for r in left_subs}
+    by_path_c3d = {r.path: r for r in right_subs}
+
+    out: List[Tuple[SyncRecord, SyncRecord, float]] = []
+    for o_view, c_view, cost in fallback_pairs:
+        orig_o = by_path_otb4.get(o_view.path)
+        orig_c = by_path_c3d.get(c_view.path)
+        if orig_o is None or orig_c is None:
+            continue
+        # Channel-3 pairing cost only compares interval *shape*, not absolute
+        # time, so a coincidental shape match between two unrelated files can
+        # still score low. Cross-check against channel 2 (if both sides have
+        # it) before trusting the fallback: if the best-possible channel-2
+        # alignment between these two specific files still can't find a
+        # plausible number of agreeing edges, this is very likely a spurious
+        # shape match, not the same physical recording -- reject it.
+        if orig_o.edge_times_sec and orig_c.edge_times_sec:
+            cross_check = _tsv_bridge_sync_alignment(orig_c.edge_times_sec, orig_o.edge_times_sec, match_tol_sec=0.05)
+            if cross_check.get("quality") in ("weak", "insufficient"):
+                log_lines.append(
+                    f"[pairing] channel-3 fallback: {Path(orig_o.path).name} <-> {Path(orig_c.path).name} "
+                    f"REJECTED -- channel-3 shape cost was low (cost={cost:.4f}) but the best possible channel-2 "
+                    f"cross-check only found {cross_check.get('matched_count')} agreeing edge(s) "
+                    f"(quality={cross_check.get('quality')}); likely a coincidental shape match, not the same recording."
+                )
+                continue
+        out.append((orig_o, orig_c, float(cost)))
+        log_lines.append(
+            f"[pairing] channel-3 fallback: {Path(orig_o.path).name} <-> {Path(orig_c.path).name} paired via "
+            f"{otb4_device} {otb4_subtitle} <-> {c3d_label} (unpaired by channel-2 dedicated sync), cost={cost:.4f}."
+        )
+    return out
+
+
 def _pair_records(left: List[SyncRecord], right: List[SyncRecord], skip_penalty: float = 0.25) -> List[Tuple[SyncRecord, SyncRecord, float]]:
     if not left or not right:
         return []
@@ -3373,27 +3942,50 @@ def _evaluate_c3d_tsv_candidate(
             bridge = _tsv_bridge_sync_alignment(tsv_record.edge_times_sec, c3d_bridge_edges)
     bridge_ok = bool(bridge and bridge.get("quality") in ("certain", "probable"))
     used_bridge = False
-    if (raw_corr is None or abs(float(raw_corr)) < 0.95) and bridge_ok:
+    if bridge_ok:
+        # The dedicated 3_Sync_50ms bridge channel is the required primary path
+        # for TSV<->C3D alignment (it is present on every recording); raw CoP
+        # correlation is only a fallback/confirmation, not the primary signal.
         raw_lag_orig = raw_result.get("lag_sec")
+        raw_strong = isinstance(raw_corr, (int, float)) and abs(float(raw_corr)) >= 0.95
         bridge_cop_conflict = (
             isinstance(raw_lag_orig, (int, float))
             and abs(float(raw_lag_orig) - float(bridge["shift_sec"])) > 1.0
         )
-        raw_result["cop_corr_diag"] = raw_result.get("corr")
-        raw_result["cop_lag_diag"] = raw_lag_orig
-        raw_result["lag_sec"] = bridge["shift_sec"]
-        raw_result["corr"] = None
         if bridge_cop_conflict:
-            # CoP found a numeric lag that disagrees with the bridge by >1s: two
-            # independent signals disagree, so don't let this auto-accept even if
-            # the bridge alone looks "certain" -- surface it for human review.
+            # Two independent signals disagree by >1s -- never auto-accept this,
+            # regardless of how strong either signal looks alone. Surface for review.
+            raw_result["cop_corr_diag"] = raw_result.get("corr")
+            raw_result["cop_lag_diag"] = raw_lag_orig
+            raw_result["lag_sec"] = bridge["shift_sec"]
+            raw_result["corr"] = None
             raw_result["quality"] = "fair"
             raw_result["basis"] = "sync_bridge_3sync50ms_conflict"
-        else:
-            raw_result["quality"] = "excellent" if bridge["quality"] == "certain" else "fair"
+            raw_result["bridge_info"] = bridge
+            used_bridge = True
+        elif bridge["quality"] == "certain":
+            # Bridge is strong and not contradicted -- authoritative primary result.
+            raw_result["cop_corr_diag"] = raw_result.get("corr")
+            raw_result["cop_lag_diag"] = raw_lag_orig
+            raw_result["lag_sec"] = bridge["shift_sec"]
+            raw_result["corr"] = None
+            raw_result["quality"] = "excellent"
             raw_result["basis"] = "sync_bridge_3sync50ms"
-        raw_result["bridge_info"] = bridge
-        used_bridge = True
+            raw_result["bridge_info"] = bridge
+            used_bridge = True
+        elif not raw_strong:
+            # Bridge is only "probable" and raw CoP isn't strong enough to stand
+            # on its own -- fall back to the bridge result as before.
+            raw_result["cop_corr_diag"] = raw_result.get("corr")
+            raw_result["cop_lag_diag"] = raw_lag_orig
+            raw_result["lag_sec"] = bridge["shift_sec"]
+            raw_result["corr"] = None
+            raw_result["quality"] = "fair"
+            raw_result["basis"] = "sync_bridge_3sync50ms"
+            raw_result["bridge_info"] = bridge
+            used_bridge = True
+        # else: bridge only "probable" but raw CoP is strong and agrees -- keep
+        # the raw result as primary; the bridge already confirmed it (no conflict).
     temp_match = {
         "otb4": None,
         "c3d": c3d_json,
@@ -3712,27 +4304,50 @@ def _match_tsv_records(
                 bridge = _tsv_bridge_sync_alignment(rec.edge_times_sec, c3d_bridge_edges)
             bridge_ok = bool(bridge and bridge.get("quality") in ("certain", "probable"))
             used_bridge = False
-            if (raw_corr is None or abs(float(raw_corr)) < 0.95) and bridge_ok:
+            if bridge_ok:
+                # The dedicated 3_Sync_50ms bridge is the required primary path for
+                # TSV<->C3D alignment (present on every recording); raw CoP
+                # correlation is only a fallback/confirmation.
                 raw_lag_orig = raw_result.get("lag_sec")
+                raw_strong = isinstance(raw_corr, (int, float)) and abs(float(raw_corr)) >= 0.95
                 bridge_cop_conflict = (
                     isinstance(raw_lag_orig, (int, float))
                     and abs(float(raw_lag_orig) - float(bridge["shift_sec"])) > 1.0
                 )
-                raw_result["cop_corr_diag"] = raw_result.get("corr")
-                raw_result["cop_lag_diag"] = raw_lag_orig
-                raw_result["lag_sec"] = bridge["shift_sec"]
-                raw_result["corr"] = None
                 if bridge_cop_conflict:
-                    # CoP found a numeric lag that disagrees with the bridge by >1s:
-                    # two independent signals disagree, so don't let this auto-accept
-                    # even if the bridge alone looks "certain" -- flag for review.
+                    # Two independent signals disagree by >1s: never auto-accept,
+                    # regardless of how strong either signal looks alone -- flag for review.
+                    raw_result["cop_corr_diag"] = raw_result.get("corr")
+                    raw_result["cop_lag_diag"] = raw_lag_orig
+                    raw_result["lag_sec"] = bridge["shift_sec"]
+                    raw_result["corr"] = None
                     raw_result["quality"] = "fair"
                     raw_result["basis"] = "sync_bridge_3sync50ms_conflict"
-                else:
-                    raw_result["quality"] = "excellent" if bridge["quality"] == "certain" else "fair"
+                    raw_result["bridge_info"] = bridge
+                    used_bridge = True
+                elif bridge["quality"] == "certain":
+                    # Bridge is strong and not contradicted -- authoritative primary result.
+                    raw_result["cop_corr_diag"] = raw_result.get("corr")
+                    raw_result["cop_lag_diag"] = raw_lag_orig
+                    raw_result["lag_sec"] = bridge["shift_sec"]
+                    raw_result["corr"] = None
+                    raw_result["quality"] = "excellent"
                     raw_result["basis"] = "sync_bridge_3sync50ms"
-                raw_result["bridge_info"] = bridge
-                used_bridge = True
+                    raw_result["bridge_info"] = bridge
+                    used_bridge = True
+                elif not raw_strong:
+                    # Bridge only "probable" and raw CoP isn't strong enough alone --
+                    # fall back to the bridge result as before.
+                    raw_result["cop_corr_diag"] = raw_result.get("corr")
+                    raw_result["cop_lag_diag"] = raw_lag_orig
+                    raw_result["lag_sec"] = bridge["shift_sec"]
+                    raw_result["corr"] = None
+                    raw_result["quality"] = "fair"
+                    raw_result["basis"] = "sync_bridge_3sync50ms"
+                    raw_result["bridge_info"] = bridge
+                    used_bridge = True
+                # else: bridge only "probable" but raw CoP is strong and agrees --
+                # keep raw as primary; bridge already confirmed it (no conflict).
             diag_corr = abs(float(raw_corr)) if isinstance(raw_corr, (int, float)) else None
             diag_lag = abs(float(raw_result.get("lag_sec") or 0.0)) if raw_result.get("lag_sec") is not None else None
             duration_penalty = 0.1 * abs((rec.duration_sec or 0.0) - pair_span)
@@ -3830,7 +4445,7 @@ def _match_tsv_records(
         match["alignment"]["tsv_end_minus_otb_sec"] = round(rec.last_ts - otb_end, 6) if rec.last_ts is not None else None
         match["alignment"]["tsv_start_minus_otb_start_sec"] = round(rec.first_ts - otb_start, 6) if rec.first_ts is not None else None
         match["alignment"]["tsv_score"] = round(score, 6)
-        match["alignment"]["tsv_alignment_basis"] = "raw_only"
+        match["alignment"]["tsv_alignment_basis"] = raw_result.get("basis") or "raw_only"
         match["alignment"]["sync_edge_skips"] = temp_match["alignment"].get("sync_edge_skips") or {"otb4": 0, "c3d": 0, "tsv": 0}
         match["alignment"]["otb4_c3d_edge_alignment"] = temp_match["alignment"].get("otb4_c3d_edge_alignment") or {}
         match["alignment"]["raw_alignment_quality"] = _effective_raw_quality(raw_result, match["alignment"].get("otb4_c3d_edge_alignment"))
@@ -4229,8 +4844,14 @@ def _derive_preferred_pairs_from_matches(matches: Sequence[Dict[str, Any]]) -> L
 
 def analyze_folder(folder: Path, match_options: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     folder = folder.resolve()
+    _apply_sync_channel_overrides(match_options)
     log_lines: List[str] = []
     log_lines.append(f"[{_now_iso()}] Scan start: {folder}")
+    if (match_options or {}).get("sync_channel_map"):
+        log_lines.append(
+            f"[sync] channel map override in effect: OTB4/C3D dedicated sync={SYNC_OTB_DEVICE} {SYNC_OTB_SUBTITLE} <-> {SYNC_C3D_LABEL}; "
+            f"TSV bridge sync=C3D {SYNC_C3D_TSV_BRIDGE_LABEL} (default otherwise: {_SYNC_CHANNEL_DEFAULTS['SYNC_OTB_SUBTITLE']} / {_SYNC_CHANNEL_DEFAULTS['SYNC_C3D_LABEL']} / {_SYNC_CHANNEL_DEFAULTS['SYNC_C3D_TSV_BRIDGE_LABEL']})."
+        )
     preferred_pairs = _normalize_global_pair_specs((match_options or {}).get("preferred_channel_pairs"))
     configured_sync_pulse_duration_ms = (match_options or {}).get("sync_pulse_duration_ms")
     plausible_sync_pulse_durations_ms = [
@@ -4272,6 +4893,7 @@ def analyze_folder(folder: Path, match_options: Optional[Dict[str, Any]] = None)
         )
         for note in rec.notes:
             log_lines.append(f"  - {note}")
+        _log_ttl_session_bounds("otb4", path, log_lines)
 
     for path in _iter_source_files(folder, ".c3d", excluded_dir_names=("matched", "accepted", "__pycache__", ".git")):
         rec = _extract_c3d_record(path)
@@ -4282,6 +4904,7 @@ def analyze_folder(folder: Path, match_options: Optional[Dict[str, Any]] = None)
         )
         for note in rec.notes:
             log_lines.append(f"  - {note}")
+        _log_ttl_session_bounds("c3d", path, log_lines)
 
     for path in _iter_source_files(folder, ".tsv", excluded_dir_names=("matched", "accepted", "__pycache__", ".git")):
         rec = _extract_tsv_record(path)
@@ -4292,11 +4915,15 @@ def analyze_folder(folder: Path, match_options: Optional[Dict[str, Any]] = None)
         )
         for note in rec.notes:
             log_lines.append(f"  - {note}")
+        _log_ttl_session_bounds("tsv", path, log_lines)
 
     pair_matches: List[Dict[str, Any]] = []
     matched_tsv: List[Dict[str, Any]] = []
     if otb4_records and c3d_records:
         otb4_to_c3d = _pair_records(otb4_records, c3d_records)
+        fallback_pairs = _channel3_pairing_fallback(otb4_records, c3d_records, otb4_to_c3d, folder, log_lines)
+        if fallback_pairs:
+            otb4_to_c3d = otb4_to_c3d + fallback_pairs
         otb4_to_c3d.sort(key=lambda t: t[0].path)
 
         pair_id = 1

@@ -5,7 +5,19 @@ import sys
 import json
 from pathlib import Path
 
-from sync_alignment_tool import ViewerWindow, run_scan, _iter_source_files, _load_otb4_track_data, _infer_pulse_duration_ms, _is_counter_track, _detect_buffer_events_abs, _fit_descending_sync_pattern
+from sync_alignment_tool import (
+    ViewerWindow,
+    run_scan,
+    _iter_source_files,
+    _load_otb4_track_data,
+    _infer_pulse_duration_ms,
+    _is_counter_track,
+    _detect_buffer_events_abs,
+    _fit_descending_sync_pattern,
+    _discover_sync_channel_candidates,
+    _resolve_sync_channel_roles,
+    _available_global_pair_options,
+)
 
 
 def _configure_qt_runtime() -> None:
@@ -172,15 +184,176 @@ def _pick_item(parent, title: str, prompt: str, values: list[float], recommended
     return float(label_to_value[choice])
 
 
+_SKIP_CHANNEL_LABEL = "None -- skip (no dedicated sync; matcher falls back to its other methods)"
+
+
+def _pick_from_choices(parent, title: str, prompt: str, labels: list[str], current_index: int) -> tuple[int, bool]:
+    from PySide6 import QtWidgets
+
+    if not labels:
+        return -1, True
+    choice, ok = QtWidgets.QInputDialog.getItem(parent, title, prompt, labels, max(0, current_index), False)
+    if not ok or not choice:
+        return -1, False
+    try:
+        return labels.index(choice), True
+    except ValueError:
+        return -1, False
+
+
+def _format_pair_candidate_label(pair: dict) -> str:
+    otb4 = pair.get("otb4") or {}
+    c3d = pair.get("c3d") or {}
+    otb4_label = f"{otb4.get('device', '?')} {otb4.get('subtitle', '')}".strip()
+    bits = []
+    width = c3d.get("pulse_width_ms")
+    if width is not None:
+        bits.append(f"{width:g} ms pulses")
+    decrement = c3d.get("decrement_ms")
+    if decrement is not None:
+        bits.append(f"{decrement:g} ms decrement")
+    conf = c3d.get("confidence")
+    if conf is not None:
+        bits.append(f"confidence {conf * 100:.0f}%")
+    suffix = f" ({', '.join(bits)})" if bits else ""
+    return f"OTB4 {otb4_label} <-> C3D {c3d.get('label', '?')}{suffix}"
+
+
+def _format_bridge_candidate_label(pair: dict) -> str:
+    base = _format_pair_candidate_label(pair)
+    tsv = pair.get("tsv")
+    if not tsv:
+        return base + " | no matching TSV column found"
+    decrement = tsv.get("decrement_ms")
+    detail = f" ({decrement:g} ms decrement)" if isinstance(decrement, (int, float)) else ""
+    return base + f" | TSV column found{detail}"
+
+
+def _pick_sync_channel_map(scan_dir: Path, parent) -> dict | None:
+    """Auto-scan (via _discover_sync_channel_candidates/_resolve_sync_channel_roles
+    -- pulse-shape based, not name based) and confirm the two sync-channel
+    roles the matcher needs: the OTB4<->C3D dedicated sync channel, and the
+    TSV<->C3D/OTB4 bridge channel. Mirrors the existing pulse-duration/
+    decrement picker pattern (_pick_item / QInputDialog.getItem) already
+    used below, so overriding a device naming change no longer requires a
+    code change -- just a different pick in this dialog.
+    """
+    if not any(_iter_source_files(scan_dir, ".otb4", excluded_dir_names=("matched", "accepted", "__pycache__", ".git"))):
+        return {"otb4_c3d_sync": None, "tsv_bridge_sync": None}
+
+    discovery = _discover_sync_channel_candidates(scan_dir, sample_limit=3)
+    roles = _resolve_sync_channel_roles(discovery)
+    paired = roles.get("all_paired_candidates") or []
+
+    dedicated_labels = [_format_pair_candidate_label(p) for p in paired] + [_SKIP_CHANNEL_LABEL]
+    recommended = roles.get("otb4_c3d_sync")
+    dedicated_idx = paired.index(recommended) if recommended in paired else (len(dedicated_labels) - 1)
+    if 0 <= dedicated_idx < len(paired):
+        dedicated_labels[dedicated_idx] += " (Recommended)"
+    idx, ok = _pick_from_choices(
+        parent,
+        "OTB4 / C3D Dedicated Sync Channel",
+        "Which channel pair is the dedicated sync signal shared by OTB4 and C3D?\n\n"
+        "Detected automatically from pulse-pattern shape (not by channel name) using a sample of "
+        "your files. Pick a different pair if this looks wrong, or Skip if this session has no "
+        "usable dedicated sync channel.",
+        dedicated_labels,
+        dedicated_idx,
+    )
+    if not ok:
+        return None
+    chosen_dedicated = paired[idx] if 0 <= idx < len(paired) else None
+
+    result: dict = {
+        "otb4_c3d_sync": (
+            {
+                "otb4_device": chosen_dedicated["otb4"]["device"],
+                "otb4_subtitle": chosen_dedicated["otb4"]["subtitle"],
+                "c3d_label": chosen_dedicated["c3d"]["label"],
+            }
+            if chosen_dedicated
+            else None
+        )
+    }
+
+    if not any(_iter_source_files(scan_dir, ".tsv", excluded_dir_names=("matched", "accepted", "__pycache__", ".git"))):
+        result["tsv_bridge_sync"] = None
+        return result
+
+    bridge_labels = [_format_bridge_candidate_label(p) for p in paired] + [_SKIP_CHANNEL_LABEL]
+    recommended_bridge = roles.get("tsv_bridge_sync")
+    bridge_idx = len(bridge_labels) - 1
+    if recommended_bridge is not None:
+        for i, p in enumerate(paired):
+            if p["c3d"]["label"] == recommended_bridge["c3d"]["label"]:
+                bridge_idx = i
+                break
+    if 0 <= bridge_idx < len(paired):
+        bridge_labels[bridge_idx] += " (Recommended)"
+    idx, ok = _pick_from_choices(
+        parent,
+        "TSV Bridge Sync Channel",
+        "Which channel bridges the TSV (biofeedback) recording to C3D/OTB4?\n\n"
+        "This is separate from the OTB4/C3D dedicated sync above. If none is detected, or you'd "
+        "rather rely on raw CoP cross-correlation (the long-standing default), choose Skip.",
+        bridge_labels,
+        bridge_idx,
+    )
+    if not ok:
+        return None
+    chosen_bridge = paired[idx] if 0 <= idx < len(paired) else None
+    result["tsv_bridge_sync"] = (
+        {
+            "otb4_device": chosen_bridge["otb4"]["device"],
+            "otb4_subtitle": chosen_bridge["otb4"]["subtitle"],
+            "c3d_label": chosen_bridge["c3d"]["label"],
+        }
+        if chosen_bridge
+        else None
+    )
+    return result
+
+
+def _pick_preferred_pairs(scan_dir: Path, parent) -> list | None:
+    """Let the user override which raw C3D/TSV channel pair is preferred for
+    cross-correlation matching, or accept auto-detection (the default).
+    Wires up `_available_global_pair_options`, which already existed for
+    exactly this purpose but was never called from the startup dialog --
+    `preferred_channel_pairs` was always hardcoded to `[]`.
+    """
+    options = [o for o in _available_global_pair_options(scan_dir) if o.get("kind") in ("auto", "raw")]
+    if len(options) <= 1:
+        return []
+    labels = [opt["label"] + (" (Recommended)" if opt.get("kind") == "auto" else "") for opt in options]
+    idx, ok = _pick_from_choices(
+        parent,
+        "Preferred Raw Channel Pair",
+        "Which C3D/TSV raw channel pair should be preferred for cross-correlation matching?\n\n"
+        "Auto detect (the default) tries the exact CoP Cx<->copx / Cy<->copy pairing automatically. "
+        "Only override this if a specific pairing needs to be forced.",
+        labels,
+        0,
+    )
+    if not ok:
+        return None
+    chosen = options[idx]
+    return [chosen] if chosen.get("kind") == "raw" else []
+
+
 def _pick_matching_preferences(scan_dir: Path, parent) -> dict | None:
     if not any(_iter_source_files(scan_dir, ".otb4", excluded_dir_names=("matched", "accepted", "__pycache__", ".git"))):
         return {
             "preferred_channel_pairs": [],
+            "sync_channel_map": {"otb4_c3d_sync": None, "tsv_bridge_sync": None},
             "sync_pulse_duration_ms": None,
             "plausible_sync_pulse_durations_ms": [],
             "sync_decrement_ms": None,
             "plausible_sync_decrements_ms": [],
         }
+
+    sync_channel_map = _pick_sync_channel_map(scan_dir, parent)
+    if sync_channel_map is None:
+        return None
 
     pulse_meta = _infer_plausible_sync_pulse_durations(scan_dir)
     plausible = [float(v) for v in (pulse_meta.get("plausible_durations_ms") or [1.0])]
@@ -213,8 +386,14 @@ def _pick_matching_preferences(scan_dir: Path, parent) -> dict | None:
     )
     if selected_decrement_ms is None:
         return None
+
+    preferred_pairs = _pick_preferred_pairs(scan_dir, parent)
+    if preferred_pairs is None:
+        return None
+
     return {
-        "preferred_channel_pairs": [],
+        "preferred_channel_pairs": preferred_pairs,
+        "sync_channel_map": sync_channel_map,
         "sync_pulse_duration_ms": float(selected_pulse_ms),
         "plausible_sync_pulse_durations_ms": plausible,
         "sync_decrement_ms": float(selected_decrement_ms),
