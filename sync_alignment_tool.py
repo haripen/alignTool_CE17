@@ -49,8 +49,12 @@ except Exception:
 SYNC_OTB_DEVICE = "Syncstation"
 SYNC_OTB_SUBTITLE = "AUX 2"
 SYNC_OTB_LABEL = "Syncstation AUX 2 [V]"
-SYNC_C3D_LABEL = "Voltage.2_Sync"
-SYNC_TSV_EXACT_SUFFIX = "2_Sync [Volt] [sync]"
+# Convention as of the 2026-07 recordings: bare "2_Sync"/"3_Sync_50ms" labels
+# (no "Voltage." device prefix). OTB4/C3D dedicated sync stays on channel 2;
+# a dedicated third channel bridges TSV (biofeedback) recordings to C3D/OTB4.
+SYNC_C3D_LABEL = "2_Sync"
+SYNC_C3D_TSV_BRIDGE_LABEL = "3_Sync_50ms"
+SYNC_TSV_EXACT_SUFFIX = "3_Sync_50ms [Volt] [sync]"
 TSV_RAW_SUFFIX = "[raw]"
 _OTB4_PROBE_DIAG_CACHE: Dict[str, Dict[str, Any]] = {}
 TRIPLET_SEED_LIMIT = 3
@@ -2510,7 +2514,7 @@ def _extract_c3d_record(path: Path) -> SyncRecord:
             intervals_sec=[],
             min_value=None,
             max_value=None,
-            notes=["Voltage.2_Sync not found in analog labels."] + platform_notes,
+            notes=[f"{SYNC_C3D_LABEL} not found in analog labels."] + platform_notes,
             timestamp=ts.isoformat(sep=" ") if ts else None,
             channel_names=labels,
             point_channel_names=point_labels,
@@ -2550,6 +2554,109 @@ def _extract_c3d_record(path: Path) -> SyncRecord:
         channel_names=labels,
         point_channel_names=point_labels,
     )
+
+
+@lru_cache(maxsize=64)
+def _c3d_channel_edge_times(path: Path, channel_name: str) -> Tuple[float, ...]:
+    """Edge times (sec, own C3D sample clock) for an arbitrary analog label.
+
+    Mirrors the peak-detection settings used for the dedicated OTB4/C3D sync
+    channel in `_extract_c3d_record`, so it can be pointed at other pulse
+    channels (e.g. the TSV bridge channel) with comparable detection quality.
+    """
+    try:
+        c3d = ezc3d.c3d(str(path), extract_forceplat_data=False)
+        labels = list(c3d["parameters"]["ANALOG"]["LABELS"]["value"])
+        if channel_name not in labels:
+            return ()
+        rate = float(c3d["parameters"]["ANALOG"]["RATE"]["value"][0])
+        idx = labels.index(channel_name)
+        arr = np.asarray(c3d["data"]["analogs"], dtype=float)
+        subframes, n_channels, n_frames = arr.shape
+        x = np.transpose(arr, (2, 0, 1)).reshape(n_frames * subframes, n_channels)[:, idx]
+        sig = _orient_signal(x)
+        peaks_sec = _detect_sparse_spikes(
+            x,
+            rate,
+            prominence_grid=[max(float(np.std(sig)) * 6.0, 1e-6), max(float(np.max(sig)) * 0.15, 1e-6), max(float(np.max(sig)) * 0.25, 1e-6)],
+            distance_grid_sec=[0.8, 1.0, 1.2],
+        )
+        return tuple(float(v) for v in peaks_sec)
+    except Exception:
+        return ()
+
+
+def _tsv_bridge_sync_alignment(
+    tsv_edges: Sequence[float],
+    other_edges: Sequence[float],
+    *,
+    match_tol_sec: float = 0.03,
+) -> Dict[str, Any]:
+    """Best-lag agreement between a TSV dedicated-sync edge train and another
+    file's edge train on the same physical bridge channel (e.g. C3D's
+    SYNC_C3D_TSV_BRIDGE_LABEL channel).
+
+    The BiofeedbackUI capture can drop an occasional pulse anywhere in the
+    train (not just at the start/end), so a positional leading-skip search
+    is not enough. Instead this probes candidate global shifts (aligning any
+    of the first few TSV edges against any edge on the other side) and, for
+    each candidate, greedily nearest-neighbor matches the remaining edges
+    within `match_tol_sec`, picking the shift with the most matched edges
+    (ties broken by lowest mean error). This tolerates arbitrary interior
+    gaps on either side as long as enough edges survive to fix the shift.
+    """
+    tsv_arr = np.asarray(sorted(tsv_edges), dtype=float)
+    other_arr = np.asarray(sorted(other_edges), dtype=float)
+    if tsv_arr.size < 2 or other_arr.size < 2:
+        return {"shift_sec": None, "mean_abs_ms": None, "max_abs_ms": None, "matched_count": 0, "quality": "insufficient"}
+
+    n_probe = min(4, tsv_arr.size)
+    candidate_shifts = {round(float(oj - tsv_arr[i]), 3) for i in range(n_probe) for oj in other_arr}
+
+    def _score_shift(shift: float) -> Dict[str, Any]:
+        shifted = tsv_arr + shift
+        used_idx: set[int] = set()
+        deltas: List[float] = []
+        for t in shifted:
+            j = int(np.argmin(np.abs(other_arr - t)))
+            if j in used_idx or abs(other_arr[j] - t) > match_tol_sec:
+                continue
+            used_idx.add(j)
+            deltas.append(abs(other_arr[j] - t) * 1000.0)
+        if not deltas:
+            return {"matched_count": 0, "mean_abs_ms": None, "max_abs_ms": None}
+        return {
+            "matched_count": len(deltas),
+            "mean_abs_ms": float(np.mean(deltas)),
+            "max_abs_ms": float(np.max(deltas)),
+        }
+
+    best: Optional[Dict[str, Any]] = None
+    best_rank: Optional[Tuple[int, float]] = None
+    for shift in candidate_shifts:
+        cand = _score_shift(shift)
+        if cand["matched_count"] == 0:
+            continue
+        rank = (-cand["matched_count"], cand["mean_abs_ms"])
+        if best_rank is None or rank < best_rank:
+            best_rank = rank
+            best = {"shift_sec": float(shift), **cand}
+    if best is None:
+        return {"shift_sec": None, "mean_abs_ms": None, "max_abs_ms": None, "matched_count": 0, "quality": "insufficient"}
+
+    # TSV timestamps come from a ~20 Hz biofeedback loop (median sample interval
+    # commonly 40-50 ms), so edge-detection jitter of roughly half a sample is
+    # the measurement noise floor, not a mismatch. Thresholds are calibrated to
+    # that floor rather than to C3D/OTB4's much higher sample rates.
+    min_n = min(tsv_arr.size, other_arr.size)
+    if best["matched_count"] >= max(3, int(round(min_n * 0.6))) and best["max_abs_ms"] <= 60.0 and best["mean_abs_ms"] <= 30.0:
+        quality = "certain"
+    elif best["matched_count"] >= 3 and best["max_abs_ms"] <= 150.0:
+        quality = "probable"
+    else:
+        quality = "weak"
+    best["quality"] = quality
+    return best
 
 
 @lru_cache(maxsize=256)
@@ -3239,6 +3346,13 @@ def _summarize_c3d_tsv_pair_certainty(eval_info: Dict[str, Any]) -> str:
             return "certain"
         if abs_corr >= 0.95 and abs_lag <= 5.0:
             return "probable"
+    if raw_result.get("basis") == "sync_bridge_3sync50ms":
+        if raw_result.get("quality") == "excellent":
+            return "certain"
+        if raw_result.get("quality") == "fair":
+            return "probable"
+    if raw_result.get("basis") == "sync_bridge_3sync50ms_conflict":
+        return "probable"
     return "uncertain"
 
 
@@ -3250,7 +3364,36 @@ def _evaluate_c3d_tsv_candidate(
 ) -> Optional[Dict[str, Any]]:
     c3d_json = c3d_record.to_json()
     tsv_json = tsv_record.to_json()
-    raw_result = _best_tsv_raw_alignment(tsv_json, c3d_json, preferred_pairs=preferred_pairs)
+    raw_result = dict(_best_tsv_raw_alignment(tsv_json, c3d_json, preferred_pairs=preferred_pairs))
+    raw_corr = raw_result.get("corr")
+    bridge: Optional[Dict[str, Any]] = None
+    if tsv_record.sync_present and tsv_record.edge_times_sec:
+        c3d_bridge_edges = _c3d_channel_edge_times(Path(c3d_record.path), SYNC_C3D_TSV_BRIDGE_LABEL)
+        if c3d_bridge_edges:
+            bridge = _tsv_bridge_sync_alignment(tsv_record.edge_times_sec, c3d_bridge_edges)
+    bridge_ok = bool(bridge and bridge.get("quality") in ("certain", "probable"))
+    used_bridge = False
+    if (raw_corr is None or abs(float(raw_corr)) < 0.95) and bridge_ok:
+        raw_lag_orig = raw_result.get("lag_sec")
+        bridge_cop_conflict = (
+            isinstance(raw_lag_orig, (int, float))
+            and abs(float(raw_lag_orig) - float(bridge["shift_sec"])) > 1.0
+        )
+        raw_result["cop_corr_diag"] = raw_result.get("corr")
+        raw_result["cop_lag_diag"] = raw_lag_orig
+        raw_result["lag_sec"] = bridge["shift_sec"]
+        raw_result["corr"] = None
+        if bridge_cop_conflict:
+            # CoP found a numeric lag that disagrees with the bridge by >1s: two
+            # independent signals disagree, so don't let this auto-accept even if
+            # the bridge alone looks "certain" -- surface it for human review.
+            raw_result["quality"] = "fair"
+            raw_result["basis"] = "sync_bridge_3sync50ms_conflict"
+        else:
+            raw_result["quality"] = "excellent" if bridge["quality"] == "certain" else "fair"
+            raw_result["basis"] = "sync_bridge_3sync50ms"
+        raw_result["bridge_info"] = bridge
+        used_bridge = True
     temp_match = {
         "otb4": None,
         "c3d": c3d_json,
@@ -3267,13 +3410,15 @@ def _evaluate_c3d_tsv_candidate(
     c3d_duration = float(c3d_record.sample_count or 0) / float(c3d_record.sample_rate or 1.0) if c3d_record.sample_rate else None
     tsv_duration = float(tsv_record.duration_sec) if tsv_record.duration_sec is not None else None
     duration_penalty = abs(float(c3d_duration or 0.0) - float(tsv_duration or 0.0)) * 0.1 if c3d_duration and tsv_duration else 0.0
-    raw_corr = raw_result.get("corr")
     raw_lag = raw_result.get("lag_sec")
-    raw_penalty = 2.5
     if isinstance(raw_corr, (int, float)) and isinstance(raw_lag, (int, float)):
         raw_penalty = (1.0 - abs(float(raw_corr))) * 40.0 + 0.15 * abs(float(raw_lag))
+    elif used_bridge:
+        raw_penalty = (2.0 if raw_result.get("quality") == "excellent" else 6.0) + 0.15 * abs(float(raw_lag or 0.0))
+    else:
+        raw_penalty = 2.5
     score = float(duration_penalty + raw_penalty)
-    if raw_result.get("corr") is None:
+    if raw_result.get("corr") is None and not used_bridge:
         return None
     certainty = _summarize_c3d_tsv_pair_certainty({"raw_result": raw_result, "dedicated": dedicated})
     return {
@@ -3284,7 +3429,7 @@ def _evaluate_c3d_tsv_candidate(
         "score": score,
         "duration_penalty": duration_penalty,
         "certainty": certainty,
-        "basis": "raw_only",
+        "basis": "sync_bridge_3sync50ms" if used_bridge else "raw_only",
     }
 
 
@@ -3521,6 +3666,7 @@ def _match_tsv_records(
         c3d_duration = float(match["c3d"].get("sample_count", 0) or 0.0) / float(match["c3d"].get("sample_rate") or 1.0)
         otb_edges = list(match["otb4"].get("edge_times_sec") or [])
         c3d_edges = list(match["c3d"].get("edge_times_sec") or [])
+        c3d_bridge_edges = _c3d_channel_edge_times(Path(match["c3d"]["path"]), SYNC_C3D_TSV_BRIDGE_LABEL)
         if otb_edges and c3d_edges:
             pair_span = float(max(otb_edges[-1], c3d_edges[-1]) - min(otb_edges[0], c3d_edges[0]))
         else:
@@ -3559,8 +3705,34 @@ def _match_tsv_records(
         shortlist = ranked_candidates[: min(3, len(ranked_candidates))]
         for _cheap_score, rec, start_delta, end_delta, filename_delta in shortlist:
             rec_json = rec.to_json()
-            raw_result = _best_tsv_raw_alignment(rec_json, match["c3d"], preferred_pairs=preferred_pairs)
+            raw_result = dict(_best_tsv_raw_alignment(rec_json, match["c3d"], preferred_pairs=preferred_pairs))
             raw_corr = raw_result.get("corr")
+            bridge: Optional[Dict[str, Any]] = None
+            if c3d_bridge_edges and rec.sync_present and rec.edge_times_sec:
+                bridge = _tsv_bridge_sync_alignment(rec.edge_times_sec, c3d_bridge_edges)
+            bridge_ok = bool(bridge and bridge.get("quality") in ("certain", "probable"))
+            used_bridge = False
+            if (raw_corr is None or abs(float(raw_corr)) < 0.95) and bridge_ok:
+                raw_lag_orig = raw_result.get("lag_sec")
+                bridge_cop_conflict = (
+                    isinstance(raw_lag_orig, (int, float))
+                    and abs(float(raw_lag_orig) - float(bridge["shift_sec"])) > 1.0
+                )
+                raw_result["cop_corr_diag"] = raw_result.get("corr")
+                raw_result["cop_lag_diag"] = raw_lag_orig
+                raw_result["lag_sec"] = bridge["shift_sec"]
+                raw_result["corr"] = None
+                if bridge_cop_conflict:
+                    # CoP found a numeric lag that disagrees with the bridge by >1s:
+                    # two independent signals disagree, so don't let this auto-accept
+                    # even if the bridge alone looks "certain" -- flag for review.
+                    raw_result["quality"] = "fair"
+                    raw_result["basis"] = "sync_bridge_3sync50ms_conflict"
+                else:
+                    raw_result["quality"] = "excellent" if bridge["quality"] == "certain" else "fair"
+                    raw_result["basis"] = "sync_bridge_3sync50ms"
+                raw_result["bridge_info"] = bridge
+                used_bridge = True
             diag_corr = abs(float(raw_corr)) if isinstance(raw_corr, (int, float)) else None
             diag_lag = abs(float(raw_result.get("lag_sec") or 0.0)) if raw_result.get("lag_sec") is not None else None
             duration_penalty = 0.1 * abs((rec.duration_sec or 0.0) - pair_span)
@@ -3571,7 +3743,7 @@ def _match_tsv_records(
                 or (diag_corr is not None and best_diag[2] is None)
             ):
                 best_diag = (rec, diag_score, diag_corr, diag_lag, filename_delta, raw_result.get("quality") or "missing")
-            if raw_corr is None or abs(float(raw_corr)) < 0.95:
+            if not used_bridge and (raw_corr is None or abs(float(raw_corr)) < 0.95):
                 continue
 
             temp_match = {
@@ -3592,10 +3764,13 @@ def _match_tsv_records(
             }
             temp_match["alignment"]["otb4_c3d_edge_alignment"] = edge_align
             temp_match["alignment"]["raw_alignment_quality"] = _effective_raw_quality(raw_result, edge_align)
-            raw_penalty = (1.0 - abs(float(raw_corr))) * 40.0 + 0.15 * abs(float(raw_result.get("lag_sec") or 0.0))
+            if isinstance(raw_corr, (int, float)):
+                raw_penalty = (1.0 - abs(float(raw_corr))) * 40.0 + 0.15 * abs(float(raw_result.get("lag_sec") or 0.0))
+            else:
+                raw_penalty = (2.0 if raw_result.get("quality") == "excellent" else 6.0) + 0.15 * abs(float(raw_result.get("lag_sec") or 0.0))
             score = start_delta + end_delta + duration_penalty + 0.01 * filename_delta + raw_penalty
             if best is None or score < best[0]:
-                best = (score, rec, filename_delta, rec_json, raw_result, {})
+                best = (score, rec, filename_delta, rec_json, raw_result, bridge)
         if best is None:
             reason = "No TSV candidate passed the time-window and raw-match filters."
             if best_diag is not None:
@@ -3611,7 +3786,7 @@ def _match_tsv_records(
             match["alignment"]["tsv_skip_reason"] = reason
             log_lines.append(f"[tsv-match] match {match['match_id']:03d}: {reason}")
             continue
-        score, rec, filename_delta, rec_json, raw_result, _dedicated_unused = best
+        score, rec, filename_delta, rec_json, raw_result, best_bridge = best
         dedicated = _dedicated_sync_agreement(
             {
                 **match,
@@ -3624,7 +3799,16 @@ def _match_tsv_records(
                 },
             }
         )
-        if score > 8.0:
+        bridge_certain_override = bool(best_bridge and best_bridge.get("quality") == "certain")
+        if score > 8.0 and bridge_certain_override:
+            log_lines.append(
+                f"[tsv-sync-bridge] match {match['match_id']:03d}: {Path(rec.path).name} score={score:.3f} exceeded "
+                f"the coarse time-window threshold, but the dedicated {SYNC_C3D_TSV_BRIDGE_LABEL} sync bridge is "
+                f"certain (matched={best_bridge.get('matched_count')} mean_abs={best_bridge.get('mean_abs_ms')}ms "
+                f"max_abs={best_bridge.get('max_abs_ms')}ms) -- likely a source-clock offset between the TSV capture "
+                f"PC and the OTB4/C3D naming clock rather than a wrong candidate. Accepting on bridge evidence."
+            )
+        elif score > 8.0:
             reason = (
                 f"Best TSV {Path(rec.path).name} rejected because combined score={score:.3f} exceeded 8.000 "
                 f"(raw={raw_result.get('quality')}, corr={raw_result.get('corr')}, lag={raw_result.get('lag_sec')}, "
@@ -3692,6 +3876,14 @@ def _match_tsv_records(
             f"raw={match['alignment']['raw_alignment_quality']} corr={raw_result.get('corr')} lag={raw_result.get('lag_sec')}s "
             f"dedicated_sync_info={dedicated.get('quality')} mean_abs={dedicated.get('mean_abs_delta_ms')}ms max_abs={dedicated.get('max_abs_delta_ms')}ms"
         )
+        if raw_result.get("basis") == "sync_bridge_3sync50ms":
+            bridge_info = raw_result.get("bridge_info") or {}
+            log_lines.append(
+                f"[tsv-sync-bridge] match {match['match_id']:03d}: {Path(rec.path).name} aligned via "
+                f"{SYNC_C3D_TSV_BRIDGE_LABEL} dedicated sync bridge (no usable raw CoP correlation) "
+                f"matched={bridge_info.get('matched_count')} mean_abs={bridge_info.get('mean_abs_ms')}ms "
+                f"max_abs={bridge_info.get('max_abs_ms')}ms shift={bridge_info.get('shift_sec')}s."
+            )
         if raw_result.get("tsv_channel") and raw_result.get("c3d_channel"):
             log_lines.append(
                 f"[raw-match] match {match['match_id']:03d}: TSV {raw_result['tsv_channel']} <-> C3D {raw_result['c3d_channel']} "
