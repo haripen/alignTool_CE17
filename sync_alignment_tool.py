@@ -55,6 +55,12 @@ SYNC_OTB_LABEL = "Syncstation AUX 2 [V]"
 SYNC_C3D_LABEL = "2_Sync"
 SYNC_C3D_TSV_BRIDGE_LABEL = "3_Sync_50ms"
 SYNC_TSV_EXACT_SUFFIX = "3_Sync_50ms [Volt] [sync]"
+# OTB4-side counterpart of the channel-3 bridge (present on both OTB4 and C3D,
+# purely cable-delivered). Unlike channel 2 -- which also carries the
+# SyncStation's RF broadcast to the wireless EMG probes -- channel 3 has no RF
+# component, so it is used as a cross-machine OTB4<->C3D alignment fallback
+# when channel 2 cannot be resolved (see _channel3_edge_alignment_fallback).
+SYNC_OTB_TSV_BRIDGE_SUBTITLE = "AUX 3"
 # Channel 1 is a session-bounds marker (one rising edge at start, one falling
 # edge at end), not a pulse train like channels 2/3. It is diagnostic-only:
 # used to log/sanity-check overall session bounds, never to gate matching.
@@ -1782,6 +1788,56 @@ def _spike_match_count(a: np.ndarray, b: np.ndarray, tol_sec: float = 0.05) -> i
     return matched
 
 
+def _channel3_edge_alignment_fallback(match: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Cross-machine OTB4<->C3D alignment via channel 3 (cable-only, no RF
+    component), used when channel 2 cannot be resolved to a trustworthy
+    alignment even after a widened leading-edge search.
+
+    Site wiring: channel 2 doubles as the SyncStation's RF broadcast to the
+    wireless EMG probes, while channels 1 and 3 are purely cable-delivered.
+    A clean channel-3 cross-machine alignment existing where channel 2 does
+    not is the diagnostic signature of an RF-specific problem on the OTB4
+    (laptop/SyncStation) side for that recording, not a general cabling or
+    C3D-side acquisition fault -- channel 3 uses the same cable path and
+    still lines up.
+    """
+    otb_path = (match.get("otb4") or {}).get("path")
+    c3d_path = (match.get("c3d") or {}).get("path")
+    if not otb_path or not c3d_path:
+        return None
+    otb_ch3 = _otb4_channel_edge_times(Path(otb_path), SYNC_OTB_DEVICE, SYNC_OTB_TSV_BRIDGE_SUBTITLE)
+    c3d_ch3 = sorted(_c3d_channel_edge_times(Path(c3d_path), SYNC_C3D_TSV_BRIDGE_LABEL))
+    if len(otb_ch3) < 2 or len(c3d_ch3) < 2:
+        return None
+    summary = _best_edge_alignment_summary(sorted(otb_ch3), c3d_ch3, max_skip_otb=10, max_skip_c3d=10)
+    mean_ms = summary.get("mean_abs_ms")
+    max_ms = summary.get("max_abs_ms")
+    if not (
+        isinstance(mean_ms, (int, float))
+        and isinstance(max_ms, (int, float))
+        and float(mean_ms) <= 20.0
+        and float(max_ms) <= 50.0
+        and int(summary.get("matched_count") or 0) >= 6
+    ):
+        return None
+    return {
+        "otb4_skip": summary.get("otb4_skip"),
+        "c3d_skip": summary.get("c3d_skip"),
+        "shift_sec": summary.get("shift_sec"),
+        "mean_abs_ms": mean_ms,
+        "max_abs_ms": max_ms,
+        "matched_count": summary.get("matched_count"),
+        "basis": "channel3_crossmachine_fallback",
+        "diagnostic_note": (
+            "Channel 2 (1ms, RF-linked to the OTB4 wireless probe sync) could not be aligned between the "
+            "OTB4 laptop and C3D/Vicon PC even after widening the search -- points to an RF-specific issue on "
+            "the OTB4/SyncStation side for this recording, not a C3D-side or general cabling fault. Channel 3 "
+            "(cable-only, no RF component) independently confirms the alignment "
+            f"(mean={mean_ms:.1f}ms, max={max_ms:.1f}ms, {int(summary.get('matched_count') or 0)} edges matched)."
+        ),
+    }
+
+
 def _select_otb4_c3d_edge_alignment(match: Dict[str, Any]) -> Dict[str, Any]:
     otb_edges = np.asarray(((match.get("otb4") or {}).get("edge_times_sec") or []), dtype=float)
     c3d_edges = np.asarray(((match.get("c3d") or {}).get("edge_times_sec") or []), dtype=float)
@@ -1903,8 +1959,82 @@ def _select_otb4_c3d_edge_alignment(match: Dict[str, Any]) -> Dict[str, Any]:
                     continue
                 if cand["score"] < best["score"]:
                     best = {**cand, "basis": "general_skip_search"}
+
+        if best["basis"] not in ("late_c3d_raw_bridge", "general_skip_search"):
+            # Channel 2 still could not be resolved. Try channel 3 (cable-only,
+            # no RF component) as a cross-machine fallback -- if it succeeds
+            # where channel 2 failed, that is a specific diagnostic signal
+            # about which end the fault is on (see _channel3_edge_alignment_fallback).
+            ch3_fallback = _channel3_edge_alignment_fallback(match)
+            if ch3_fallback is not None:
+                best = {**best, **ch3_fallback}
+            else:
+                best["diagnostic_note"] = (
+                    "Neither channel 2 (1ms, RF-linked) nor channel 3 (50ms, cable-only) could be aligned "
+                    "between the OTB4 laptop and C3D/Vicon PC for this pair, even after widening the search. "
+                    "This cannot be narrowed to one end from the dedicated sync channels alone -- check both "
+                    "the OTB4 SyncStation cabling/RF link and the C3D/Vicon analog input for this recording, "
+                    "and confirm the pairing itself (e.g. via TSV bridge/CoP if available) before trusting it."
+                )
     best["late_c3d_supported"] = late_c3d_supported
     return best
+
+
+def _dedicated_sync_agreement_for_edge_alignment(
+    match: Dict[str, Any], edge_align: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
+    """Wrapper around `_dedicated_sync_agreement` that substitutes the
+    channel-3 cross-machine fallback's own numbers when that fallback was
+    used for `otb4_c3d_edge_alignment`. `_dedicated_sync_agreement`'s generic
+    comparison always applies `sync_edge_skips` to the channel-2 edge train
+    (`match["otb4"/"c3d"]["edge_times_sec"]`); a channel-3-derived skip/shift
+    would otherwise get silently misapplied to the wrong edges and report
+    nonsense numbers.
+    """
+    if edge_align is None:
+        edge_align = (match.get("alignment") or {}).get("otb4_c3d_edge_alignment") or {}
+        if not edge_align and match.get("otb4") and match.get("c3d"):
+            # Not every OTB4/C3D pair goes through the TSV-matching loop that
+            # normally populates this (e.g. pairs with no TSV attached), so
+            # the leading-edge/channel-3 diagnosis would otherwise never run
+            # for them at all. Compute it lazily here so every place that
+            # displays dedicated-sync quality (review UI included) benefits.
+            edge_align = _select_otb4_c3d_edge_alignment(match)
+            match.setdefault("alignment", {})["otb4_c3d_edge_alignment"] = edge_align
+    if edge_align.get("basis") != "channel3_crossmachine_fallback":
+        return _dedicated_sync_agreement(match)
+    mean_abs = edge_align.get("mean_abs_ms")
+    max_abs = edge_align.get("max_abs_ms")
+    if not (isinstance(mean_abs, (int, float)) and isinstance(max_abs, (int, float))):
+        return _dedicated_sync_agreement(match)
+    matched = int(edge_align.get("matched_count") or 0)
+    if max_abs <= 1.0 and mean_abs <= 0.25:
+        quality = "excellent"
+    elif max_abs <= 5.0 and mean_abs <= 1.0:
+        quality = "good"
+    elif max_abs <= 20.0:
+        quality = "fair"
+    else:
+        quality = "poor"
+    return {
+        "quality": quality,
+        "pair_quality": quality,
+        "tsv_sync_missing": False,
+        "source_count": 2,
+        "spike_count": matched,
+        "mean_abs_delta_ms": round(float(mean_abs), 6),
+        "max_abs_delta_ms": round(float(max_abs), 6),
+        "pairwise": {
+            "otb4_vs_c3d": {
+                "mean_abs_ms": round(float(mean_abs), 6),
+                "max_abs_ms": round(float(max_abs), 6),
+                "count": matched,
+                "matched_spikes_50ms": matched,
+                "basis": "channel3_crossmachine_fallback",
+            }
+        },
+        "basis": "channel3_crossmachine_fallback",
+    }
 
 
 def _dedicated_sync_agreement(match: Dict[str, Any]) -> Dict[str, Any]:
@@ -3737,7 +3867,8 @@ def _ensure_otb4_repair_applied(match: Dict[str, Any], log_lines: Optional[List[
     alignment["otb4_repair_evaluated"] = True
 
 
-def _otb4_channel_edge_times(path: Path, device: str, subtitle: str) -> List[float]:
+@lru_cache(maxsize=128)
+def _otb4_channel_edge_times(path: Path, device: str, subtitle: str) -> Tuple[float, ...]:
     """Edge times (sec, own OTB4 sample clock) for an arbitrary AUX track,
     mirroring `_c3d_channel_edge_times` so a non-primary OTB4 sync channel
     (e.g. the 3_Sync_50ms bridge track) can be probed with comparable
@@ -3746,10 +3877,10 @@ def _otb4_channel_edge_times(path: Path, device: str, subtitle: str) -> List[flo
     try:
         _t, x, meta = _load_otb4_aux_channel(path, device=device, subtitle=subtitle)
     except Exception:
-        return []
+        return ()
     fs = float(meta.get("sampling_frequency") or 0.0)
     if fs <= 0.0:
-        return []
+        return ()
     sig = _orient_signal(x)
     amp = float(np.nanmax(sig)) if sig.size else 0.0
     peaks_sec = _detect_sparse_spikes(
@@ -3758,7 +3889,7 @@ def _otb4_channel_edge_times(path: Path, device: str, subtitle: str) -> List[flo
         prominence_grid=[max(float(np.std(sig)) * 6.0, 1e-4), max(amp * 0.15, 1e-4), max(amp * 0.25, 1e-4)],
         distance_grid_sec=[0.8, 1.0, 1.2],
     )
-    return [float(v) for v in peaks_sec]
+    return tuple(float(v) for v in peaks_sec)
 
 
 def _channel3_pairing_fallback(
@@ -4492,12 +4623,14 @@ def _match_tsv_records(
         }
         match["alignment"]["otb4_c3d_edge_alignment"] = final_edge_align
         match["alignment"]["raw_alignment_quality"] = _effective_raw_quality(raw_result, final_edge_align)
+        if final_edge_align.get("diagnostic_note"):
+            log_lines.append(f"[sync-diag] match {match['match_id']:03d}: {final_edge_align['diagnostic_note']}")
         # Recompute now that otb4_c3d_edge_alignment reflects final_edge_align
         # (possibly a non-zero skip found above) -- the earlier `dedicated`
         # was necessarily computed before that skip was known, so its
         # internal _sync_edge_skip_count lookup would otherwise silently
         # fall back to skip=0 and misreport dedicated-sync quality.
-        dedicated = _dedicated_sync_agreement(match)
+        dedicated = _dedicated_sync_agreement_for_edge_alignment(match, final_edge_align)
         match["alignment"]["dedicated_sync_quality"] = dedicated.get("quality")
         match["alignment"]["dedicated_sync_pair_quality"] = dedicated.get("pair_quality")
         match["alignment"]["dedicated_sync_mean_abs_ms"] = dedicated.get("mean_abs_delta_ms")
@@ -4677,7 +4810,7 @@ def _evaluate_manual_tsv_selection(
     }
     temp_match["alignment"]["otb4_c3d_edge_alignment"] = edge_align
     temp_match["alignment"]["raw_alignment_quality"] = _effective_raw_quality(raw_result, edge_align)
-    dedicated = _dedicated_sync_agreement(temp_match)
+    dedicated = _dedicated_sync_agreement_for_edge_alignment(temp_match, edge_align)
     corr_mag = abs(float(raw_corr)) if isinstance(raw_corr, (int, float)) else 0.0
     raw_penalty = (1.0 - corr_mag) * 40.0 + 0.15 * abs(float(raw_result.get("lag_sec") or 0.0))
     score = start_delta + end_delta + duration_penalty + 0.01 * filename_delta + raw_penalty
@@ -4739,7 +4872,7 @@ def _apply_manual_tsv_selection(
     }
     alignment["otb4_c3d_edge_alignment"] = final_edge_align
     alignment["raw_alignment_quality"] = _effective_raw_quality(raw_result, final_edge_align)
-    dedicated = _dedicated_sync_agreement(match)
+    dedicated = _dedicated_sync_agreement_for_edge_alignment(match, final_edge_align)
     alignment["dedicated_sync_quality"] = dedicated.get("quality")
     alignment["dedicated_sync_pair_quality"] = dedicated.get("pair_quality")
     alignment["dedicated_sync_mean_abs_ms"] = dedicated.get("mean_abs_delta_ms")
@@ -5148,6 +5281,32 @@ def analyze_folder(folder: Path, match_options: Optional[Dict[str, Any]] = None)
                 log_lines.append(
                     f"[tsv-missing] {Path(rec.path).name}: sync channel missing or too weak for a certain match."
                 )
+
+    for match in pair_matches:
+        if not (match.get("otb4") and match.get("c3d")):
+            continue
+        if (match.get("alignment") or {}).get("otb4_c3d_edge_alignment"):
+            continue
+        # Pairs with no TSV attached never went through _match_tsv_records,
+        # so the channel-2/channel-3 diagnosis has not run for them yet --
+        # run it now so it is logged and available at scan time, not only
+        # lazily the first time someone opens the match in the review UI.
+        edge_align = _select_otb4_c3d_edge_alignment(match)
+        match.setdefault("alignment", {})["otb4_c3d_edge_alignment"] = edge_align
+        if edge_align.get("diagnostic_note"):
+            log_lines.append(f"[sync-diag] match {match['match_id']:03d}: {edge_align['diagnostic_note']}")
+        dedicated = _dedicated_sync_agreement_for_edge_alignment(match, edge_align)
+        match["alignment"]["dedicated_sync_quality"] = dedicated.get("quality")
+        match["alignment"]["dedicated_sync_pair_quality"] = dedicated.get("pair_quality")
+        match["alignment"]["dedicated_sync_mean_abs_ms"] = dedicated.get("mean_abs_delta_ms")
+        match["alignment"]["dedicated_sync_max_abs_ms"] = dedicated.get("max_abs_delta_ms")
+        match["alignment"]["dedicated_sync_spike_count"] = dedicated.get("spike_count")
+        match["alignment"]["dedicated_sync_pairwise"] = dedicated.get("pairwise")
+        match["alignment"]["sync_triplet_quality"] = dedicated.get("quality")
+        match["alignment"]["sync_triplet_spike_mean_abs_ms"] = dedicated.get("mean_abs_delta_ms")
+        match["alignment"]["sync_triplet_spike_max_abs_ms"] = dedicated.get("max_abs_delta_ms")
+        match["alignment"]["sync_triplet_spike_count"] = dedicated.get("spike_count")
+        match["alignment"]["sync_triplet_pairwise"] = dedicated.get("pairwise")
 
     summary = {
         "otb4_count": len(otb4_records),
@@ -7433,7 +7592,7 @@ def _plot_source_files_text(match: Dict[str, Any], row_role: str, series_specs: 
 
 
 def _sync_plot_metric_text(match: Dict[str, Any], series_specs: Sequence[Dict[str, Any]]) -> str:
-    dedicated = _dedicated_sync_agreement(match)
+    dedicated = _dedicated_sync_agreement_for_edge_alignment(match)
     plotted_sources = [str(spec.get("source") or "") for spec in series_specs if spec.get("kind") == "sync"]
     plotted_sources = [source for idx, source in enumerate(plotted_sources) if source and source not in plotted_sources[:idx]]
     parts = [f"Sync {dedicated.get('quality') or 'missing'}"]
@@ -7592,6 +7751,11 @@ def _review_status_label(match: Dict[str, Any]) -> str:
 
 
 def _decision_reason_text(match: Dict[str, Any]) -> str:
+    if match.get("otb4") and match.get("c3d") and not ((match.get("alignment") or {}).get("otb4_c3d_edge_alignment")):
+        # Ensure the channel-2/channel-3 diagnosis has run at least once for
+        # this match, so pairs that never went through TSV matching (no TSV
+        # attached) still get a real diagnosis here instead of "unavailable".
+        _dedicated_sync_agreement_for_edge_alignment(match)
     alignment = match.get("alignment") or {}
     review = match.get("review") or {}
     pairwise = alignment.get("dedicated_sync_pairwise") or {}
@@ -7628,9 +7792,20 @@ def _decision_reason_text(match: Dict[str, Any]) -> str:
             lines.append(
                 f"Sync bridge used: late C3D start inferred from raw alignment; skipped {int(edge_align.get('otb4_skip') or 0)} leading OTB4 sync pulse(s)."
             )
+        elif edge_align.get("basis") == "channel3_crossmachine_fallback":
+            lines.append(
+                "Sync diagnosis: channel 2 (1ms, RF-linked to the OTB4 wireless probe sync) could not be "
+                "aligned between the OTB4 laptop and C3D/Vicon PC -- aligned on channel 3 (cable-only, no RF) "
+                "instead. Points to an RF-specific issue on the OTB4/SyncStation side for this recording, "
+                "not the C3D/Vicon side or general cabling."
+            )
+        elif edge_align.get("diagnostic_note"):
+            lines.append(f"Sync diagnosis: {edge_align['diagnostic_note']}")
     else:
         if match.get("otb4"):
             lines.append("OTB4/C3D sync: unavailable")
+            if edge_align.get("diagnostic_note"):
+                lines.append(f"Sync diagnosis: {edge_align['diagnostic_note']}")
         else:
             lines.append("Dedicated sync: not used for C3D/TSV doublets; raw C3D/TSV correlation is the alignment basis.")
 
@@ -8913,7 +9088,7 @@ class ViewerWindow:
         self.scan_notes.setText(_scan_notes_rich_text(notes))
         self.match_files_info.setText(_match_files_line(self.current_match))
         self.match_files_info.setToolTip(_match_files_line(self.current_match))
-        dedicated = _dedicated_sync_agreement(self.current_match)
+        dedicated = _dedicated_sync_agreement_for_edge_alignment(self.current_match)
         self.sync_info.setText(_sync_info_rich_text(self.current_match, dedicated))
         sync_tone_bg = "#EAF7EE" if int(_otb4_probe_sync_diagnostics(self.current_match).get("non_sync_probe_count") or 0) == 0 else "#FFF7E6"
         sync_tone_border = "#B9DEC4" if sync_tone_bg == "#EAF7EE" else "#E7C87B"
