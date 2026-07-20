@@ -12,7 +12,6 @@ PySide6 workflow for matching `.otb4`, `.c3d`, and `.tsv` recordings by shared s
 ## Notes
 
 - [MAT export full-rate traceBio spec](./MAT_EXPORT_TRACEBIO_SPEC.md)
-- [traceBio corridor visualization and exact corridor reconstruction](./TRACEBIO_CORRIDOR_VISUALIZATION.md)
 
 ## What It Does
 

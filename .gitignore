@@ -6,3 +6,4 @@ accepted/
 *.json
 codex resume.txt
 *.mat
+tmp_*/
