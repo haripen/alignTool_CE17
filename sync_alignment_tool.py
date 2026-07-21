@@ -6173,12 +6173,41 @@ def _copy_match_group(match: Dict[str, Any], target_dir: Path, saved_stamp: str)
             continue
         dst = target_dir / filename
         try:
-            if src.resolve() != dst.resolve():
+            if src.resolve() != dst.resolve() and not _dst_already_copied(src, dst):
                 _safe_copy(src, dst)
         except Exception:
             _safe_copy(src, dst)
         copied[key] = str(dst)
     return copied
+
+
+def _dst_already_copied(src: Path, dst: Path) -> bool:
+    """True if `dst` already looks like an up-to-date copy of `src`, so the
+    (potentially large, network-share-hosted) source file can be skipped.
+
+    `_write_review_outputs` re-copies every accepted match's group on every
+    save (manual re-match, accept/reject flush, export, window close), not
+    just the one match that changed -- with many already-accepted matches
+    this made every one of those actions re-copy every previous match's
+    raw .otb4/.c3d/.tsv files over the network share each time.
+
+    Size alone isn't quite enough: the destination filename is derived from
+    the C3D stem (`_match_base_name`), so a manual re-match that swaps the
+    OTB4/TSV source while keeping the same C3D reuses the old filename --
+    a same-size replacement source would then look "already copied" by size
+    alone. `_safe_copy` uses `shutil.copy2`, which preserves the source
+    mtime, so also requiring the mtimes to match (within a couple of
+    seconds, for FAT/exFAT's coarser mtime resolution) catches that case;
+    any mismatch just falls through to a (harmless, if unnecessary) copy.
+    """
+    try:
+        if not dst.is_file():
+            return False
+        dst_stat = dst.stat()
+        src_stat = src.stat()
+        return dst_stat.st_size == src_stat.st_size and abs(dst_stat.st_mtime - src_stat.st_mtime) <= 2.0
+    except OSError:
+        return False
 
 
 def _write_review_outputs(export_dir: Path, mapping: Dict[str, Any], saved_stamp: str) -> Tuple[Path, Path]:
@@ -9078,6 +9107,20 @@ class PlotRowWidget:
             self.label.setText(f"{self.title} | {series_names}")
 
         self.status.setText("")
+        # t=0 is pinned to the left edge of the green common matched time
+        # window (inner_merge_start_sec) so on-screen plots use the same
+        # zero reference as the MAT/pipe exports (_relative_time /
+        # _build_common_c3d_target's out_time), instead of each source's
+        # own absolute aligned clock.
+        inner_merge = ((self.match.get("alignment") or {}).get("inner_merge") or {})
+        merge_start = inner_merge.get("inner_merge_start_sec")
+        merge_end = inner_merge.get("inner_merge_end_sec")
+        has_merge_window = (
+            isinstance(merge_start, (int, float))
+            and isinstance(merge_end, (int, float))
+            and merge_end > merge_start
+        )
+        time_zero = float(merge_start) if has_merge_window else 0.0
         x_min: Optional[float] = None
         x_max: Optional[float] = None
         y_max: Optional[float] = None
@@ -9092,6 +9135,7 @@ class PlotRowWidget:
             if len(t) == 0:
                 missing.append(f"{_series_label(spec)} unavailable: empty data")
                 continue
+            t = np.asarray(t, dtype=float) - time_zero
             if self.row_role in {"raw", "probe_detail"}:
                 y = _normalize_unit_interval(y)
             color = _overlay_series_color(spec, plotted, len(self.series_specs))
@@ -9120,7 +9164,7 @@ class PlotRowWidget:
 
         footer_lines: List[str] = []
         if plotted:
-            self.plot.setLabel("bottom", "Aligned time", units="s")
+            self.plot.setLabel("bottom", "Time (t=0 = matched window start)", units="s")
             y_label, y_units = _y_axis_label(self.row_role, self.series_specs)
             self.plot.setLabel("left", y_label, units=y_units)
             self.plot.setMinimumHeight(320 if self.row_role == "probe_detail" else 280)
@@ -9128,16 +9172,17 @@ class PlotRowWidget:
                 self.plot.setXRange(x_min, x_max, padding=0.03)
             else:
                 self.plot.autoRange()
-            inner_merge = ((self.match.get("alignment") or {}).get("inner_merge") or {})
-            merge_start = inner_merge.get("inner_merge_start_sec")
-            merge_end = inner_merge.get("inner_merge_end_sec")
-            if isinstance(merge_start, (int, float)) and isinstance(merge_end, (int, float)) and merge_end > merge_start:
-                region = pg.LinearRegionItem(values=(merge_start, merge_end), movable=False, brush=(190, 240, 190, 28))
+            if has_merge_window:
+                region = pg.LinearRegionItem(
+                    values=(float(merge_start) - time_zero, float(merge_end) - time_zero),
+                    movable=False,
+                    brush=(190, 240, 190, 28),
+                )
                 region.setZValue(-20)
                 for line in region.lines:
                     line.setPen(pg.mkPen(color="#9FD89F", width=1.0, style=QtCore.Qt.PenStyle.DashLine))
                 self.plot.addItem(region)
-                for boundary in (float(merge_start), float(merge_end)):
+                for boundary in (float(merge_start) - time_zero, float(merge_end) - time_zero):
                     boundary_line = pg.InfiniteLine(
                         pos=boundary,
                         angle=90,
@@ -9148,7 +9193,7 @@ class PlotRowWidget:
                     self.plot.addItem(boundary_line)
             gap_brush, gap_line = _repair_gap_style(self.match)
             for gap_start, gap_end in _repair_gap_regions(self.match):
-                region = pg.LinearRegionItem(values=(gap_start, gap_end), movable=False, brush=gap_brush)
+                region = pg.LinearRegionItem(values=(gap_start - time_zero, gap_end - time_zero), movable=False, brush=gap_brush)
                 region.setZValue(-19)
                 for line in region.lines:
                     line.setPen(pg.mkPen(color=gap_line, width=1.0, style=QtCore.Qt.PenStyle.DashLine))
@@ -9164,7 +9209,7 @@ class PlotRowWidget:
                 for marker in _expected_sync_markers(self.match, device=device):
                     status = str(marker.get("status") or "missing")
                     line = pg.InfiniteLine(
-                        pos=float(marker.get("time_sec") or 0.0) + shift,
+                        pos=float(marker.get("time_sec") or 0.0) + shift - time_zero,
                         angle=90,
                         movable=False,
                         pen=pg.mkPen(
@@ -9192,7 +9237,7 @@ class PlotRowWidget:
                     pens = []
                     for marker in markers:
                         status = str(marker.get("status") or "missing")
-                        xs.append(float(marker.get("time_sec") or 0.0) + shift)
+                        xs.append(float(marker.get("time_sec") or 0.0) + shift - time_zero)
                         if status in fill_colors:
                             color = fill_colors[status]
                             brushes.append(pg.mkBrush(color))
