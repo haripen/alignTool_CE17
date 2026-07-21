@@ -8878,10 +8878,6 @@ def _prefetch_match_plot_data(match: Dict[str, Any]) -> None:
             desired_specs.extend(_probe_detail_series_specs(match, device))
         except Exception:
             continue
-
-
-def _save_mapping_bundle_snapshot(mapping_path: Path, mapping_snapshot: Dict[str, Any], *, write_review_outputs: bool) -> None:
-    _save_mapping_bundle(mapping_path, mapping_snapshot, write_review_outputs=write_review_outputs)
     seen: set[Tuple[str, str, str, str]] = set()
     for spec in desired_specs:
         key = (
@@ -8897,6 +8893,10 @@ def _save_mapping_bundle_snapshot(mapping_path: Path, mapping_snapshot: Dict[str
             _load_series_for_spec(match, spec)
         except Exception:
             continue
+
+
+def _save_mapping_bundle_snapshot(mapping_path: Path, mapping_snapshot: Dict[str, Any], *, write_review_outputs: bool) -> None:
+    _save_mapping_bundle(mapping_path, mapping_snapshot, write_review_outputs=write_review_outputs)
 
 
 def _review_progress(mapping: Dict[str, Any]) -> Tuple[int, int]:
