@@ -3001,13 +3001,47 @@ def _extract_c3d_record(path: Path) -> SyncRecord:
     )
 
 
+def _detect_pulse_center_edges(values: np.ndarray, sample_rate: float, *, min_width_sec: float = 0.005) -> List[float]:
+    """Rise/fall threshold-crossing midpoint time (sec) for each rectangular
+    pulse in a wide-plateau pulse train (e.g. channel 3's 50ms pulses) --
+    the geometric center of the plateau, not its leading edge. For a 1ms
+    pulse (channel 2, ~2 samples at 2kHz) leading-edge vs. center is a
+    sub-ms difference that doesn't matter; for a 50ms pulse (channel 3,
+    ~100 samples) it's tens of ms, which matters for overlay plots and for
+    any cross-machine comparison that assumes both sides measure the "same"
+    point of the pulse.
+    """
+    x = np.asarray(values, dtype=float).reshape(-1)
+    fs = float(sample_rate or 0.0)
+    if x.size < 3 or fs <= 0.0:
+        return []
+    sig = _orient_signal(x)
+    baseline = float(np.median(sig))
+    amp = float(np.nanmax(sig)) if sig.size else 0.0
+    if not np.isfinite(amp) or amp <= baseline:
+        return []
+    threshold = baseline + (amp - baseline) * 0.5
+    above = sig >= threshold
+    if not np.any(above):
+        return []
+    change_idx = np.flatnonzero(np.diff(above.astype(np.int8)) != 0) + 1
+    bounds = np.concatenate(([0], change_idx, [above.size]))
+    min_width = max(1, int(round(fs * min_width_sec)))
+    centers: List[float] = []
+    for start, end in zip(bounds[:-1], bounds[1:]):
+        if not above[start] or (end - start) < min_width:
+            continue
+        centers.append(((start + end - 1) / 2.0) / fs)
+    return centers
+
+
 @lru_cache(maxsize=64)
 def _c3d_channel_edge_times(path: Path, channel_name: str) -> Tuple[float, ...]:
-    """Edge times (sec, own C3D sample clock) for an arbitrary analog label.
-
-    Mirrors the peak-detection settings used for the dedicated OTB4/C3D sync
-    channel in `_extract_c3d_record`, so it can be pointed at other pulse
-    channels (e.g. the TSV bridge channel) with comparable detection quality.
+    """Edge times (sec, own C3D sample clock) for an arbitrary analog label
+    -- the pulse-plateau center (see `_detect_pulse_center_edges`), with a
+    fallback to the peak-detection settings used for the dedicated
+    OTB4/C3D sync channel in `_extract_c3d_record` if thresholding doesn't
+    find enough pulses (e.g. an unexpectedly noisy channel).
     """
     try:
         c3d = ezc3d.c3d(str(path), extract_forceplat_data=False)
@@ -3019,6 +3053,9 @@ def _c3d_channel_edge_times(path: Path, channel_name: str) -> Tuple[float, ...]:
         arr = np.asarray(c3d["data"]["analogs"], dtype=float)
         subframes, n_channels, n_frames = arr.shape
         x = np.transpose(arr, (2, 0, 1)).reshape(n_frames * subframes, n_channels)[:, idx]
+        centers_sec = _detect_pulse_center_edges(x, rate)
+        if len(centers_sec) >= 4:
+            return tuple(float(v) for v in centers_sec)
         sig = _orient_signal(x)
         peaks_sec = _detect_sparse_spikes(
             x,
@@ -4133,10 +4170,12 @@ def _ensure_otb4_repair_applied(match: Dict[str, Any], log_lines: Optional[List[
 
 @lru_cache(maxsize=128)
 def _otb4_channel_edge_times(path: Path, device: str, subtitle: str) -> Tuple[float, ...]:
-    """Edge times (sec, own OTB4 sample clock) for an arbitrary AUX track,
-    mirroring `_c3d_channel_edge_times` so a non-primary OTB4 sync channel
-    (e.g. the 3_Sync_50ms bridge track) can be probed with comparable
-    detection quality to the dedicated channel-2 extraction.
+    """Edge times (sec, own OTB4 sample clock) for an arbitrary AUX track --
+    the pulse-plateau center (see `_detect_pulse_center_edges`), mirroring
+    `_c3d_channel_edge_times` so a non-primary OTB4 sync channel (e.g. the
+    3_Sync_50ms bridge track) can be probed with comparable detection
+    quality to the dedicated channel-2 extraction. Falls back to
+    peak-detection if thresholding doesn't find enough pulses.
     """
     try:
         _t, x, meta = _load_otb4_aux_channel(path, device=device, subtitle=subtitle)
@@ -4145,6 +4184,9 @@ def _otb4_channel_edge_times(path: Path, device: str, subtitle: str) -> Tuple[fl
     fs = float(meta.get("sampling_frequency") or 0.0)
     if fs <= 0.0:
         return ()
+    centers_sec = _detect_pulse_center_edges(x, fs)
+    if len(centers_sec) >= 4:
+        return tuple(float(v) for v in centers_sec)
     sig = _orient_signal(x)
     amp = float(np.nanmax(sig)) if sig.size else 0.0
     peaks_sec = _detect_sparse_spikes(
