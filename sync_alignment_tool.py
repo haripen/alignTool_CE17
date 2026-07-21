@@ -1674,6 +1674,35 @@ def _expected_sync_markers(match: Dict[str, Any], device: Optional[str] = None, 
     return markers
 
 
+def _channel3_match_markers(match: Dict[str, Any], tolerance_sec: float = 0.05) -> List[Dict[str, Any]]:
+    """Per-pulse OTB4<->C3D match status for channel 3 (3_Sync_50ms): for
+    each OTB4 channel-3 pulse (in OTB4's own native time -- same convention
+    as _expected_sync_markers), "confirmed" if a C3D channel-3 pulse falls
+    within `tolerance_sec` of it once both are placed on the common aligned
+    time axis (via _match_plot_shifts), else "missing". This is the sync
+    diagnosis for channel 3 specifically, independent of which basis
+    (channel 2, channel 3, or TTL) the overall OTB4<->C3D alignment used.
+    """
+    otb_path = (match.get("otb4") or {}).get("path")
+    c3d_path = (match.get("c3d") or {}).get("path")
+    if not otb_path or not c3d_path:
+        return []
+    otb_ch3 = sorted(_otb4_channel_edge_times(Path(otb_path), SYNC_OTB_DEVICE, SYNC_OTB_TSV_BRIDGE_SUBTITLE))
+    c3d_ch3 = sorted(_c3d_channel_edge_times(Path(c3d_path), SYNC_C3D_TSV_BRIDGE_LABEL))
+    if not otb_ch3:
+        return []
+    shifts = _match_plot_shifts(match)
+    otb_shift = float(shifts.get("otb4", 0.0))
+    c3d_shift = float(shifts.get("c3d", 0.0))
+    c3d_aligned = np.asarray(c3d_ch3, dtype=float) + c3d_shift
+    markers: List[Dict[str, Any]] = []
+    for t in otb_ch3:
+        aligned_t = float(t) + otb_shift
+        confirmed = bool(c3d_aligned.size and np.any(np.abs(c3d_aligned - aligned_t) <= tolerance_sec))
+        markers.append({"time_sec": float(t), "status": "confirmed" if confirmed else "missing"})
+    return markers
+
+
 def _triplet_spike_agreement(records: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     usable: List[Tuple[str, np.ndarray]] = []
     for rec in records:
@@ -6199,7 +6228,10 @@ def _channel_options_for_record(record: Dict[str, Any]) -> List[Tuple[str, Dict[
 
 
 _SYNC_CHANNEL_BAND_HEIGHT = 1.2
-_SYNC_CHANNEL_MARKER_Y = -0.5
+# OTB4-internal probe/control-vs-AUX2 diagnosis (_expected_sync_markers).
+_SYNC_CHANNEL_MARKER_Y = -0.25
+# Channel-3 (3_Sync_50ms) OTB4<->C3D cross-machine match diagnosis (_channel3_match_markers).
+_SYNC_CHANNEL3_MARKER_Y = -0.5
 
 
 def _sync_channel_band_offset(channel_num: int) -> float:
@@ -8770,8 +8802,9 @@ class PlotRowWidget:
         if self.row_role == "sync":
             text = (
                 "Dedicated sync overlay | channel 1 (1_TTL) top, 2 (2_Sync) middle, 3 (3_Sync_50ms) bottom "
-                "| circles below traces=match status: filled green=confirmed, filled amber=partial, "
-                "open white=missing (unmatched) | green bars=start/end"
+                "| circles: filled green=confirmed, filled amber=partial, open white=missing (unmatched) "
+                "-- row at y=-0.25 is OTB4-internal probe/control diagnosis, row at y=-0.5 is the channel-3 "
+                "(3_Sync_50ms) OTB4<->C3D cross-machine sync diagnosis | green bars=start/end"
             )
             if _repair_gap_regions(self.match):
                 text += " | pink/amber bands = OTB4 repaired or detected gap zones"
@@ -8875,29 +8908,35 @@ class PlotRowWidget:
                     line.setZValue(-6)
                     self.plot.addItem(line)
             elif self.row_role == "sync":
-                # Matched-pulse status as filled circles at a fixed negative
-                # y (below the lowest channel band, channel 3) instead of
-                # full-height vertical lines: green=confirmed, amber=partial,
-                # open white circle=missing (unmatched).
+                # Matched-pulse status as filled circles at fixed negative y
+                # rows instead of full-height vertical lines: green=confirmed,
+                # amber=partial, open white circle=missing (unmatched). Two
+                # independent rows: the OTB4-internal probe/control-vs-AUX2
+                # diagnosis (_expected_sync_markers) at -0.25, and the
+                # channel-3 (3_Sync_50ms) OTB4<->C3D cross-machine sync
+                # diagnosis (_channel3_match_markers) at -0.5.
                 shift = float(_match_plot_shifts(self.match).get("otb4", 0.0))
                 fill_colors = {"confirmed": "#1F7A4D", "partial": "#D9A400"}
-                xs: List[float] = []
-                brushes = []
-                pens = []
-                for marker in _expected_sync_markers(self.match):
-                    status = str(marker.get("status") or "missing")
-                    xs.append(float(marker.get("time_sec") or 0.0) + shift)
-                    if status in fill_colors:
-                        color = fill_colors[status]
-                        brushes.append(pg.mkBrush(color))
-                        pens.append(pg.mkPen(color, width=1.5))
-                    else:
-                        brushes.append(pg.mkBrush("#FFFFFF"))
-                        pens.append(pg.mkPen("#7D8597", width=1.5))
-                if xs:
+
+                def _add_marker_row(markers: List[Dict[str, Any]], y_value: float) -> None:
+                    xs: List[float] = []
+                    brushes = []
+                    pens = []
+                    for marker in markers:
+                        status = str(marker.get("status") or "missing")
+                        xs.append(float(marker.get("time_sec") or 0.0) + shift)
+                        if status in fill_colors:
+                            color = fill_colors[status]
+                            brushes.append(pg.mkBrush(color))
+                            pens.append(pg.mkPen(color, width=1.5))
+                        else:
+                            brushes.append(pg.mkBrush("#FFFFFF"))
+                            pens.append(pg.mkPen("#7D8597", width=1.5))
+                    if not xs:
+                        return
                     scatter = pg.ScatterPlotItem(
                         x=xs,
-                        y=[_SYNC_CHANNEL_MARKER_Y] * len(xs),
+                        y=[y_value] * len(xs),
                         size=10,
                         symbol="o",
                         brush=brushes,
@@ -8905,6 +8944,9 @@ class PlotRowWidget:
                     )
                     scatter.setZValue(-4)
                     self.plot.addItem(scatter)
+
+                _add_marker_row(_expected_sync_markers(self.match), _SYNC_CHANNEL_MARKER_Y)
+                _add_marker_row(_channel3_match_markers(self.match), _SYNC_CHANNEL3_MARKER_Y)
             footer_lines.append(_plot_source_files_text(self.match, self.row_role, self.series_specs))
             footer_lines.append(_plot_decision_context_text(self.match, self.row_role, self.series_specs))
         else:
