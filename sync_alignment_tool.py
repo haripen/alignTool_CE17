@@ -8117,28 +8117,45 @@ def _series_label(spec: Dict[str, Any]) -> str:
     return f"{prefix}: {channel}"
 
 
+# Matplotlib's "tab10" categorical palette -- 10 maximally-distinct hues
+# used throughout plotting instead of hand-picked colors, so traces stay
+# visually distinguishable at a glance regardless of how many overlap.
+_TAB10_PALETTE = [
+    "#1f77b4",  # blue
+    "#ff7f0e",  # orange
+    "#2ca02c",  # green
+    "#d62728",  # red
+    "#9467bd",  # purple
+    "#8c564b",  # brown
+    "#e377c2",  # pink
+    "#7f7f7f",  # gray
+    "#bcbd22",  # olive
+    "#17becf",  # cyan
+]
+
+
 def _source_plot_color(source: str) -> str:
     return {
-        "c3d": "#3A86FF",
-        "tsv": "#7B61A8",
-        "otb4": "#F28E2B",
-    }.get(str(source or "").lower(), "#444444")
+        "c3d": _TAB10_PALETTE[0],
+        "otb4": _TAB10_PALETTE[1],
+        "tsv": _TAB10_PALETTE[4],
+    }.get(str(source or "").lower(), _TAB10_PALETTE[7])
 
 
 def _series_color(spec: Dict[str, Any]) -> str:
     if spec.get("kind") == "probe_buffer":
-        return "#0A9396"
+        return _TAB10_PALETTE[8]
     if spec.get("kind") == "probe_ramp":
-        return "#AE2012"
+        return _TAB10_PALETTE[3]
     if spec.get("kind") == "sync":
         return _source_plot_color(str(spec.get("source") or ""))
     if spec.get("kind") == "point":
-        return "#D45087"
+        return _TAB10_PALETTE[6]
     if spec.get("kind") == "cop":
-        return "#3A86FF"
+        return _TAB10_PALETTE[0]
     if spec.get("kind") == "raw":
         return _source_plot_color(str(spec.get("source") or ""))
-    return {"otb4": "#00A6D6", "c3d": "#7F7F7F", "tsv": "#8E7DBE"}.get(spec["source"], "#444444")
+    return {"otb4": _TAB10_PALETTE[1], "c3d": _TAB10_PALETTE[7], "tsv": _TAB10_PALETTE[4]}.get(spec["source"], _TAB10_PALETTE[7])
 
 
 def _series_identity_key(spec: Dict[str, Any]) -> str:
@@ -8154,21 +8171,15 @@ def _series_identity_key(spec: Dict[str, Any]) -> str:
 
 
 def _stable_series_palette_color(spec: Dict[str, Any]) -> str:
-    # Kept within each source's own hue family (matching _source_plot_color's
-    # sync/channel-2 base color) so a trace's source stays recognizable at a
-    # glance; shades vary for the channel-1/channel-3 overlay traces. No
-    # greens here on purpose -- c3d's old palette was all-green and easy to
-    # confuse trace-to-trace.
-    source = str(spec.get("source") or "")
-    palettes = {
-        "otb4": ["#F28E2B", "#D2691E", "#FFB35C", "#B8590A", "#E8963F"],
-        "c3d": ["#3A86FF", "#1B4F91", "#79B8FF", "#0B3C7A", "#5C9EFF"],
-        "tsv": ["#7B61A8", "#9C6ADE", "#5A3E85", "#B58FE0", "#4B2E70"],
-    }
-    palette = palettes.get(source, ["#0B84A5", "#F28E2B", "#3A86FF", "#E15759", "#7B61A8"])
+    # Tab10 cycle, keyed by a stable hash of the series identity so the same
+    # channel always gets the same color across refreshes/matches. Line
+    # style (see PlotRowWidget.refresh) already distinguishes channel 1/2/3
+    # when traces overlap, so a plain tab10 hash -- rather than a per-source
+    # sub-palette -- keeps colors maximally distinct without the risk of
+    # any one hue family (e.g. all-green) dominating.
     key = _series_identity_key(spec)
     checksum = sum((idx + 1) * ord(ch) for idx, ch in enumerate(key))
-    return palette[checksum % len(palette)]
+    return _TAB10_PALETTE[checksum % len(_TAB10_PALETTE)]
 
 
 def _overlay_series_color(spec: Dict[str, Any], idx: int, total: int) -> str:
@@ -9983,6 +9994,7 @@ class ViewerWindow:
                     return
             if rebuild_list:
                 self._refresh_match_list(selected_row=selected_row)
+                self._sync_auto_rows()
             else:
                 scroll_bar = self.list_widget.verticalScrollBar()
                 scroll_value = scroll_bar.value()
