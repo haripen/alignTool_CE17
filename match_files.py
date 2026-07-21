@@ -19,6 +19,8 @@ from sync_alignment_tool import (
     _available_global_pair_options,
     _apply_tracebio_paths_root_override,
     TRACEBIO_PATHS_ROOT_DEFAULT,
+    _otb4_autonumber_plan,
+    _apply_otb4_autonumber,
 )
 
 
@@ -493,6 +495,48 @@ def _reuse_existing_scan(scan_dir: Path, export_dir: Path, match_options: dict |
     return mapping_path, log_path, matched_dir
 
 
+def _pick_otb4_autonumber(scan_dir: Path, parent) -> None:
+    """If any OTB4 files in scan_dir still use the old unnumbered
+    "File__TIMESTAMP..." naming, offer to renumber them chronologically
+    before scanning. Purely cosmetic -- the matcher never depends on
+    filename numbers -- but makes the file list easier to cross-reference
+    by eye against C3D "Setting_NN"/TSV "File_0NN" filenames. Silent (no
+    dialog) if none are found.
+    """
+    from PySide6 import QtWidgets
+
+    otb4_paths = _iter_source_files(scan_dir, ".otb4", excluded_dir_names=("matched", "accepted", "__pycache__", ".git"))
+    plan = _otb4_autonumber_plan(otb4_paths)
+    if not plan:
+        return
+    first_old, first_new = plan[0]
+    preview = f"{first_old.name}\n  -> {first_new.name}"
+    if len(plan) > 1:
+        last_old, last_new = plan[-1]
+        preview += f"\n...\n{last_old.name}\n  -> {last_new.name}"
+    msg = QtWidgets.QMessageBox(parent)
+    msg.setIcon(QtWidgets.QMessageBox.Icon.Question)
+    msg.setWindowTitle("Renumber OTB4 Files")
+    msg.setText(f"{len(plan)} OTB4 file(s) use the old unnumbered \"File__TIMESTAMP...\" naming.")
+    msg.setInformativeText(
+        "Renumber them chronologically by capture timestamp (File_01_..., File_02_..., ...)?\n\n"
+        f"{preview}\n\n"
+        "This only renames the files on disk -- it does not change how they are matched "
+        "(matching never depends on filename numbers)."
+    )
+    yes_btn = msg.addButton("Renumber", QtWidgets.QMessageBox.ButtonRole.YesRole)
+    msg.addButton("Leave As-Is", QtWidgets.QMessageBox.ButtonRole.NoRole)
+    msg.exec()
+    if msg.clickedButton() is not yes_btn:
+        return
+    results = _apply_otb4_autonumber(plan)
+    QtWidgets.QMessageBox.information(
+        parent,
+        "OTB4 Files Renumbered",
+        "\n".join(results) if results else "No files were renamed.",
+    )
+
+
 def _pick_directories() -> tuple[Path, Path, dict] | tuple[None, None, None]:
     from PySide6 import QtWidgets
 
@@ -508,6 +552,7 @@ def _pick_directories() -> tuple[Path, Path, dict] | tuple[None, None, None]:
     )
     if not scan_dir:
         return None, None, None
+    _pick_otb4_autonumber(Path(scan_dir), parent)
 
     export_dir = QtWidgets.QFileDialog.getExistingDirectory(
         parent,

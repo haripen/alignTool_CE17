@@ -269,6 +269,63 @@ def _file_numeric_index(path_or_text: Any) -> Optional[int]:
     return None
 
 
+# Old OTB4 naming convention with no number field between "File" and the
+# capture timestamp, e.g. "File__20260707_143120_451.otb4" (double
+# underscore). Current convention inserts a sequence number there, e.g.
+# "File_12_20260707_143120_451.otb4".
+_OTB4_UNNUMBERED_RE = re.compile(r"^(File)__(\d{8}_\d{6}.*)$")
+
+
+def _otb4_unnumbered_files(paths: Sequence[Path]) -> List[Path]:
+    return [p for p in paths if _OTB4_UNNUMBERED_RE.match(p.stem)]
+
+
+def _otb4_autonumber_plan(paths: Sequence[Path]) -> List[Tuple[Path, Path]]:
+    """Chronological (by parsed capture timestamp) 2-digit renumbering plan
+    for OTB4 files still in the old unnumbered "File__TIMESTAMP..." format
+    -- e.g. File__20260707_143120_451.otb4 -> File_01_20260707_143120_451.otb4.
+    Only ever includes files matching that exact old pattern; already
+    numbered files are left untouched. This never renames anything itself
+    -- see _apply_otb4_autonumber -- and is not used by the matcher, which
+    never depends on filename numbers; it's purely for the file list to be
+    easier to cross-reference by eye against C3D/TSV filenames.
+    """
+    candidates = _otb4_unnumbered_files(paths)
+
+    def _sort_key(p: Path) -> Tuple[bool, datetime, str]:
+        ts = _parse_timestamp_from_name(p)
+        return (ts is None, ts or datetime.min, p.name)
+
+    ordered = sorted(candidates, key=_sort_key)
+    plan: List[Tuple[Path, Path]] = []
+    for idx, path in enumerate(ordered, start=1):
+        m = _OTB4_UNNUMBERED_RE.match(path.stem)
+        if not m:
+            continue
+        new_stem = f"{m.group(1)}_{idx:02d}_{m.group(2)}"
+        plan.append((path, path.with_name(new_stem + path.suffix)))
+    return plan
+
+
+def _apply_otb4_autonumber(plan: Sequence[Tuple[Path, Path]]) -> List[str]:
+    """Executes a rename plan from _otb4_autonumber_plan. Skips (and
+    reports) any rename whose destination already exists rather than
+    overwriting -- this touches real capture data on a shared drive, so
+    silently clobbering an existing file is not acceptable.
+    """
+    messages: List[str] = []
+    for old_path, new_path in plan:
+        if new_path.exists():
+            messages.append(f"Skipped {old_path.name} -> {new_path.name}: destination already exists.")
+            continue
+        try:
+            old_path.rename(new_path)
+            messages.append(f"Renamed {old_path.name} -> {new_path.name}")
+        except Exception as exc:
+            messages.append(f"Failed to rename {old_path.name} -> {new_path.name}: {exc}")
+    return messages
+
+
 def _filename_clock_offset_sec(path: Path) -> Optional[float]:
     ts = _parse_timestamp_from_name(path)
     if ts is None:
