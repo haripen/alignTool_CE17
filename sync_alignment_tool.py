@@ -7952,13 +7952,18 @@ def _series_identity_key(spec: Dict[str, Any]) -> str:
 
 
 def _stable_series_palette_color(spec: Dict[str, Any]) -> str:
+    # Kept within each source's own hue family (matching _source_plot_color's
+    # sync/channel-2 base color) so a trace's source stays recognizable at a
+    # glance; shades vary for the channel-1/channel-3 overlay traces. No
+    # greens here on purpose -- c3d's old palette was all-green and easy to
+    # confuse trace-to-trace.
     source = str(spec.get("source") or "")
     palettes = {
-        "otb4": ["#0B84A5", "#4E79A7", "#76B7B2", "#2F6690", "#1D4E89"],
-        "c3d": ["#59A14F", "#8CD17D", "#4E9F3D", "#2A9D8F", "#6BA368"],
-        "tsv": ["#B07AA1", "#AF52DE", "#9C6ADE", "#7B61A8", "#C08497"],
+        "otb4": ["#F28E2B", "#D2691E", "#FFB35C", "#B8590A", "#E8963F"],
+        "c3d": ["#3A86FF", "#1B4F91", "#79B8FF", "#0B3C7A", "#5C9EFF"],
+        "tsv": ["#7B61A8", "#9C6ADE", "#5A3E85", "#B58FE0", "#4B2E70"],
     }
-    palette = palettes.get(source, ["#0B84A5", "#F28E2B", "#59A14F", "#E15759", "#4E79A7", "#B07AA1"])
+    palette = palettes.get(source, ["#0B84A5", "#F28E2B", "#3A86FF", "#E15759", "#7B61A8"])
     key = _series_identity_key(spec)
     checksum = sum((idx + 1) * ord(ch) for idx, ch in enumerate(key))
     return palette[checksum % len(palette)]
@@ -8898,7 +8903,21 @@ class PlotRowWidget:
             if self.row_role in {"raw", "probe_detail"}:
                 y = _normalize_unit_interval(y)
             color = _overlay_series_color(spec, plotted, len(self.series_specs))
-            self.plot.plot(t, y, pen=pg.mkPen(color=color, width=1.4), name=_series_label(spec))
+            pen = pg.mkPen(color=color, width=1.4)
+            # Channel 1/2/3 traces can end up close together or overlapping
+            # in the banded sync plot (row_role == "sync") -- give each
+            # channel number a distinct line style so they stay
+            # distinguishable even where color alone wouldn't be enough.
+            channel_num = spec.get("sync_channel_num")
+            if channel_num == 1:
+                pen.setStyle(QtCore.Qt.PenStyle.DotLine)
+            elif channel_num == 2:
+                pen.setStyle(QtCore.Qt.PenStyle.CustomDashLine)
+                pen.setDashPattern([3, 3])
+            elif channel_num == 3:
+                pen.setStyle(QtCore.Qt.PenStyle.CustomDashLine)
+                pen.setDashPattern([10, 6])
+            self.plot.plot(t, y, pen=pen, name=_series_label(spec))
             plotted += 1
             lo = float(np.nanmin(t))
             hi = float(np.nanmax(t))
@@ -10510,6 +10529,23 @@ class ViewerWindow:
                 "No accepted synchronized doublets or triplets are available for MAT export.",
             )
             return
+        two_file_matches = [
+            match for match in accepted_matches
+            if not match.get("tsv") and match.get("otb4") and match.get("c3d")
+        ]
+        if two_file_matches:
+            names = ", ".join(Path(str((m.get("c3d") or m.get("otb4") or {}).get("path") or "")).stem for m in two_file_matches)
+            proceed = QtWidgets.QMessageBox.warning(
+                self.window,
+                "OTB4+C3D-Only Export",
+                f"{len(two_file_matches)} accepted match(es) have no TSV attached: {names}.\n\n"
+                "These export fine as OTB4+C3D-only .mat files, but will not include TSV-driven fields "
+                "(traceBio corridor/path reconstruction, tsv_reconstructed). Continue with export?",
+                QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.Cancel,
+                QtWidgets.QMessageBox.StandardButton.Yes,
+            )
+            if proceed != QtWidgets.QMessageBox.StandardButton.Yes:
+                return
         export_root = Path(self.mapping.get("export_root") or self.mapping_path.parent) / "matched"
         export_root.mkdir(parents=True, exist_ok=True)
         written: List[str] = []

@@ -537,6 +537,9 @@ def _pick_otb4_autonumber(scan_dir: Path, parent) -> None:
     )
 
 
+_DEFAULT_SCAN_ROOT = Path(r"U:\Daten_speziell\Vicon\Eclipse Datenbanken\Projekte\ASF-PPPD")
+
+
 def _pick_directories() -> tuple[Path, Path, dict] | tuple[None, None, None]:
     from PySide6 import QtWidgets
 
@@ -544,10 +547,11 @@ def _pick_directories() -> tuple[Path, Path, dict] | tuple[None, None, None]:
     parent = QtWidgets.QWidget()
     parent.setWindowTitle("Match Files")
 
+    start_dir = _DEFAULT_SCAN_ROOT if _DEFAULT_SCAN_ROOT.exists() else Path("C:/")
     scan_dir = QtWidgets.QFileDialog.getExistingDirectory(
         parent,
         "Select Directory To Scan",
-        str(Path.cwd()),
+        str(start_dir),
         QtWidgets.QFileDialog.Option.ShowDirsOnly,
     )
     if not scan_dir:
