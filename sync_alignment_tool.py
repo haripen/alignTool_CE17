@@ -603,7 +603,16 @@ def _best_edge_alignment_summary(
     *,
     max_skip_otb: int = 2,
     max_skip_c3d: int = 2,
+    ttl_shift_sec: Optional[float] = None,
+    ttl_tol_sec: float = 1.0,
 ) -> Dict[str, Any]:
+    """`ttl_shift_sec`, when given, additionally requires a candidate's
+    implied shift to land within `ttl_tol_sec` of the channel-1 TTL anchor
+    (see `_match_ttl_anchor`) to count as quality-passing. The repeating
+    decrement pattern on channels 2/3 can otherwise produce a deceptively
+    good residual at the wrong point in the cycle (a multi-second error) --
+    TTL fires once per session and isn't vulnerable to that ambiguity.
+    """
     a = np.asarray(otb_edges, dtype=float)
     b = np.asarray(c3d_edges, dtype=float)
     best: Optional[Dict[str, Any]] = None
@@ -629,6 +638,9 @@ def _best_edge_alignment_summary(
                 continue
             cur_ok = float(best["mean_abs_ms"]) <= 20.0 and float(best["max_abs_ms"]) <= 50.0
             new_ok = float(cand["mean_abs_ms"]) <= 20.0 and float(cand["max_abs_ms"]) <= 50.0
+            if ttl_shift_sec is not None:
+                cur_ok = cur_ok and abs(float(best["shift_sec"]) - float(ttl_shift_sec)) <= ttl_tol_sec
+                new_ok = new_ok and abs(float(cand["shift_sec"]) - float(ttl_shift_sec)) <= ttl_tol_sec
             if new_ok and not cur_ok:
                 best = cand
                 continue
@@ -637,6 +649,27 @@ def _best_edge_alignment_summary(
                 < (float(best["mean_abs_ms"]), float(best["max_abs_ms"]), int(best["otb4_skip"]) + int(best["c3d_skip"]))
             ):
                 best = cand
+    if best is not None and ttl_shift_sec is not None:
+        final_ok = (
+            isinstance(best.get("mean_abs_ms"), (int, float))
+            and isinstance(best.get("max_abs_ms"), (int, float))
+            and float(best["mean_abs_ms"]) <= 20.0
+            and float(best["max_abs_ms"]) <= 50.0
+            and abs(float(best["shift_sec"]) - float(ttl_shift_sec)) <= ttl_tol_sec
+        )
+        if not final_ok:
+            # No candidate satisfied both the residual quality bar and TTL
+            # consistency -- report "nothing found" rather than risk a
+            # caller that only re-checks the plain quality bar accepting a
+            # TTL-inconsistent (likely wrong-cycle-locked) result.
+            return {
+                "otb4_skip": int(best.get("otb4_skip") or 0),
+                "c3d_skip": int(best.get("c3d_skip") or 0),
+                "shift_sec": best.get("shift_sec"),
+                "mean_abs_ms": None,
+                "max_abs_ms": None,
+                "matched_count": 0,
+            }
     return best or {
         "otb4_skip": 0,
         "c3d_skip": 0,
@@ -1450,6 +1483,18 @@ def _sync_edge_skip_count(match: Dict[str, Any], source: str) -> int:
 
 
 def _source_sync_offset_for_match(match: Dict[str, Any], source: str) -> float:
+    if source in ("otb4", "c3d"):
+        # Some alignment bases (channel-3 cross-machine fallback, TTL anchor)
+        # find their anchor in an edge array *other* than
+        # match[source]["edge_times_sec"] (which is always channel 2) -- an
+        # explicit native-time anchor avoids misapplying that basis's skip
+        # count to the wrong array. Bases that search channel 2 directly
+        # (first_visible_sync/channel2_refined/late_c3d_raw_bridge) don't set
+        # this and fall through to the skip-indexed lookup below unchanged.
+        edge_align = (match.get("alignment") or {}).get("otb4_c3d_edge_alignment") or {}
+        anchor = edge_align.get(f"{source}_anchor_sec")
+        if isinstance(anchor, (int, float)):
+            return float(anchor)
     record = match.get(source) or {}
     edges = np.asarray(record.get("edge_times_sec") or [], dtype=float)
     if edges.size == 0:
@@ -1888,11 +1933,15 @@ def _channel3_edge_alignment_fallback(match: Dict[str, Any]) -> Optional[Dict[st
     c3d_path = (match.get("c3d") or {}).get("path")
     if not otb_path or not c3d_path:
         return None
-    otb_ch3 = _otb4_channel_edge_times(Path(otb_path), SYNC_OTB_DEVICE, SYNC_OTB_TSV_BRIDGE_SUBTITLE)
+    otb_ch3 = sorted(_otb4_channel_edge_times(Path(otb_path), SYNC_OTB_DEVICE, SYNC_OTB_TSV_BRIDGE_SUBTITLE))
     c3d_ch3 = sorted(_c3d_channel_edge_times(Path(c3d_path), SYNC_C3D_TSV_BRIDGE_LABEL))
     if len(otb_ch3) < 2 or len(c3d_ch3) < 2:
         return None
-    summary = _best_edge_alignment_summary(sorted(otb_ch3), c3d_ch3, max_skip_otb=10, max_skip_c3d=10)
+    ttl_anchor = _match_ttl_anchor(match)
+    ttl_shift_sec = (ttl_anchor[1] - ttl_anchor[0]) if ttl_anchor is not None else None
+    summary = _best_edge_alignment_summary(
+        otb_ch3, c3d_ch3, max_skip_otb=10, max_skip_c3d=10, ttl_shift_sec=ttl_shift_sec
+    )
     mean_ms = summary.get("mean_abs_ms")
     max_ms = summary.get("max_abs_ms")
     if not (
@@ -1916,15 +1965,24 @@ def _channel3_edge_alignment_fallback(match: Dict[str, Any]) -> Optional[Dict[st
     control_note = _otb4_control_vs_aux2_note(Path(otb_path))
     if control_note:
         note = f"{note} {control_note}"
+    otb4_skip = int(summary.get("otb4_skip") or 0)
+    c3d_skip = int(summary.get("c3d_skip") or 0)
     return {
-        "otb4_skip": summary.get("otb4_skip"),
-        "c3d_skip": summary.get("c3d_skip"),
+        "otb4_skip": otb4_skip,
+        "c3d_skip": c3d_skip,
         "shift_sec": summary.get("shift_sec"),
         "mean_abs_ms": mean_ms,
         "max_abs_ms": max_ms,
         "matched_count": summary.get("matched_count"),
         "basis": "channel3_crossmachine_fallback",
         "diagnostic_note": note,
+        # These skip indices are into the channel-3 edge arrays, not the
+        # channel-2 arrays carried on match["otb4"/"c3d"]["edge_times_sec"] --
+        # export/plot code must use these explicit native-time anchors
+        # (see _source_sync_offset_for_match) rather than re-indexing
+        # channel-2's edge_times_sec with these skip counts.
+        "otb4_anchor_sec": float(otb_ch3[otb4_skip]) if otb4_skip < len(otb_ch3) else None,
+        "c3d_anchor_sec": float(c3d_ch3[c3d_skip]) if c3d_skip < len(c3d_ch3) else None,
     }
 
 
@@ -2023,23 +2081,31 @@ def _select_otb4_c3d_edge_alignment(match: Dict[str, Any]) -> Dict[str, Any]:
             best = best_late
 
     if base_is_clearly_bad and best["basis"] != "late_c3d_raw_bridge":
-        # Channel 2's naive (skip 0,0) reading looks bad, but the SyncMini
-        # decrement pattern repeats, so the true alignment can still require
-        # skipping several leading edges on *either* side. Search for it --
-        # this is channel 2 "refining on matching pulses, if any": only a
-        # candidate that clears a genuine quality bar (>=6 matched edges,
-        # mean<=20ms, max<=50ms) counts as a match, which is what keeps this
-        # from locking onto the wrong point in the repeating pattern. When
-        # channel 2 has no such matching pulses, channel 3 (from the
-        # independent, radio-silent SyncMini -- the main cross-machine
-        # confirmation signal, see _channel3_edge_alignment_fallback) carries
-        # the alignment on its own, coarser numbers instead. Channel 3 is
-        # tried first for that fallback role rather than searched itself,
-        # since its own wide search can just as easily lock onto the wrong
-        # cycle position when used as a first resort (found empirically:
-        # it did so for one pair in the validation dataset) -- channel 2's
-        # quality-gated search is the more reliable of the two whenever it
-        # has real matching pulses to work with.
+        # Channel 1 (1_TTL) fires once, on a manual switch T-split to both
+        # OTB4 and C3D simultaneously -- unlike a pulse train it can't be
+        # ambiguous about *which* cycle position it's at, so where available
+        # it's used to keep channel 2/3's search from locking onto the wrong
+        # point in their repeating decrement pattern (a real failure mode:
+        # a multi-second-wrong candidate can still show a deceptively good
+        # residual over a short matched window).
+        ttl_anchor = _match_ttl_anchor(match)
+        ttl_shift_sec = (ttl_anchor[1] - ttl_anchor[0]) if ttl_anchor is not None else None
+        ttl_tol_sec = 1.0
+
+        # Channel 2's naive (skip 0,0) reading looks bad. Search for a wider
+        # skip that clears a genuine quality bar (>=6 matched edges,
+        # mean<=20ms, max<=50ms) *and*, when a TTL anchor is available, lands
+        # within ttl_tol_sec of it -- this is channel 2 "refining on matching
+        # pulses, if any". When channel 2 has no such matching pulses,
+        # channel 3 (from the independent, radio-silent SyncMini -- the main
+        # cross-machine confirmation signal, see
+        # _channel3_edge_alignment_fallback) carries the alignment on its own,
+        # coarser numbers instead. Channel 3 is tried first for that fallback
+        # role rather than searched itself, since its own wide search can
+        # just as easily lock onto the wrong cycle position when used as a
+        # first resort -- channel 2's quality-gated search is the more
+        # reliable of the two whenever it has real matching pulses to work
+        # with.
         min_matched = 6
         max_skip = 10
         refined = None
@@ -2057,6 +2123,8 @@ def _select_otb4_c3d_edge_alignment(match: Dict[str, Any]) -> Dict[str, Any]:
                     and float(cand["max_abs_ms"]) <= 50.0
                 ):
                     continue
+                if ttl_shift_sec is not None and abs(float(cand["shift_sec"]) - ttl_shift_sec) > ttl_tol_sec:
+                    continue
                 if refined is None or cand["score"] < refined["score"]:
                     refined = cand
         if refined is not None:
@@ -2065,16 +2133,49 @@ def _select_otb4_c3d_edge_alignment(match: Dict[str, Any]) -> Dict[str, Any]:
             ch3_anchor = _channel3_edge_alignment_fallback(match)
             if ch3_anchor is not None:
                 best = {**best, **ch3_anchor}
+            elif ttl_anchor is not None:
+                # Neither dedicated sync channel produced a TTL-consistent
+                # match (or channel 3 wasn't usable at all) -- fall back to
+                # the TTL anchor itself. Coarser and not cross-validated by
+                # multiple pulses, so this is never auto-acceptable (see
+                # _dedicated_sync_agreement_for_edge_alignment), but it keeps
+                # the reported/exported lag physically plausible instead of
+                # an uncorroborated multi-second guess from a wrong-cycle-lock.
+                otb_rise, c3d_rise = ttl_anchor
+                best = {
+                    "otb4_skip": 0,
+                    "c3d_skip": 0,
+                    "shift_sec": c3d_rise - otb_rise,
+                    "mean_abs_ms": None,
+                    "max_abs_ms": None,
+                    "matched_count": 0,
+                    "basis": "ttl_anchor",
+                    "otb4_anchor_sec": otb_rise,
+                    "c3d_anchor_sec": c3d_rise,
+                    "diagnostic_note": (
+                        "Neither channel 2 nor channel 3 dedicated sync could be aligned between the OTB4 "
+                        "laptop and C3D/Vicon PC for this pair (even after widening the search) in a way "
+                        "consistent with channel 1 (1_TTL) -- the manual-switch signal both systems receive "
+                        "simultaneously via the same T-split, and by far the most robust of the three "
+                        "(one wide level transition rather than a pulse train, so it isn't vulnerable to the "
+                        "long-cable pulse degradation that can corrupt channels 2/3). Falling back to the "
+                        f"TTL-implied lag ({c3d_rise - otb_rise:.3f}s) to avoid reporting/exporting the "
+                        "unrealistic multi-second lag either dedicated-sync search would otherwise have "
+                        "produced. This is a single-point anchor, not cross-validated pulse-by-pulse, so "
+                        "treat it as approximate and confirm visually before accepting."
+                    ),
+                }
             else:
                 note = (
                     "Neither channel 3 (from the independent SyncMini -- the main cross-machine sync signal) "
                     "nor channel 2 (SyncStation-generated) could be aligned between the OTB4 laptop and "
-                    "C3D/Vicon PC for this pair, even after widening the search. Both are independently "
-                    "generated but T-split the same way to a Vicon Lock Lab input feeding C3D -- both failing "
-                    "at once points more toward the C3D/Vicon/Lock-Lab side (or a session-wide OTB4 clock/timing "
-                    "issue) than toward two unrelated generator-side faults. Confirm the file pairing itself "
-                    "(e.g. via TSV bridge/CoP if available) before trusting it, and check the Lock Lab "
-                    "input/cabling for this recording."
+                    "C3D/Vicon PC for this pair, even after widening the search, and channel 1 (1_TTL) is "
+                    "unavailable on one or both sides to sanity-check the result. Both channels 2/3 are "
+                    "independently generated but T-split the same way to a Vicon Lock Lab input feeding C3D "
+                    "-- both failing at once points more toward the C3D/Vicon/Lock-Lab side (or a session-wide "
+                    "OTB4 clock/timing issue) than toward two unrelated generator-side faults. Confirm the "
+                    "file pairing itself (e.g. via TSV bridge/CoP if available) before trusting it, and check "
+                    "the Lock Lab input/cabling for this recording."
                 )
                 otb_path = (match.get("otb4") or {}).get("path")
                 control_note = _otb4_control_vs_aux2_note(Path(otb_path)) if otb_path else None
@@ -2106,6 +2207,21 @@ def _dedicated_sync_agreement_for_edge_alignment(
             # displays dedicated-sync quality (review UI included) benefits.
             edge_align = _select_otb4_c3d_edge_alignment(match)
             match.setdefault("alignment", {})["otb4_c3d_edge_alignment"] = edge_align
+    if edge_align.get("basis") == "ttl_anchor":
+        # A single-edge TTL anchor, not cross-validated pulse-by-pulse --
+        # deliberately reports no pairwise spike counts (otb_c3d_count stays
+        # 0 in _auto_accept_match) so this basis can never auto-accept.
+        return {
+            "quality": "fair",
+            "pair_quality": "fair",
+            "tsv_sync_missing": False,
+            "source_count": 2,
+            "spike_count": 0,
+            "mean_abs_delta_ms": None,
+            "max_abs_delta_ms": None,
+            "pairwise": {},
+            "basis": "ttl_anchor",
+        }
     if edge_align.get("basis") != "channel3_crossmachine_fallback":
         return _dedicated_sync_agreement(match)
     mean_abs = edge_align.get("mean_abs_ms")
@@ -2952,13 +3068,17 @@ def _level_edge_bounds(x: np.ndarray, fs: float) -> Dict[str, Optional[float]]:
     return out
 
 
-def _log_ttl_session_bounds(kind: str, path: Path, log_lines: List[str]) -> None:
-    """Best-effort channel-1 (1_TTL) session-bounds diagnostic. Purely
-    informational -- never gates matching or repair decisions. On the
-    2026-07 dataset most files only expose a single TTL edge, so a full
-    start+end bound frequently cannot be validated; that is expected and
-    logged as such rather than treated as an error.
+def _ttl_channel_bounds(kind: str, path: Path) -> Dict[str, Optional[float]]:
+    """Channel-1 (1_TTL) rise/fall bounds for one file, on that file's own
+    local time axis. Shared by the diagnostic logger below and by the
+    OTB4<->C3D alignment sanity check (`_match_ttl_anchor`) -- the rising
+    edge is a single, session-wide level transition on a manual switch fed
+    to both OTB4 and C3D via the same T-split, so unlike the ~2-sample-wide
+    channel-2 pulses it is not vulnerable to the long-cable degradation that
+    can corrupt individual dedicated-sync pulses; it is a reliable (if
+    coarse, single-point) absolute time anchor.
     """
+    empty: Dict[str, Optional[float]] = {"rise_sec": None, "fall_sec": None}
     try:
         if kind == "otb4":
             _t, x, meta = _load_otb4_aux_channel(path, device=SYNC_OTB_DEVICE, subtitle=SYNC_OTB_TTL_SUBTITLE)
@@ -2967,8 +3087,7 @@ def _log_ttl_session_bounds(kind: str, path: Path, log_lines: List[str]) -> None
             c3d = ezc3d.c3d(str(path), extract_forceplat_data=False)
             labels = list(c3d["parameters"]["ANALOG"]["LABELS"]["value"])
             if SYNC_C3D_TTL_LABEL not in labels:
-                log_lines.append(f"[ttl] {path.name}: {SYNC_C3D_TTL_LABEL} channel not found; session bounds unavailable.")
-                return
+                return empty
             fs = float(c3d["parameters"]["ANALOG"]["RATE"]["value"][0])
             idx = labels.index(SYNC_C3D_TTL_LABEL)
             arr = np.asarray(c3d["data"]["analogs"], dtype=float)
@@ -2978,21 +3097,61 @@ def _log_ttl_session_bounds(kind: str, path: Path, log_lines: List[str]) -> None
             cols, df = _read_tsv_table(path)
             sync_cols = [c for c in cols if str(c).endswith(SYNC_TSV_TTL_SUFFIX)]
             if not sync_cols or "t_rel" not in df.columns:
-                log_lines.append(f"[ttl] {path.name}: {SYNC_TSV_TTL_SUFFIX} column not found; session bounds unavailable.")
-                return
+                return empty
             t_rel = pd.to_numeric(df["t_rel"], errors="coerce").to_numpy(dtype=float)
             x = pd.to_numeric(df[sync_cols[0]], errors="coerce").to_numpy(dtype=float)
             finite = np.isfinite(t_rel) & np.isfinite(x)
             if int(np.sum(finite)) < 2:
-                log_lines.append(f"[ttl] {path.name}: insufficient TTL samples; session bounds unavailable.")
-                return
+                return empty
             t_rel = t_rel[finite]
             x = x[finite]
             dt = float(np.median(np.diff(t_rel))) if t_rel.size >= 2 else 0.0
             fs = 1.0 / dt if dt > 0 else 0.0
         else:
-            return
-        bounds = _level_edge_bounds(x, fs)
+            return empty
+        return _level_edge_bounds(x, fs)
+    except Exception:
+        return empty
+
+
+def _match_ttl_anchor(match: Dict[str, Any]) -> Optional[Tuple[float, float]]:
+    """(otb4_rise_sec, c3d_rise_sec) if channel 1's rising edge is available
+    on both sides of this OTB4<->C3D pair, else None. Both systems receive
+    the same manual-switch pulse simultaneously via a T-split, so these two
+    numbers -- each on that file's own local time axis -- pin down the true
+    OTB4<->C3D time offset to roughly detection precision (~ms), independent
+    of the dedicated sync pulse trains and their repeating decrement pattern.
+    """
+    otb_path = (match.get("otb4") or {}).get("path")
+    c3d_path = (match.get("c3d") or {}).get("path")
+    if not otb_path or not c3d_path:
+        return None
+    otb_rise = _ttl_channel_bounds("otb4", Path(otb_path)).get("rise_sec")
+    c3d_rise = _ttl_channel_bounds("c3d", Path(c3d_path)).get("rise_sec")
+    if isinstance(otb_rise, (int, float)) and isinstance(c3d_rise, (int, float)):
+        return float(otb_rise), float(c3d_rise)
+    return None
+
+
+def _log_ttl_session_bounds(kind: str, path: Path, log_lines: List[str]) -> None:
+    """Best-effort channel-1 (1_TTL) session-bounds diagnostic logging. On
+    the 2026-07 dataset most files only expose a single TTL edge, so a full
+    start+end bound frequently cannot be validated; that is expected and
+    logged as such rather than treated as an error. The rising edge alone
+    (when present) is also used non-diagnostically -- see `_match_ttl_anchor`.
+    """
+    try:
+        if kind == "c3d":
+            c3d_check = ezc3d.c3d(str(path), extract_forceplat_data=False)
+            if SYNC_C3D_TTL_LABEL not in list(c3d_check["parameters"]["ANALOG"]["LABELS"]["value"]):
+                log_lines.append(f"[ttl] {path.name}: {SYNC_C3D_TTL_LABEL} channel not found; session bounds unavailable.")
+                return
+        elif kind == "tsv":
+            cols, _df = _read_tsv_table(path)
+            if not [c for c in cols if str(c).endswith(SYNC_TSV_TTL_SUFFIX)]:
+                log_lines.append(f"[ttl] {path.name}: {SYNC_TSV_TTL_SUFFIX} column not found; session bounds unavailable.")
+                return
+        bounds = _ttl_channel_bounds(kind, path)
         start_sec, end_sec = bounds.get("rise_sec"), bounds.get("fall_sec")
         if start_sec is not None and end_sec is not None:
             log_lines.append(
@@ -5413,6 +5572,8 @@ def analyze_folder(folder: Path, match_options: Optional[Dict[str, Any]] = None)
         match["alignment"]["sync_triplet_spike_max_abs_ms"] = dedicated.get("max_abs_delta_ms")
         match["alignment"]["sync_triplet_spike_count"] = dedicated.get("spike_count")
         match["alignment"]["sync_triplet_pairwise"] = dedicated.get("pairwise")
+        match["alignment"]["plot_time_shifts_sec"] = _match_plot_shifts(match)
+        match["alignment"]["inner_merge"] = _build_inner_merge_alignment(match)
 
     summary = {
         "otb4_count": len(otb4_records),
