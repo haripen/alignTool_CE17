@@ -6204,6 +6204,22 @@ def _sync_series_specs(match: Dict[str, Any]) -> List[Dict[str, Any]]:
         rec = match.get(source)
         if rec and rec.get("sync_present") and rec.get("sync_channel"):
             specs.append({"source": source, "kind": "sync", "channel": rec["sync_channel"]})
+    # Channel 3 (3_Sync_50ms) overlay by default -- the main cross-machine
+    # confirmation signal (see _channel3_edge_alignment_fallback) -- shown
+    # alongside channel 2 above regardless of which basis this particular
+    # pair actually used, so a reviewer can visually compare both.
+    if (match.get("otb4") or {}).get("path"):
+        specs.append(
+            {
+                "source": "otb4",
+                "kind": "sync_ch3",
+                "channel": f"{SYNC_OTB_DEVICE} {SYNC_OTB_TSV_BRIDGE_SUBTITLE} (3_Sync_50ms)",
+                "otb4_device": SYNC_OTB_DEVICE,
+                "otb4_subtitle": SYNC_OTB_TSV_BRIDGE_SUBTITLE,
+            }
+        )
+    if (match.get("c3d") or {}).get("path"):
+        specs.append({"source": "c3d", "kind": "sync_ch3", "channel": SYNC_C3D_TSV_BRIDGE_LABEL})
     return specs
 
 
@@ -6240,6 +6256,16 @@ def _load_series_for_spec(match: Dict[str, Any], spec: Dict[str, Any]) -> Tuple[
             diag = _otb4_probe_sync_diagnostics(match)
             probe = next((item for item in (diag.get("probes") or []) if str(item.get("device") or "") == str(spec.get("device"))), None)
             probe_shift_sec = -float((probe or {}).get("optimal_lag_sec") or 0.0)
+        elif spec.get("kind") == "sync_ch3":
+            # Channel 3 (AUX 3) isn't looked up by a flat channel-name string
+            # like the branch below -- same direct AUX loader the channel-3
+            # edge extraction (_otb4_channel_edge_times) uses.
+            t, x, _meta = _load_otb4_aux_channel(
+                Path(match[source]["path"]),
+                device=str(spec.get("otb4_device") or SYNC_OTB_DEVICE),
+                subtitle=str(spec.get("otb4_subtitle") or SYNC_OTB_TSV_BRIDGE_SUBTITLE),
+            )
+            t, y = np.asarray(t, dtype=float), np.asarray(x, dtype=float)
         else:
             device = _otb_label_device(spec["channel"])
             t, y = _load_otb4_channel(
@@ -7737,6 +7763,8 @@ def _series_label(spec: Dict[str, Any]) -> str:
         return f"{prefix} CoP: {channel}"
     if spec.get("kind") == "sync":
         return f"{prefix} sync: {channel}"
+    if spec.get("kind") == "sync_ch3":
+        return f"{prefix} sync ch3 (3_Sync_50ms)"
     if spec.get("kind") == "raw":
         return f"{prefix} raw: {channel}"
     return f"{prefix}: {channel}"
