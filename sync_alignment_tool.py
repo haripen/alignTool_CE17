@@ -1790,6 +1790,42 @@ def _spike_match_count(a: np.ndarray, b: np.ndarray, tol_sec: float = 0.05) -> i
     return matched
 
 
+def _otb4_control_vs_aux2_note(otb_path: Path) -> Optional[str]:
+    """Compare the SyncStation's internal digital control-buffer event log
+    against its own AUX2 analog loopback capture -- the same generated
+    channel-2 pulse train, read two different ways inside the OTB4 file
+    itself (before any cable to C3D is involved).
+
+    Checked whether this distinguishes well-aligned from poorly-aligned
+    OTB4<->C3D pairs: it does not. A handful of pulses missing from one side
+    or the other shows up on essentially every OTB4 recording, including
+    ones whose channel-2 alignment against C3D is fine, so it is reported
+    here for transparency but should not be read as the explanation for a
+    cross-machine mismatch -- it looks like differing detection sensitivity
+    between analog threshold detection (AUX2) and digital buffer logging
+    (control), not a fault specific to any one recording.
+    """
+    try:
+        diag = _extract_otb4_probe_sync_diagnostics(otb_path)
+    except Exception:
+        return None
+    control_t = np.asarray(diag.get("control_observed_times_sec") or [], dtype=float)
+    aux2_t = np.asarray(diag.get("aux2_observed_times_sec") or [], dtype=float)
+    if control_t.size < 2 or aux2_t.size < 2:
+        return None
+    tol = 0.01
+    missing_in_aux2 = int(sum(1 for t in control_t if np.min(np.abs(aux2_t - t)) > tol))
+    missing_in_control = int(sum(1 for t in aux2_t if np.min(np.abs(control_t - t)) > tol))
+    if missing_in_aux2 == 0 and missing_in_control == 0:
+        return None
+    return (
+        f"OTB4-internal check: the AUX2 loopback and the SyncStation's internal control-buffer event log "
+        f"differ ({missing_in_aux2} pulse(s) in the control buffer missing from AUX2, {missing_in_control} "
+        f"pulse(s) in AUX2 missing from the control buffer). This also occurs on well-aligned OTB4/C3D pairs, "
+        f"so it does not by itself explain the cross-machine mismatch above."
+    )
+
+
 def _channel3_edge_alignment_fallback(match: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Cross-machine OTB4<->C3D alignment via channel 3, used when channel 2
     cannot be resolved to a trustworthy alignment even after a widened
@@ -1834,6 +1870,18 @@ def _channel3_edge_alignment_fallback(match: Dict[str, Any]) -> Optional[Dict[st
         and int(summary.get("matched_count") or 0) >= 6
     ):
         return None
+    note = (
+        "Channel 2 (1ms) could not be aligned between the OTB4 laptop and C3D/Vicon PC even after "
+        "widening the search. OTB4's channel-2 reading is a loopback of the SyncStation's own generated "
+        "signal, so it is inherently self-consistent -- this points to a cable/connector issue on the "
+        "SyncStation-to-Vicon-Lock-Lab run for this recording (the C3D-side branch of that T-split), not "
+        "an OTB4-side fault, and is unrelated to the separate 433MHz RF link to the wireless probes. "
+        "Channel 3 (from the independent, radio-silent SyncMini) independently confirms the alignment "
+        f"(mean={mean_ms:.1f}ms, max={max_ms:.1f}ms, {int(summary.get('matched_count') or 0)} edges matched)."
+    )
+    control_note = _otb4_control_vs_aux2_note(Path(otb_path))
+    if control_note:
+        note = f"{note} {control_note}"
     return {
         "otb4_skip": summary.get("otb4_skip"),
         "c3d_skip": summary.get("c3d_skip"),
@@ -1842,15 +1890,7 @@ def _channel3_edge_alignment_fallback(match: Dict[str, Any]) -> Optional[Dict[st
         "max_abs_ms": max_ms,
         "matched_count": summary.get("matched_count"),
         "basis": "channel3_crossmachine_fallback",
-        "diagnostic_note": (
-            "Channel 2 (1ms) could not be aligned between the OTB4 laptop and C3D/Vicon PC even after "
-            "widening the search. OTB4's channel-2 reading is a loopback of the SyncStation's own generated "
-            "signal, so it is inherently self-consistent -- this points to a cable/connector issue on the "
-            "SyncStation-to-Vicon-Lock-Lab run for this recording (the C3D-side branch of that T-split), not "
-            "an OTB4-side fault, and is unrelated to the separate 433MHz RF link to the wireless probes. "
-            "Channel 3 (from the independent, radio-silent SyncMini) independently confirms the alignment "
-            f"(mean={mean_ms:.1f}ms, max={max_ms:.1f}ms, {int(summary.get('matched_count') or 0)} edges matched)."
-        ),
+        "diagnostic_note": note,
     }
 
 
@@ -1985,7 +2025,7 @@ def _select_otb4_c3d_edge_alignment(match: Dict[str, Any]) -> Dict[str, Any]:
             if ch3_fallback is not None:
                 best = {**best, **ch3_fallback}
             else:
-                best["diagnostic_note"] = (
+                note = (
                     "Neither channel 2 (SyncStation-generated) nor channel 3 (from the separate SyncMini) "
                     "could be aligned between the OTB4 laptop and C3D/Vicon PC for this pair, even after "
                     "widening the search. Both are independently generated but T-split the same way to a "
@@ -1994,6 +2034,11 @@ def _select_otb4_c3d_edge_alignment(match: Dict[str, Any]) -> Dict[str, Any]:
                     "unrelated generator-side faults. Confirm the file pairing itself (e.g. via TSV bridge/CoP "
                     "if available) before trusting it, and check the Lock Lab input/cabling for this recording."
                 )
+                otb_path = (match.get("otb4") or {}).get("path")
+                control_note = _otb4_control_vs_aux2_note(Path(otb_path)) if otb_path else None
+                if control_note:
+                    note = f"{note} {control_note}"
+                best["diagnostic_note"] = note
     best["late_c3d_supported"] = late_c3d_supported
     return best
 
