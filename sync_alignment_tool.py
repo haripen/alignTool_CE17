@@ -2258,16 +2258,17 @@ def _select_otb4_c3d_edge_alignment(match: Dict[str, Any]) -> Dict[str, Any]:
                     "otb4_anchor_sec": otb_rise,
                     "c3d_anchor_sec": c3d_rise,
                     "diagnostic_note": (
-                        "Neither channel 2 nor channel 3 dedicated sync could be aligned between the OTB4 "
-                        "laptop and C3D/Vicon PC for this pair (even after widening the search) in a way "
-                        "consistent with channel 1 (1_TTL) -- the manual-switch signal both systems receive "
-                        "simultaneously via the same T-split, and by far the most robust of the three "
-                        "(one wide level transition rather than a pulse train, so it isn't vulnerable to the "
-                        "long-cable pulse degradation that can corrupt channels 2/3). Falling back to the "
-                        f"TTL-implied lag ({c3d_rise - otb_rise:.3f}s) to avoid reporting/exporting the "
-                        "unrealistic multi-second lag either dedicated-sync search would otherwise have "
-                        "produced. This is a single-point anchor, not cross-validated pulse-by-pulse, so "
-                        "treat it as approximate and confirm visually before accepting."
+                        "Aligned via channel 1 (1_TTL) -- the manual-switch signal both systems receive "
+                        "simultaneously via the same T-split, and by far the most robust of the three (one "
+                        "wide level transition rather than a pulse train, so it isn't vulnerable to the "
+                        f"long-cable pulse degradation that can corrupt channels 2/3): lag {c3d_rise - otb_rise:.3f}s. "
+                        "Channels 2 and 3 on this specific OTB4 recording are too degraded to independently "
+                        "confirm or refine that further (their own widened searches only find "
+                        "sawtooth-pattern coincidences at physically implausible multi-second lags, correctly "
+                        "rejected against the TTL anchor) -- this reflects a cable/reception issue on this "
+                        "recording, not doubt about the file pairing or the TTL lag itself. It is still a "
+                        "single-point anchor, not cross-validated pulse-by-pulse like channels 2/3 normally "
+                        "are, so treat the precision as coarser than a certain pair and confirm visually."
                     ),
                 }
             else:
@@ -4223,11 +4224,16 @@ def _apply_otb4_repairs(matches: List[Dict[str, Any]], log_lines: List[str]) -> 
             f"OTB4 repair applied from {repair['device']} {repair['subtitle']}: +{repair['samples_added']} NaN gap samples."
         )
 
-        final_edge_align = {
-            **selected["summary"],
-            "basis": "repair_gap_alignment",
-            "late_c3d_supported": bool(((match.get("alignment") or {}).get("otb4_c3d_edge_alignment") or {}).get("late_c3d_supported")),
-        }
+        # selected["summary"] is only the alignment achieved by *this specific*
+        # repair candidate at selection time (no skip search, used purely to
+        # rank candidates against each other) -- it can be far worse than what
+        # the general, TTL-gated search in _select_otb4_c3d_edge_alignment
+        # finds once the repaired edge times are in place (e.g. a pair whose
+        # OTB4 gap-repair fixed a dropped-packet gap but whose true alignment
+        # still needs the widened channel-2/3/TTL search to resolve). Recompute
+        # with the canonical method now that match["otb4"] reflects the repair,
+        # rather than overwriting with the cruder candidate-ranking summary.
+        final_edge_align = _select_otb4_c3d_edge_alignment(match)
         match["alignment"]["sync_edge_skips"] = {
             "otb4": int(final_edge_align.get("otb4_skip") or 0),
             "c3d": int(final_edge_align.get("c3d_skip") or 0),
