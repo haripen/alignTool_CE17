@@ -4391,6 +4391,112 @@ def _channel3_pairing_fallback(
     return out
 
 
+def _channel3_weak_pair_rescue(
+    otb4_records: Sequence[SyncRecord],
+    c3d_records: Sequence[SyncRecord],
+    otb4_to_c3d: List[Tuple[SyncRecord, SyncRecord, float]],
+    folder: Path,
+    log_lines: List[str],
+) -> List[Tuple[SyncRecord, SyncRecord, float]]:
+    """Rescue primary (channel-2) pairs at the weakest confidence tier
+    ("uncertain") by checking whether the dedicated channel-3 (50ms) bridge
+    supports reassigning *both* sides of the pair to different,
+    currently-unused records instead.
+
+    Channel 2 alone can be too degraded to disambiguate near-tied
+    candidates (seen on early-session recordings with poor probe sync), and
+    channel 3's own repeating decrement pattern can alias between files a
+    few trials apart (the wrong-cycle-lock seen earlier this session) -- so
+    neither signal is trusted alone here. A swap only happens when *both*
+    halves independently pass the same certain/probable-quality,
+    near-zero-shift edge cross-check used elsewhere for bridge confirmation
+    (a large shift means the "match" is a shape coincidence at the wrong
+    point in the repeating pattern, not the same physical recording).
+    """
+    weak_pairs = [
+        (o, c, cost) for o, c, cost in otb4_to_c3d
+        if _summarize_pair_cost(cost) == "uncertain"
+    ]
+    if not weak_pairs:
+        return otb4_to_c3d
+    try:
+        roles = _resolve_sync_channel_roles(_discover_sync_channel_candidates(folder))
+    except Exception as exc:
+        log_lines.append(f"[pairing] channel-3 weak-pair rescue: sync channel discovery failed ({exc}); skipping.")
+        return otb4_to_c3d
+    bridge = roles.get("tsv_bridge_sync") or {}
+    otb4_device = str((bridge.get("otb4") or {}).get("device") or "")
+    otb4_subtitle = str((bridge.get("otb4") or {}).get("subtitle") or "")
+    c3d_label = str((bridge.get("c3d") or {}).get("label") or "")
+    if not (otb4_device and otb4_subtitle and c3d_label):
+        return otb4_to_c3d
+
+    def ch3_edges_otb4(rec: SyncRecord) -> List[float]:
+        return sorted(_otb4_channel_edge_times(Path(rec.path), otb4_device, otb4_subtitle))
+
+    def ch3_edges_c3d(rec: SyncRecord) -> List[float]:
+        return sorted(_c3d_channel_edge_times(Path(rec.path), c3d_label))
+
+    def confirmed(otb_edges: List[float], c3d_edges: List[float]) -> Optional[Dict[str, Any]]:
+        if len(otb_edges) < 2 or len(c3d_edges) < 2:
+            return None
+        check = _tsv_bridge_sync_alignment(c3d_edges, otb_edges, match_tol_sec=0.05)
+        if check.get("quality") not in ("certain", "probable"):
+            return None
+        shift = check.get("shift_sec")
+        if not isinstance(shift, (int, float)) or abs(float(shift)) > 2.0:
+            return None
+        return check
+
+    result = list(otb4_to_c3d)
+    used_otb_ids = {id(o) for o, _c, _cost in result}
+    used_c3d_ids = {id(c) for _o, c, _cost in result}
+
+    for o_weak, c_weak, cost_weak in weak_pairs:
+        weak_check = confirmed(ch3_edges_otb4(o_weak), ch3_edges_c3d(c_weak))
+        if weak_check is not None:
+            continue  # channel 3 already agrees with the primary pairing -- nothing to rescue
+        leftover_otb4 = [r for r in otb4_records if id(r) not in used_otb_ids]
+        leftover_c3d = [r for r in c3d_records if id(r) not in used_c3d_ids]
+        if not leftover_otb4 or not leftover_c3d:
+            continue
+        c_weak_edges = ch3_edges_c3d(c_weak)
+        candidates_o = [
+            (cand, chk) for cand in leftover_otb4
+            if (chk := confirmed(ch3_edges_otb4(cand), c_weak_edges)) is not None
+        ]
+        if not candidates_o:
+            continue
+        best_o_alt, best_o_check = min(candidates_o, key=lambda item: abs(float(item[1].get("shift_sec") or 0.0)))
+        o_weak_edges = ch3_edges_otb4(o_weak)
+        candidates_c = [
+            (cand, chk) for cand in leftover_c3d
+            if (chk := confirmed(o_weak_edges, ch3_edges_c3d(cand))) is not None
+        ]
+        if not candidates_c:
+            continue
+        best_c_alt, best_c_check = min(candidates_c, key=lambda item: abs(float(item[1].get("shift_sec") or 0.0)))
+
+        new_cost_a = _pair_cost_value(best_o_alt.intervals_sec, c_weak.intervals_sec, weak_pair_cost=0.25)
+        new_cost_b = _pair_cost_value(o_weak.intervals_sec, best_c_alt.intervals_sec, weak_pair_cost=0.25)
+        for idx, (o, c, _cost) in enumerate(result):
+            if o is o_weak and c is c_weak:
+                result[idx] = (best_o_alt, c_weak, float(new_cost_a) if new_cost_a is not None else 0.25)
+                break
+        result.append((o_weak, best_c_alt, float(new_cost_b) if new_cost_b is not None else 0.25))
+        used_otb_ids.discard(id(o_weak))
+        used_otb_ids.add(id(best_o_alt))
+        used_c3d_ids.add(id(best_c_alt))
+        log_lines.append(
+            f"[pairing] channel-3 weak-pair rescue: primary pair {Path(o_weak.path).name}<->{Path(c_weak.path).name} "
+            f"had weak channel-2 confidence (cost={cost_weak:.4f}) and channel 3 did not confirm it; reassigned to "
+            f"{Path(best_o_alt.path).name}<->{Path(c_weak.path).name} (ch3 shift={best_o_check.get('shift_sec')}s "
+            f"matched={best_o_check.get('matched_count')}) and {Path(o_weak.path).name}<->{Path(best_c_alt.path).name} "
+            f"(ch3 shift={best_c_check.get('shift_sec')}s matched={best_c_check.get('matched_count')})."
+        )
+    return result
+
+
 def _pair_records(left: List[SyncRecord], right: List[SyncRecord], skip_penalty: float = 0.25) -> List[Tuple[SyncRecord, SyncRecord, float]]:
     if not left or not right:
         return []
@@ -5552,6 +5658,7 @@ def analyze_folder(folder: Path, match_options: Optional[Dict[str, Any]] = None)
         fallback_pairs = _channel3_pairing_fallback(otb4_records, c3d_records, otb4_to_c3d, folder, log_lines)
         if fallback_pairs:
             otb4_to_c3d = otb4_to_c3d + fallback_pairs
+        otb4_to_c3d = _channel3_weak_pair_rescue(otb4_records, c3d_records, otb4_to_c3d, folder, log_lines)
         otb4_to_c3d.sort(key=lambda t: t[0].path)
 
         pair_id = 1
