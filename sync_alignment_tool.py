@@ -3042,7 +3042,7 @@ def _extract_otb4_record(path: Path, *, include_probe_sync_diagnostics: bool = F
 
 
 def _extract_c3d_record(path: Path) -> SyncRecord:
-    c3d = ezc3d.c3d(str(path), extract_forceplat_data=False)
+    c3d = _c3d_forceplat_metadata(path)["c3d"]
     labels = list(c3d["parameters"]["ANALOG"]["LABELS"]["value"])
     point_labels = list(c3d["parameters"].get("POINT", {}).get("LABELS", {}).get("value", []))
     if "LABELS2" in c3d["parameters"].get("POINT", {}):
@@ -3148,9 +3148,16 @@ def _c3d_channel_edge_times(path: Path, channel_name: str) -> Tuple[float, ...]:
     fallback to the peak-detection settings used for the dedicated
     OTB4/C3D sync channel in `_extract_c3d_record` if thresholding doesn't
     find enough pulses (e.g. an unexpectedly noisy channel).
+
+    Reuses `_c3d_forceplat_metadata`'s path-keyed cache for the raw parse
+    instead of calling `ezc3d.c3d()` again here: this function is cached
+    per (path, channel_name), so probing multiple channels on the same
+    file (e.g. the channel-2 and channel-3 sync labels) used to reparse
+    the whole file once per channel -- the dominant cost in analyze_folder
+    once more candidates get probed per pair.
     """
     try:
-        c3d = ezc3d.c3d(str(path), extract_forceplat_data=False)
+        c3d = _c3d_forceplat_metadata(path)["c3d"]
         labels = list(c3d["parameters"]["ANALOG"]["LABELS"]["value"])
         if channel_name not in labels:
             return ()
@@ -3211,6 +3218,7 @@ def _level_edge_bounds(x: np.ndarray, fs: float) -> Dict[str, Optional[float]]:
     return out
 
 
+@lru_cache(maxsize=128)
 def _ttl_channel_bounds(kind: str, path: Path) -> Dict[str, Optional[float]]:
     """Channel-1 (1_TTL) rise/fall bounds for one file, on that file's own
     local time axis. Shared by the diagnostic logger below and by the
@@ -3220,6 +3228,14 @@ def _ttl_channel_bounds(kind: str, path: Path) -> Dict[str, Optional[float]]:
     channel-2 pulses it is not vulnerable to the long-cable degradation that
     can corrupt individual dedicated-sync pulses; it is a reliable (if
     coarse, single-point) absolute time anchor.
+
+    Cached: this is a pure function of on-disk file content (the underlying
+    .otb4/.c3d/.tsv is never rewritten mid-session, only the in-memory match
+    dict is mutated by repair), and it is called repeatedly for the same
+    file -- once per TSV candidate evaluated for a pair (via
+    `_match_ttl_anchor` inside `_select_otb4_c3d_edge_alignment`), plus once
+    per diagnostic log line. Without caching, a full OTB4/C3D re-parse for
+    every one of those calls dominated analyze_folder's runtime.
     """
     empty: Dict[str, Optional[float]] = {"rise_sec": None, "fall_sec": None}
     try:
@@ -3227,7 +3243,7 @@ def _ttl_channel_bounds(kind: str, path: Path) -> Dict[str, Optional[float]]:
             _t, x, meta = _load_otb4_aux_channel(path, device=SYNC_OTB_DEVICE, subtitle=SYNC_OTB_TTL_SUBTITLE)
             fs = float(meta.get("sampling_frequency") or 0.0)
         elif kind == "c3d":
-            c3d = ezc3d.c3d(str(path), extract_forceplat_data=False)
+            c3d = _c3d_forceplat_metadata(path)["c3d"]
             labels = list(c3d["parameters"]["ANALOG"]["LABELS"]["value"])
             if SYNC_C3D_TTL_LABEL not in labels:
                 return empty
@@ -3285,7 +3301,7 @@ def _log_ttl_session_bounds(kind: str, path: Path, log_lines: List[str]) -> None
     """
     try:
         if kind == "c3d":
-            c3d_check = ezc3d.c3d(str(path), extract_forceplat_data=False)
+            c3d_check = _c3d_forceplat_metadata(path)["c3d"]
             if SYNC_C3D_TTL_LABEL not in list(c3d_check["parameters"]["ANALOG"]["LABELS"]["value"]):
                 log_lines.append(f"[ttl] {path.name}: {SYNC_C3D_TTL_LABEL} channel not found; session bounds unavailable.")
                 return
@@ -3810,7 +3826,7 @@ def _c3d_sync_channel_candidates(paths: Sequence[Path], *, sample_limit: int = 3
     scored: Dict[str, Dict[str, Any]] = {}
     for path in list(paths)[:sample_limit]:
         try:
-            c3d = ezc3d.c3d(str(path), extract_forceplat_data=False)
+            c3d = _c3d_forceplat_metadata(path)["c3d"]
             labels = list(c3d["parameters"]["ANALOG"]["LABELS"]["value"])
             rate = float(c3d["parameters"]["ANALOG"]["RATE"]["value"][0])
             arr = np.asarray(c3d["data"]["analogs"], dtype=float)
@@ -3870,6 +3886,7 @@ def _tsv_sync_channel_candidates(paths: Sequence[Path], *, sample_limit: int = 3
     return _summarize_channel_candidates(scored, label_fn=lambda k, _v: str(k))
 
 
+@lru_cache(maxsize=16)
 def _discover_sync_channel_candidates(folder: Path, *, sample_limit: int = 3) -> Dict[str, Any]:
     """Scan a sample of files per source type and rank channels by how much
     they look like a dedicated sync pulse train (see
@@ -3878,6 +3895,10 @@ def _discover_sync_channel_candidates(folder: Path, *, sample_limit: int = 3) ->
     bridge role without assuming today's fixed labels, so a future device
     naming change can be caught (and picked from) instead of silently
     producing zero matches.
+
+    Cached: this re-samples and re-scores files on every call, and multiple
+    call sites (primary pairing fallback, weak-pair rescue) invoke it once
+    per analyze_folder run for the same folder.
     """
     excluded = ("matched", "accepted", "__pycache__", ".git")
     otb4_paths = _iter_source_files(folder, ".otb4", excluded_dir_names=excluded)
@@ -8856,6 +8877,16 @@ def _save_mapping_bundle(mapping_path: Path, mapping: Dict[str, Any], *, write_r
 
 
 def _prefetch_match_plot_data(match: Dict[str, Any]) -> None:
+    """Warm the cheap, reusable per-match state (repair, review defaults,
+    probe diagnostics) for the next couple of rows in the background.
+
+    Deliberately does *not* also pre-load full plot series data here (via
+    _load_series_for_spec): that costs roughly 2s/match of real CPU work
+    on the background thread pool, which was found to visibly stutter the
+    UI during review even though it never blocks the main thread directly.
+    Actual series loading happens on demand in PlotRowWidget.refresh() when
+    a match is opened.
+    """
     try:
         _ensure_otb4_repair_applied(match, [])
     except Exception:
@@ -8865,40 +8896,9 @@ def _prefetch_match_plot_data(match: Dict[str, Any]) -> None:
     except Exception:
         pass
     try:
-        diag = _otb4_probe_sync_diagnostics(match)
-    except Exception:
-        diag = {}
-    desired_specs: List[Dict[str, Any]] = []
-    try:
-        desired_specs.extend(_sync_series_specs(match))
-        desired_specs.extend(_raw_series_specs(match))
+        _otb4_probe_sync_diagnostics(match)
     except Exception:
         pass
-    for probe in (diag.get("probes") or []):
-        if not probe.get("non_sync"):
-            continue
-        device = str(probe.get("device") or "").strip()
-        if not device:
-            continue
-        try:
-            desired_specs.extend(_probe_detail_series_specs(match, device))
-        except Exception:
-            continue
-    seen: set[Tuple[str, str, str, str]] = set()
-    for spec in desired_specs:
-        key = (
-            str(spec.get("source") or ""),
-            str(spec.get("channel") or ""),
-            str(spec.get("device") or ""),
-            str(spec.get("subtitle") or ""),
-        )
-        if key in seen:
-            continue
-        seen.add(key)
-        try:
-            _load_series_for_spec(match, spec)
-        except Exception:
-            continue
 
 
 def _save_mapping_bundle_snapshot(mapping_path: Path, mapping_snapshot: Dict[str, Any], *, write_review_outputs: bool) -> None:
