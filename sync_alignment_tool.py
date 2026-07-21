@@ -6198,16 +6198,44 @@ def _channel_options_for_record(record: Dict[str, Any]) -> List[Tuple[str, Dict[
     return options
 
 
+_SYNC_CHANNEL_BAND_HEIGHT = 1.2
+_SYNC_CHANNEL_MARKER_Y = -0.5
+
+
+def _sync_channel_band_offset(channel_num: int) -> float:
+    """Vertical band offset for a channel-1/2/3 trace normalized to 0..1
+    (see _load_series_for_spec): 1_TTL highest, 2_Sync middle,
+    3_Sync_50ms lowest.
+    """
+    return float(3 - int(channel_num)) * _SYNC_CHANNEL_BAND_HEIGHT
+
+
+def _tsv_column_by_suffix(match: Dict[str, Any], suffix: str) -> Optional[str]:
+    names = ((match.get("tsv") or {}).get("channel_names")) or []
+    return next((str(name) for name in names if str(name).endswith(suffix)), None)
+
+
 def _sync_series_specs(match: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Every source's channel 1 (1_TTL), channel 2 (2_Sync), and channel 3
+    (3_Sync_50ms) trace, so a reviewer can visually compare all three
+    dedicated sync signals regardless of which one the pairing/alignment
+    actually used. Each spec carries "sync_channel_num" (1/2/3), which
+    _load_series_for_spec uses to stack same-numbered channels at the same
+    plotted height across sources (see _sync_channel_band_offset).
+    """
     specs: List[Dict[str, Any]] = []
     for source in ("otb4", "c3d", "tsv"):
         rec = match.get(source)
         if rec and rec.get("sync_present") and rec.get("sync_channel"):
-            specs.append({"source": source, "kind": "sync", "channel": rec["sync_channel"]})
-    # Channel 3 (3_Sync_50ms) overlay by default -- the main cross-machine
-    # confirmation signal (see _channel3_edge_alignment_fallback) -- shown
-    # alongside channel 2 above regardless of which basis this particular
-    # pair actually used, so a reviewer can visually compare both.
+            # TSV's own dedicated sync is always the channel-3 bridge; OTB4/C3D's is channel 2.
+            specs.append(
+                {
+                    "source": source,
+                    "kind": "sync",
+                    "channel": rec["sync_channel"],
+                    "sync_channel_num": 3 if source == "tsv" else 2,
+                }
+            )
     if (match.get("otb4") or {}).get("path"):
         specs.append(
             {
@@ -6216,10 +6244,25 @@ def _sync_series_specs(match: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "channel": f"{SYNC_OTB_DEVICE} {SYNC_OTB_TSV_BRIDGE_SUBTITLE} (3_Sync_50ms)",
                 "otb4_device": SYNC_OTB_DEVICE,
                 "otb4_subtitle": SYNC_OTB_TSV_BRIDGE_SUBTITLE,
+                "sync_channel_num": 3,
+            }
+        )
+        specs.append(
+            {
+                "source": "otb4",
+                "kind": "sync_ch1",
+                "channel": f"{SYNC_OTB_DEVICE} {SYNC_OTB_TTL_SUBTITLE} (1_TTL)",
+                "otb4_device": SYNC_OTB_DEVICE,
+                "otb4_subtitle": SYNC_OTB_TTL_SUBTITLE,
+                "sync_channel_num": 1,
             }
         )
     if (match.get("c3d") or {}).get("path"):
-        specs.append({"source": "c3d", "kind": "sync_ch3", "channel": SYNC_C3D_TSV_BRIDGE_LABEL})
+        specs.append({"source": "c3d", "kind": "sync_ch3", "channel": SYNC_C3D_TSV_BRIDGE_LABEL, "sync_channel_num": 3})
+        specs.append({"source": "c3d", "kind": "sync_ch1", "channel": SYNC_C3D_TTL_LABEL, "sync_channel_num": 1})
+    tsv_ttl_col = _tsv_column_by_suffix(match, SYNC_TSV_TTL_SUFFIX)
+    if tsv_ttl_col:
+        specs.append({"source": "tsv", "kind": "sync_ch1", "channel": tsv_ttl_col, "sync_channel_num": 1})
     return specs
 
 
@@ -6256,14 +6299,17 @@ def _load_series_for_spec(match: Dict[str, Any], spec: Dict[str, Any]) -> Tuple[
             diag = _otb4_probe_sync_diagnostics(match)
             probe = next((item for item in (diag.get("probes") or []) if str(item.get("device") or "") == str(spec.get("device"))), None)
             probe_shift_sec = -float((probe or {}).get("optimal_lag_sec") or 0.0)
-        elif spec.get("kind") == "sync_ch3":
-            # Channel 3 (AUX 3) isn't looked up by a flat channel-name string
-            # like the branch below -- same direct AUX loader the channel-3
-            # edge extraction (_otb4_channel_edge_times) uses.
+        elif spec.get("kind") in {"sync_ch1", "sync_ch3"}:
+            # Neither AUX 1 (channel 1) nor AUX 3 (channel 3) is looked up by
+            # a flat channel-name string like the branch below (that only
+            # special-cases channel 2's SYNC_OTB_LABEL) -- same direct AUX
+            # loader the channel-3 edge extraction (_otb4_channel_edge_times)
+            # and the TTL bounds check (_ttl_channel_bounds) use.
+            default_subtitle = SYNC_OTB_TTL_SUBTITLE if spec.get("kind") == "sync_ch1" else SYNC_OTB_TSV_BRIDGE_SUBTITLE
             t, x, _meta = _load_otb4_aux_channel(
                 Path(match[source]["path"]),
                 device=str(spec.get("otb4_device") or SYNC_OTB_DEVICE),
-                subtitle=str(spec.get("otb4_subtitle") or SYNC_OTB_TSV_BRIDGE_SUBTITLE),
+                subtitle=str(spec.get("otb4_subtitle") or default_subtitle),
             )
             t, y = np.asarray(t, dtype=float), np.asarray(x, dtype=float)
         else:
@@ -6280,6 +6326,14 @@ def _load_series_for_spec(match: Dict[str, Any], spec: Dict[str, Any]) -> Tuple[
     else:
         raise ValueError(source)
     shift = float(_match_plot_shifts(match).get(source, 0.0))
+    channel_num = spec.get("sync_channel_num")
+    if isinstance(channel_num, int):
+        # Per-trace independent 0..1 normalization (different sensors/
+        # sources, so sharing a raw voltage scale isn't meaningful) plus a
+        # shared per-channel-number offset, so e.g. OTB4's and C3D's channel
+        # 2 traces plot at the *same* height even though their raw voltage
+        # ranges differ -- "same-signal data at the same y-axis height".
+        y = _normalize_unit_interval(y) + _sync_channel_band_offset(channel_num)
     return t + shift + probe_shift_sec, y
 
 
@@ -7765,6 +7819,8 @@ def _series_label(spec: Dict[str, Any]) -> str:
         return f"{prefix} sync: {channel}"
     if spec.get("kind") == "sync_ch3":
         return f"{prefix} sync ch3 (3_Sync_50ms)"
+    if spec.get("kind") == "sync_ch1":
+        return f"{prefix} sync ch1 (1_TTL)"
     if spec.get("kind") == "raw":
         return f"{prefix} raw: {channel}"
     return f"{prefix}: {channel}"
@@ -8713,8 +8769,9 @@ class PlotRowWidget:
 
         if self.row_role == "sync":
             text = (
-                "Dedicated sync overlay | dotted expected lines: "
-                "green=confirmed, amber=partial, red=missing | green bars=start/end"
+                "Dedicated sync overlay | channel 1 (1_TTL) top, 2 (2_Sync) middle, 3 (3_Sync_50ms) bottom "
+                "| circles below traces=match status: filled green=confirmed, filled amber=partial, "
+                "open white=missing (unmatched) | green bars=start/end"
             )
             if _repair_gap_regions(self.match):
                 text += " | pink/amber bands = OTB4 repaired or detected gap zones"
@@ -8795,14 +8852,14 @@ class PlotRowWidget:
                 for line in region.lines:
                     line.setPen(pg.mkPen(color=gap_line, width=1.0, style=QtCore.Qt.PenStyle.DashLine))
                 self.plot.addItem(region)
-            if self.row_role in {"sync", "probe_detail"}:
-                device = str(self.context.get("device") or "") if self.row_role == "probe_detail" else None
+            if self.row_role == "probe_detail":
                 marker_colors = {
                     "confirmed": "#1F7A4D",
                     "partial": "#A06A00",
                     "missing": "#B42318",
                 }
                 shift = float(_match_plot_shifts(self.match).get("otb4", 0.0))
+                device = str(self.context.get("device") or "")
                 for marker in _expected_sync_markers(self.match, device=device):
                     status = str(marker.get("status") or "missing")
                     line = pg.InfiniteLine(
@@ -8817,6 +8874,37 @@ class PlotRowWidget:
                     )
                     line.setZValue(-6)
                     self.plot.addItem(line)
+            elif self.row_role == "sync":
+                # Matched-pulse status as filled circles at a fixed negative
+                # y (below the lowest channel band, channel 3) instead of
+                # full-height vertical lines: green=confirmed, amber=partial,
+                # open white circle=missing (unmatched).
+                shift = float(_match_plot_shifts(self.match).get("otb4", 0.0))
+                fill_colors = {"confirmed": "#1F7A4D", "partial": "#D9A400"}
+                xs: List[float] = []
+                brushes = []
+                pens = []
+                for marker in _expected_sync_markers(self.match):
+                    status = str(marker.get("status") or "missing")
+                    xs.append(float(marker.get("time_sec") or 0.0) + shift)
+                    if status in fill_colors:
+                        color = fill_colors[status]
+                        brushes.append(pg.mkBrush(color))
+                        pens.append(pg.mkPen(color, width=1.5))
+                    else:
+                        brushes.append(pg.mkBrush("#FFFFFF"))
+                        pens.append(pg.mkPen("#7D8597", width=1.5))
+                if xs:
+                    scatter = pg.ScatterPlotItem(
+                        x=xs,
+                        y=[_SYNC_CHANNEL_MARKER_Y] * len(xs),
+                        size=10,
+                        symbol="o",
+                        brush=brushes,
+                        pen=pens,
+                    )
+                    scatter.setZValue(-4)
+                    self.plot.addItem(scatter)
             footer_lines.append(_plot_source_files_text(self.match, self.row_role, self.series_specs))
             footer_lines.append(_plot_decision_context_text(self.match, self.row_role, self.series_specs))
         else:
