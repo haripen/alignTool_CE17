@@ -269,6 +269,25 @@ def _file_numeric_index(path_or_text: Any) -> Optional[int]:
     return None
 
 
+def _c3d_setting_number(path_or_text: Any) -> Optional[int]:
+    """Trial number embedded in a Vicon C3D filename, e.g. Setting_12.c3d -> 12.
+
+    Distinct from _file_numeric_index (which only recognizes the OTB4/TSV
+    "File_" naming convention): C3D files here use "Setting_NN", and its
+    number corresponds 1:1 with the TSV "File_0NN" number -- it does NOT
+    correspond to the OTB4 "File_NN" number (OTB4 and C3D numbering run
+    independently; e.g. OTB4 File_02 pairs with C3D Setting_01).
+    """
+    stem = Path(str(path_or_text or "")).stem
+    m = re.search(r"setting[_-]?0*(\d+)(?:_|$)", stem, flags=re.IGNORECASE)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            return None
+    return None
+
+
 # Old OTB4 naming convention with no number field between "File" and the
 # capture timestamp, e.g. "File__20260707_143120_451.otb4" (double
 # underscore). Current convention inserts a sequence number there, e.g.
@@ -4821,6 +4840,8 @@ def _match_tsv_records(
             c3d_rel = np.asarray(c3d_edges[:n_ref], dtype=float)
             template_ref = (((otb_rel - otb_rel[0]) + (c3d_rel - c3d_rel[0])) / 2.0).tolist()
 
+        expected_tsv_num = _c3d_setting_number(match["c3d"]["path"])
+
         ranked_candidates: List[Tuple[float, SyncRecord, float, float, float]] = []
         for rec in local_candidates:
             if rec.path in used:
@@ -4843,9 +4864,15 @@ def _match_tsv_records(
             ranked_candidates.append((cheap_score, rec, start_delta, end_delta, filename_delta))
         ranked_candidates.sort(key=lambda item: item[0])
 
-        best: Optional[Tuple[float, SyncRecord, float, Dict[str, Any], Dict[str, Any], Dict[str, Any]]] = None
+        best: Optional[Tuple[Tuple[int, float], SyncRecord, float, Dict[str, Any], Dict[str, Any], Dict[str, Any], bool]] = None
         best_diag: Optional[Tuple[SyncRecord, float, Optional[float], Optional[float], Optional[float], str]] = None
-        shortlist = ranked_candidates[: min(3, len(ranked_candidates))]
+        # Evaluate every candidate inside the coarse +/-180s time window, not just
+        # the top-3 by timestamp proximity: a genuine TSV/C3D pair can have a large
+        # apparent timestamp offset (TSV capture-PC clock drift on a specific file)
+        # while still having near-perfect raw CoP correlation and sync-bridge
+        # agreement -- capping the shortlist by timestamp score alone can silently
+        # exclude the correct candidate before its content evidence is ever seen.
+        shortlist = ranked_candidates
         for _cheap_score, rec, start_delta, end_delta, filename_delta in shortlist:
             rec_json = rec.to_json()
             raw_result = dict(_best_tsv_raw_alignment(rec_json, match["c3d"], preferred_pairs=preferred_pairs))
@@ -4855,6 +4882,7 @@ def _match_tsv_records(
                 bridge = _tsv_bridge_sync_alignment(rec.edge_times_sec, c3d_bridge_edges)
             bridge_ok = bool(bridge and bridge.get("quality") in ("certain", "probable"))
             used_bridge = False
+            bridge_cop_conflict = False
             if bridge_ok:
                 # The dedicated 3_Sync_50ms bridge is the required primary path for
                 # TSV<->C3D alignment (present on every recording); raw CoP
@@ -4935,8 +4963,47 @@ def _match_tsv_records(
             else:
                 raw_penalty = (2.0 if raw_result.get("quality") == "excellent" else 6.0) + 0.15 * abs(float(raw_result.get("lag_sec") or 0.0))
             score = start_delta + end_delta + duration_penalty + 0.01 * filename_delta + raw_penalty
-            if best is None or score < best[0]:
-                best = (score, rec, filename_delta, rec_json, raw_result, bridge)
+            # Content evidence (raw CoP correlation, sync-bridge shift) is far more
+            # reliable than filename/timestamp proximity: the TSV capture PC's clock
+            # can drift independently of the OTB4/C3D naming clock, inflating
+            # start_delta/end_delta for an otherwise-correct match. A candidate whose
+            # content evidence is strong AND uncontradicted is preferred outright over
+            # any candidate that only looks good on timestamp proximity; score is only
+            # used to break ties within the same confirmation tier.
+            bridge_shift_val = bridge.get("shift_sec") if bridge else None
+            strong_bridge = (
+                bridge_ok
+                and not bridge_cop_conflict
+                and isinstance(bridge_shift_val, (int, float))
+                and abs(float(bridge_shift_val)) <= 2.0
+            )
+            strong_raw = (
+                not bridge_cop_conflict
+                and isinstance(raw_corr, (int, float))
+                and abs(float(raw_corr)) >= 0.95
+            )
+            content_confirmed = strong_bridge or strong_raw
+            # The C3D "Setting_NN" <-> TSV "File_0NN" number correspondence is a
+            # confirmed-correct ground truth for this recording convention (unlike
+            # timestamp proximity, which can be thrown off by TSV capture-PC clock
+            # drift on individual files). Raw CoP shape and even the sync bridge can
+            # both be fooled by a repeated/cyclic protocol matching a *neighboring*
+            # trial almost as well as the true one -- so a content-confirmed AND
+            # number-matched candidate is preferred outright over a content-confirmed
+            # candidate that only agrees by shape/bridge with the wrong trial.
+            tsv_num = _file_numeric_index(rec.path)
+            number_matched = (
+                expected_tsv_num is not None and tsv_num is not None and tsv_num == expected_tsv_num
+            )
+            if number_matched and content_confirmed:
+                tier = 0
+            elif content_confirmed:
+                tier = 1
+            else:
+                tier = 2
+            sort_key = (tier, score)
+            if best is None or sort_key < best[0]:
+                best = (sort_key, rec, filename_delta, rec_json, raw_result, bridge, content_confirmed)
         if best is None:
             reason = "No TSV candidate passed the time-window and raw-match filters."
             if best_diag is not None:
@@ -4952,7 +5019,8 @@ def _match_tsv_records(
             match["alignment"]["tsv_skip_reason"] = reason
             log_lines.append(f"[tsv-match] match {match['match_id']:03d}: {reason}")
             continue
-        score, rec, filename_delta, rec_json, raw_result, best_bridge = best
+        sort_key, rec, filename_delta, rec_json, raw_result, best_bridge, best_content_confirmed = best
+        score = sort_key[1]
         dedicated = _dedicated_sync_agreement(
             {
                 **match,
@@ -4965,14 +5033,14 @@ def _match_tsv_records(
                 },
             }
         )
-        bridge_certain_override = bool(best_bridge and best_bridge.get("quality") == "certain")
-        if score > 8.0 and bridge_certain_override:
+        if score > 8.0 and best_content_confirmed:
             log_lines.append(
-                f"[tsv-sync-bridge] match {match['match_id']:03d}: {Path(rec.path).name} score={score:.3f} exceeded "
-                f"the coarse time-window threshold, but the dedicated {SYNC_C3D_TSV_BRIDGE_LABEL} sync bridge is "
-                f"certain (matched={best_bridge.get('matched_count')} mean_abs={best_bridge.get('mean_abs_ms')}ms "
-                f"max_abs={best_bridge.get('max_abs_ms')}ms) -- likely a source-clock offset between the TSV capture "
-                f"PC and the OTB4/C3D naming clock rather than a wrong candidate. Accepting on bridge evidence."
+                f"[tsv-content-confirmed] match {match['match_id']:03d}: {Path(rec.path).name} score={score:.3f} exceeded "
+                f"the coarse time-window threshold, but raw CoP correlation and/or the dedicated "
+                f"{SYNC_C3D_TSV_BRIDGE_LABEL} sync bridge (corr={raw_result.get('cop_corr_diag') if raw_result.get('cop_corr_diag') is not None else raw_result.get('corr')} "
+                f"bridge_shift={best_bridge.get('shift_sec') if best_bridge else 'n/a'}) confirm this candidate uncontradicted -- "
+                f"likely a source-clock offset between the TSV capture PC and the OTB4/C3D naming clock rather than a "
+                f"wrong candidate. Accepting on content evidence."
             )
         elif score > 8.0:
             reason = (
