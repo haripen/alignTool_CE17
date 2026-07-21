@@ -17,6 +17,8 @@ from sync_alignment_tool import (
     _discover_sync_channel_candidates,
     _resolve_sync_channel_roles,
     _available_global_pair_options,
+    _apply_tracebio_paths_root_override,
+    TRACEBIO_PATHS_ROOT_DEFAULT,
 )
 
 
@@ -340,7 +342,48 @@ def _pick_preferred_pairs(scan_dir: Path, parent) -> list | None:
     return [chosen] if chosen.get("kind") == "raw" else []
 
 
+def _pick_tracebio_paths_root(parent) -> str | None:
+    """Confirm the shared traceBio corridor/path-file folder once at startup
+    instead of only discovering it's missing deep into MAT export or
+    per-match review (where it previously showed up as a reactive per-file
+    browse dialog). Silent when the default network location is reachable;
+    only prompts when it isn't.
+    """
+    from PySide6 import QtWidgets
+
+    default_root = Path(TRACEBIO_PATHS_ROOT_DEFAULT)
+    if default_root.exists() and default_root.is_dir():
+        return str(default_root)
+
+    msg = QtWidgets.QMessageBox(parent)
+    msg.setIcon(QtWidgets.QMessageBox.Icon.Warning)
+    msg.setWindowTitle("traceBio Paths Folder Not Found")
+    msg.setText(f"The shared traceBio path-file folder was not found at:\n{default_root}")
+    msg.setInformativeText(
+        "This folder holds the traceBio corridor/path TSV files referenced by biofeedback "
+        "recordings' settings JSON (e.g. via a network share that may not be mapped right now). "
+        "Browse to the correct location, or Skip to be asked again per-file later only if a "
+        "specific path file turns out to be missing."
+    )
+    browse_btn = msg.addButton("Browse...", QtWidgets.QMessageBox.ButtonRole.AcceptRole)
+    msg.addButton("Skip", QtWidgets.QMessageBox.ButtonRole.RejectRole)
+    msg.exec()
+    if msg.clickedButton() is not browse_btn:
+        return None
+    start_dir = default_root.parent if default_root.parent.exists() else Path.home()
+    chosen = QtWidgets.QFileDialog.getExistingDirectory(
+        parent,
+        "Select traceBio Paths Folder",
+        str(start_dir),
+        QtWidgets.QFileDialog.Option.ShowDirsOnly,
+    )
+    return chosen or None
+
+
 def _pick_matching_preferences(scan_dir: Path, parent) -> dict | None:
+    tsv_present = any(_iter_source_files(scan_dir, ".tsv", excluded_dir_names=("matched", "accepted", "__pycache__", ".git")))
+    tracebio_paths_root = _pick_tracebio_paths_root(parent) if tsv_present else None
+
     if not any(_iter_source_files(scan_dir, ".otb4", excluded_dir_names=("matched", "accepted", "__pycache__", ".git"))):
         return {
             "preferred_channel_pairs": [],
@@ -349,6 +392,7 @@ def _pick_matching_preferences(scan_dir: Path, parent) -> dict | None:
             "plausible_sync_pulse_durations_ms": [],
             "sync_decrement_ms": None,
             "plausible_sync_decrements_ms": [],
+            "tracebio_paths_root": tracebio_paths_root,
         }
 
     sync_channel_map = _pick_sync_channel_map(scan_dir, parent)
@@ -398,6 +442,7 @@ def _pick_matching_preferences(scan_dir: Path, parent) -> dict | None:
         "plausible_sync_pulse_durations_ms": plausible,
         "sync_decrement_ms": float(selected_decrement_ms),
         "plausible_sync_decrements_ms": plausible_decrements,
+        "tracebio_paths_root": tracebio_paths_root,
     }
 
 
@@ -484,6 +529,11 @@ def main() -> int:
     if scan_dir is None or export_dir is None:
         print("Cancelled.")
         return 1
+    # Applies regardless of whether the scan below is reused from cache or run
+    # fresh -- a reused scan skips analyze_folder (where this would otherwise
+    # also get applied), but traceBio export/review-time file resolution
+    # still needs it in this process.
+    _apply_tracebio_paths_root_override(match_options)
 
     reused = _reuse_existing_scan(scan_dir, export_dir, match_options=match_options)
     if reused is not None:

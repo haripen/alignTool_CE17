@@ -134,6 +134,30 @@ def _apply_sync_channel_overrides(match_options: Optional[Dict[str, Any]]) -> No
         SYNC_TSV_EXACT_SUFFIX = _SYNC_CHANNEL_DEFAULTS["SYNC_TSV_EXACT_SUFFIX"]
 
 
+# Shared network location where the BiofeedbackUI application keeps its
+# traceBio corridor/path TSV files (referenced by a recording's settings
+# JSON via "SelectedPath"). These are protocol-level files reused across
+# sessions, not per-session artifacts, so this fixed root is tried before
+# falling back to the reactive per-match "browse for it" prompt.
+TRACEBIO_PATHS_ROOT_DEFAULT = r"U:\Data_HP\BiofeedbackUi\BiofeedbackUI_latest\paths"
+TRACEBIO_PATHS_ROOT: str = TRACEBIO_PATHS_ROOT_DEFAULT
+
+
+def _apply_tracebio_paths_root_override(match_options: Optional[Dict[str, Any]]) -> None:
+    """Reassign the module-level traceBio paths-folder root, mirroring
+    `_apply_sync_channel_overrides`. Set from `match_options["tracebio_paths_root"]`
+    (confirmed at startup by match_files.py's picker, only shown when the
+    default network location isn't reachable) or reset to the hardcoded
+    default. Must also be called directly from match_files.py's `main()`,
+    not only from `analyze_folder`, because a reused cached scan skips
+    `analyze_folder` entirely but still needs this for later traceBio export/
+    review-time file resolution in the same process.
+    """
+    global TRACEBIO_PATHS_ROOT
+    override = (match_options or {}).get("tracebio_paths_root")
+    TRACEBIO_PATHS_ROOT = str(override) if override else TRACEBIO_PATHS_ROOT_DEFAULT
+
+
 def _otb4_probe_diag_cache_key(path: str, step_sec: Optional[float] = None) -> str:
     suffix = "auto" if step_sec in (None, "") else f"{float(step_sec):.6f}"
     return f"{path}|step={suffix}"
@@ -5093,6 +5117,7 @@ def _derive_preferred_pairs_from_matches(matches: Sequence[Dict[str, Any]]) -> L
 def analyze_folder(folder: Path, match_options: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     folder = folder.resolve()
     _apply_sync_channel_overrides(match_options)
+    _apply_tracebio_paths_root_override(match_options)
     log_lines: List[str] = []
     log_lines.append(f"[{_now_iso()}] Scan start: {folder}")
     if (match_options or {}).get("sync_channel_map"):
@@ -6720,6 +6745,19 @@ def _tracebio_paths_roots(match: Dict[str, Any]) -> List[Path]:
         _add_file_related_roots(settings_path)
 
     _add_file_related_roots((match.get("tsv") or {}).get("path"))
+
+    if TRACEBIO_PATHS_ROOT:
+        try:
+            shared_root = Path(TRACEBIO_PATHS_ROOT).resolve()
+        except Exception:
+            shared_root = Path(TRACEBIO_PATHS_ROOT)
+        if (
+            shared_root.exists()
+            and shared_root.is_dir()
+            and all(str(shared_root).lower() != str(existing).lower() for existing in roots)
+        ):
+            roots.append(shared_root)
+
     return roots
 
 
