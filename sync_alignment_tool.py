@@ -288,6 +288,30 @@ def _c3d_setting_number(path_or_text: Any) -> Optional[int]:
     return None
 
 
+def _device_camera_number(path_or_text: Any) -> Optional[int]:
+    """Camera/device number embedded as a standalone "cNN" token, e.g.
+    OTB4 "File_06_20260723_155828_481_c06.otb4" or TSV
+    "c06_File_008_20260723_155618.tsv" both -> 6.
+
+    Some projects name C3D trials in a way that carries no recoverable
+    sequence number at all (e.g. "FullTest06.c3d", where neither
+    _file_numeric_index's "File_NN" pattern nor _c3d_setting_number's
+    "Setting_NN" pattern matches), leaving OTB4<->TSV as the only reliable
+    numbered correspondence available. OTB4 and TSV filenames from those
+    projects both carry the same physical device/camera number as a "cNN"
+    token, so this is checked as an additional (not exclusive) signal
+    alongside _c3d_setting_number/_file_numeric_index.
+    """
+    stem = Path(str(path_or_text or "")).stem
+    m = re.search(r"(?:^|_)c0*(\d+)(?:_|$)", stem, flags=re.IGNORECASE)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            return None
+    return None
+
+
 # Old OTB4 naming convention with no number field between "File" and the
 # capture timestamp, e.g. "File__20260707_143120_451.otb4" (double
 # underscore). Current convention inserts a sequence number there, e.g.
@@ -4039,9 +4063,16 @@ def _apply_otb4_repairs(matches: List[Dict[str, Any]], log_lines: List[str]) -> 
         otb_path = Path(match["otb4"]["path"])
         fs = float(match["otb4"].get("sample_rate") or 2000.0)
         c3d_edges = match["c3d"].get("edge_times_sec") or []
-        base_pairwise = ((_triplet_spike_agreement([match["otb4"], match["c3d"]]).get("pairwise") or {}).get("otb4_vs_c3d") or {})
-        base_mean_ms = base_pairwise.get("mean_abs_ms")
-        base_max_ms = base_pairwise.get("max_abs_ms")
+        # Use the same skip-aware alignment the rest of the pipeline (review
+        # UI, export) relies on -- not a naive zero-skip pairwise comparison
+        # -- so a file that only needs a leading-edge skip (a normal, benign
+        # case) isn't mistaken for one that needs gap repair. The naive
+        # comparison here previously judged such files as badly misaligned
+        # and applied an unnecessary, harmful gap insertion instead of
+        # recognizing they were already excellently aligned via the skip.
+        base_edge_alignment = _select_otb4_c3d_edge_alignment(match)
+        base_mean_ms = base_edge_alignment.get("mean_abs_ms")
+        base_max_ms = base_edge_alignment.get("max_abs_ms")
         if isinstance(base_mean_ms, (int, float)) and isinstance(base_max_ms, (int, float)):
             if float(base_mean_ms) <= 20.0 and float(base_max_ms) <= 50.0:
                 match.setdefault("alignment", {})["otb4_repair"] = {
@@ -4137,7 +4168,7 @@ def _apply_otb4_repairs(matches: List[Dict[str, Any]], log_lines: List[str]) -> 
             )
 
         option_rows: List[Dict[str, Any]] = []
-        base_summary = _best_edge_alignment_summary(match["otb4"].get("edge_times_sec") or [], c3d_edges)
+        base_summary = base_edge_alignment
         option_rows.append(
             {
                 "name": "none",
@@ -5025,6 +5056,7 @@ def _match_tsv_records(
             template_ref = (((otb_rel - otb_rel[0]) + (c3d_rel - c3d_rel[0])) / 2.0).tolist()
 
         expected_tsv_num = _c3d_setting_number(match["c3d"]["path"])
+        expected_tsv_camera_num = _device_camera_number(match["otb4"]["path"])
 
         ranked_candidates: List[Tuple[float, SyncRecord, float, float, float]] = []
         for rec in local_candidates:
@@ -5167,17 +5199,25 @@ def _match_tsv_records(
                 and abs(float(raw_corr)) >= 0.95
             )
             content_confirmed = strong_bridge or strong_raw
-            # The C3D "Setting_NN" <-> TSV "File_0NN" number correspondence is a
-            # confirmed-correct ground truth for this recording convention (unlike
-            # timestamp proximity, which can be thrown off by TSV capture-PC clock
-            # drift on individual files). Raw CoP shape and even the sync bridge can
-            # both be fooled by a repeated/cyclic protocol matching a *neighboring*
-            # trial almost as well as the true one -- so a content-confirmed AND
-            # number-matched candidate is preferred outright over a content-confirmed
-            # candidate that only agrees by shape/bridge with the wrong trial.
+            # The C3D "Setting_NN" <-> TSV "File_0NN" number correspondence (or,
+            # for projects where the C3D filename carries no recoverable sequence
+            # number at all, the OTB4<->TSV "cNN" device/camera number) is
+            # confirmed-correct ground truth for these recording conventions
+            # (unlike timestamp proximity, which can be thrown off by TSV
+            # capture-PC clock drift on individual files). Raw CoP shape and even
+            # the sync bridge can both be fooled by a repeated/cyclic protocol
+            # matching a *neighboring* trial almost as well as the true one -- so
+            # a content-confirmed AND number-matched candidate is preferred
+            # outright over a content-confirmed candidate that only agrees by
+            # shape/bridge with the wrong trial.
             tsv_num = _file_numeric_index(rec.path)
+            tsv_camera_num = _device_camera_number(rec.path)
             number_matched = (
                 expected_tsv_num is not None and tsv_num is not None and tsv_num == expected_tsv_num
+            ) or (
+                expected_tsv_camera_num is not None
+                and tsv_camera_num is not None
+                and tsv_camera_num == expected_tsv_camera_num
             )
             if number_matched and content_confirmed:
                 tier = 0
@@ -8485,6 +8525,20 @@ def _repair_status_text(match: Dict[str, Any]) -> str:
     device_count = len([value for value in device_repairs.values() if (value.get("zones") or [])])
     if not repair:
         return f"OTB4 device-specific gap candidates detected on {device_count} device(s)."
+    if repair.get("repair_source") == "skipped_good_base_sync":
+        return (
+            f"OTB4 repair not needed: base OTB4/C3D sync is already good "
+            f"(mean {repair.get('base_mean_abs_ms')} ms, max {repair.get('base_max_abs_ms')} ms)."
+        )
+    if not repair.get("device") and not repair.get("subtitle"):
+        # matlab_ramp_gap_detection ran but selected_option == "none": no
+        # device/subtitle candidate had a usable gap-repair zone, as opposed
+        # to a real candidate that was found but withheld (handled below).
+        return (
+            f"OTB4 gap repair: no usable candidate found on any device "
+            f"(base mean {repair.get('base_mean_abs_ms')} ms, {repair.get('matched_edges') or 0} edges matched) | "
+            f"device candidates {device_count}."
+        )
     if not repair.get("applied"):
         return (
             f"OTB4 gap candidate via {repair.get('device')} {repair.get('subtitle')} | "
