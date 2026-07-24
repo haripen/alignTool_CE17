@@ -1149,10 +1149,25 @@ def _tsv_raw_channels(record: Dict[str, Any]) -> List[str]:
     return [c for c in (record.get("channel_names") or []) if str(c).lower().endswith(TSV_RAW_SUFFIX)]
 
 
+def _c3d_param_scalar(value: Any) -> float:
+    """Extract a single scalar from an ezc3d parameter 'value' array.
+
+    Vicon Nexus stores scalar/word-pair parameters (POINT:RATE,
+    ANALOG:RATE, TRIAL:ACTUAL_START_FIELD, ...) as 1D arrays, so `value[0]`
+    is already a 0-d scalar. Other exporters (e.g. Theia markerless c3d
+    output) store the same parameters as a column vector (shape (N, 1)
+    instead of (N,)), so `value[0]` is itself a length-1 array -- under
+    NumPy 2.x, int()/float() on that raises "only 0-dimensional arrays can
+    be converted to Python scalars". Flattening first makes this robust to
+    either layout.
+    """
+    return float(np.asarray(value, dtype=float).reshape(-1)[0])
+
+
 def _analog_time_from_c3d(c3d_file: ezc3d.c3d) -> np.ndarray:
-    point_rate = float(c3d_file["parameters"]["POINT"]["RATE"]["value"][0])
-    analog_rate = float(c3d_file["parameters"]["ANALOG"]["RATE"]["value"][0])
-    actual_start = int(c3d_file["parameters"]["TRIAL"]["ACTUAL_START_FIELD"]["value"][0])
+    point_rate = _c3d_param_scalar(c3d_file["parameters"]["POINT"]["RATE"]["value"])
+    analog_rate = _c3d_param_scalar(c3d_file["parameters"]["ANALOG"]["RATE"]["value"])
+    actual_start = int(_c3d_param_scalar(c3d_file["parameters"]["TRIAL"]["ACTUAL_START_FIELD"]["value"]))
     n_point_frames = c3d_file["data"]["points"].shape[2]
     point_frames = np.arange(n_point_frames) + actual_start
     time_c3d = point_frames / point_rate - 1.0 / point_rate
@@ -1266,8 +1281,8 @@ def _preferred_raw_pair_candidates(
 
 def _available_global_pair_options(folder: Path) -> List[Dict[str, Any]]:
     folder = Path(folder)
-    c3d_paths = _iter_source_files(folder, ".c3d", excluded_dir_names=("matched", "accepted", "__pycache__", ".git"))
-    tsv_paths = _iter_source_files(folder, ".tsv", excluded_dir_names=("matched", "accepted", "__pycache__", ".git"))
+    c3d_paths = _iter_source_files(folder, ".c3d", excluded_dir_names=("matched", "accepted", "theia", "__pycache__", ".git"))
+    tsv_paths = _iter_source_files(folder, ".tsv", excluded_dir_names=("matched", "accepted", "theia", "__pycache__", ".git"))
     if not c3d_paths or not tsv_paths:
         return [{"label": "Auto detect exact raw/sync pairs", "kind": "auto"}]
     try:
@@ -3047,7 +3062,7 @@ def _extract_c3d_record(path: Path) -> SyncRecord:
     point_labels = list(c3d["parameters"].get("POINT", {}).get("LABELS", {}).get("value", []))
     if "LABELS2" in c3d["parameters"].get("POINT", {}):
         point_labels += list(c3d["parameters"]["POINT"]["LABELS2"]["value"])
-    rate = float(c3d["parameters"]["ANALOG"]["RATE"]["value"][0])
+    rate = _c3d_param_scalar(c3d["parameters"]["ANALOG"]["RATE"]["value"])
     platform_notes: List[str] = ["C3D force-platform data is loaded on demand for raw alignment/export."]
     if SYNC_C3D_LABEL not in labels:
         ts = _parse_timestamp_from_name(path)
@@ -3161,7 +3176,7 @@ def _c3d_channel_edge_times(path: Path, channel_name: str) -> Tuple[float, ...]:
         labels = list(c3d["parameters"]["ANALOG"]["LABELS"]["value"])
         if channel_name not in labels:
             return ()
-        rate = float(c3d["parameters"]["ANALOG"]["RATE"]["value"][0])
+        rate = _c3d_param_scalar(c3d["parameters"]["ANALOG"]["RATE"]["value"])
         idx = labels.index(channel_name)
         arr = np.asarray(c3d["data"]["analogs"], dtype=float)
         subframes, n_channels, n_frames = arr.shape
@@ -3247,7 +3262,7 @@ def _ttl_channel_bounds(kind: str, path: Path) -> Dict[str, Optional[float]]:
             labels = list(c3d["parameters"]["ANALOG"]["LABELS"]["value"])
             if SYNC_C3D_TTL_LABEL not in labels:
                 return empty
-            fs = float(c3d["parameters"]["ANALOG"]["RATE"]["value"][0])
+            fs = _c3d_param_scalar(c3d["parameters"]["ANALOG"]["RATE"]["value"])
             idx = labels.index(SYNC_C3D_TTL_LABEL)
             arr = np.asarray(c3d["data"]["analogs"], dtype=float)
             subframes, n_channels, n_frames = arr.shape
@@ -3441,6 +3456,33 @@ def _tsv_numeric_column(df: pd.DataFrame, column: str) -> np.ndarray:
     return pd.to_numeric(df[column], errors="coerce").to_numpy(dtype=float)
 
 
+def _fill_tsv_column_gaps(values: np.ndarray) -> np.ndarray:
+    """Fill missing (NaN) samples in a TSV column, per-column and independent
+    of every other column. A column can start logging a few rows after
+    others (e.g. a CoP tracker that locks on late), leaving blank cells at
+    the top rather than from the start of the file. Leading gaps are
+    back-filled from the first valid value below them; any remaining
+    (trailing/interior) gaps are forward-filled from the last valid value
+    above. Only an entirely-empty column falls back to zero."""
+    arr = np.asarray(values, dtype=float)
+    s = pd.Series(arr)
+    if not s.notna().any():
+        return np.zeros(len(arr), dtype=float)
+    return s.bfill().ffill().to_numpy(dtype=float)
+
+
+def _first_valid_value(values: np.ndarray) -> Optional[float]:
+    arr = np.asarray(values, dtype=float)
+    finite = np.flatnonzero(np.isfinite(arr))
+    return float(arr[finite[0]]) if finite.size else None
+
+
+def _last_valid_value(values: np.ndarray) -> Optional[float]:
+    arr = np.asarray(values, dtype=float)
+    finite = np.flatnonzero(np.isfinite(arr))
+    return float(arr[finite[-1]]) if finite.size else None
+
+
 def _finite_count(values: np.ndarray) -> int:
     return int(np.sum(np.isfinite(np.asarray(values, dtype=float))))
 
@@ -3588,9 +3630,16 @@ def _extract_tsv_record(path: Path) -> SyncRecord:
     cols, df = _read_tsv_table(path)
     ts = _parse_timestamp_from_name(path)
     ts_vals = pd.to_numeric(df["ts"], errors="coerce").to_numpy(dtype=float) if not df.empty and "ts" in df.columns else None
-    first_ts = float(ts_vals[0]) if ts_vals is not None and len(ts_vals) else None
-    last_ts = float(ts_vals[-1]) if ts_vals is not None and len(ts_vals) else None
-    duration_sec = float(pd.to_numeric(df["t_rel"], errors="coerce").iloc[-1]) if not df.empty and "t_rel" in df.columns else None
+    # The "ts"/"t_rel" columns can themselves have blank cells on the first
+    # few rows (a column can start logging later than others), so take the
+    # first/last *valid* sample rather than assuming row 0 / row -1 are set.
+    first_ts = _first_valid_value(ts_vals) if ts_vals is not None else None
+    last_ts = _last_valid_value(ts_vals) if ts_vals is not None else None
+    duration_sec = (
+        _last_valid_value(pd.to_numeric(df["t_rel"], errors="coerce").to_numpy(dtype=float))
+        if not df.empty and "t_rel" in df.columns
+        else None
+    )
     if df.empty or not cols:
         return SyncRecord(
             path=str(path),
@@ -3641,15 +3690,14 @@ def _extract_tsv_record(path: Path) -> SyncRecord:
 
     col = sync_cols[0]
     x = pd.to_numeric(df[col], errors="coerce").to_numpy(dtype=float)
-    med = np.nanmedian(x) if np.any(np.isfinite(x)) else 0.0
-    x = np.nan_to_num(x, nan=med)
+    x = _fill_tsv_column_gaps(x)
     minv = float(np.nanmin(x))
     maxv = float(np.nanmax(x))
     notes = [f"Selected TSV sync column {col}."]
     if maxv - minv < 0.05:
         notes.append("Low dynamic range detected; sync is likely weak or missing.")
     if "t_rel" in df.columns:
-        t_rel = pd.to_numeric(df["t_rel"], errors="coerce").to_numpy(dtype=float)
+        t_rel = _fill_tsv_column_gaps(pd.to_numeric(df["t_rel"], errors="coerce").to_numpy(dtype=float))
         if len(t_rel) > 2 and np.all(np.isfinite(t_rel)) and np.median(np.diff(t_rel)) > 0:
             sample_rate = float(1.0 / np.median(np.diff(t_rel)))
         else:
@@ -3828,7 +3876,7 @@ def _c3d_sync_channel_candidates(paths: Sequence[Path], *, sample_limit: int = 3
         try:
             c3d = _c3d_forceplat_metadata(path)["c3d"]
             labels = list(c3d["parameters"]["ANALOG"]["LABELS"]["value"])
-            rate = float(c3d["parameters"]["ANALOG"]["RATE"]["value"][0])
+            rate = _c3d_param_scalar(c3d["parameters"]["ANALOG"]["RATE"]["value"])
             arr = np.asarray(c3d["data"]["analogs"], dtype=float)
         except Exception:
             continue
@@ -3868,15 +3916,18 @@ def _tsv_sync_channel_candidates(paths: Sequence[Path], *, sample_limit: int = 3
         if df.empty or "t_rel" not in df.columns:
             continue
         t_rel = pd.to_numeric(df["t_rel"], errors="coerce").to_numpy(dtype=float)
-        if len(t_rel) < 3 or not np.all(np.isfinite(t_rel[:3])):
+        # Don't require the leading rows specifically to be finite -- a
+        # column (including t_rel itself) can start logging a few rows late.
+        # Only skip the file if too few valid samples exist anywhere.
+        if _finite_count(t_rel) < 3:
             continue
+        t_rel = _fill_tsv_column_gaps(t_rel)
         for col in cols:
             col_l = str(col).lower()
             if "[sync]" not in col_l and "volt" not in col_l:
                 continue
             x = pd.to_numeric(df[col], errors="coerce").to_numpy(dtype=float)
-            med = float(np.nanmedian(x)) if np.any(np.isfinite(x)) else 0.0
-            x = np.nan_to_num(x, nan=med)
+            x = _fill_tsv_column_gaps(x)
             event_times_sec = _detect_tsv_spikes_with_template(x, t_rel)
             sig = _pulse_train_signature_from_events(event_times_sec)
             if sig is None:
@@ -3900,7 +3951,7 @@ def _discover_sync_channel_candidates(folder: Path, *, sample_limit: int = 3) ->
     call sites (primary pairing fallback, weak-pair rescue) invoke it once
     per analyze_folder run for the same folder.
     """
-    excluded = ("matched", "accepted", "__pycache__", ".git")
+    excluded = ("matched", "accepted", "theia", "__pycache__", ".git")
     otb4_paths = _iter_source_files(folder, ".otb4", excluded_dir_names=excluded)
     c3d_paths = _iter_source_files(folder, ".c3d", excluded_dir_names=excluded)
     tsv_paths = _iter_source_files(folder, ".tsv", excluded_dir_names=excluded)
@@ -4851,7 +4902,7 @@ def _pair_cost_value(
 def _infer_root_filename_clock_offset_sec(folder: Path) -> Optional[float]:
     samples: List[float] = []
     for suffix in (".tsv", ".otb4"):
-        for path in _iter_source_files(folder, suffix, excluded_dir_names=("matched", "accepted", "__pycache__", ".git")):
+        for path in _iter_source_files(folder, suffix, excluded_dir_names=("matched", "accepted", "theia", "__pycache__", ".git")):
             delta = _filename_clock_offset_sec(path)
             if delta is None:
                 continue
@@ -5645,7 +5696,7 @@ def analyze_folder(folder: Path, match_options: Optional[Dict[str, Any]] = None)
     tsv_records: List[SyncRecord] = []
     unmatched: List[Dict[str, Any]] = []
 
-    for path in _iter_source_files(folder, ".otb4", excluded_dir_names=("matched", "accepted", "__pycache__", ".git")):
+    for path in _iter_source_files(folder, ".otb4", excluded_dir_names=("matched", "accepted", "theia", "__pycache__", ".git")):
         rec = _extract_otb4_record(path, include_probe_sync_diagnostics=False)
         otb4_records.append(rec)
         log_lines.append(
@@ -5656,7 +5707,7 @@ def analyze_folder(folder: Path, match_options: Optional[Dict[str, Any]] = None)
             log_lines.append(f"  - {note}")
         _log_ttl_session_bounds("otb4", path, log_lines)
 
-    for path in _iter_source_files(folder, ".c3d", excluded_dir_names=("matched", "accepted", "__pycache__", ".git")):
+    for path in _iter_source_files(folder, ".c3d", excluded_dir_names=("matched", "accepted", "theia", "__pycache__", ".git")):
         rec = _extract_c3d_record(path)
         c3d_records.append(rec)
         log_lines.append(
@@ -5667,7 +5718,7 @@ def analyze_folder(folder: Path, match_options: Optional[Dict[str, Any]] = None)
             log_lines.append(f"  - {note}")
         _log_ttl_session_bounds("c3d", path, log_lines)
 
-    for path in _iter_source_files(folder, ".tsv", excluded_dir_names=("matched", "accepted", "__pycache__", ".git")):
+    for path in _iter_source_files(folder, ".tsv", excluded_dir_names=("matched", "accepted", "theia", "__pycache__", ".git")):
         rec = _extract_tsv_record(path)
         tsv_records.append(rec)
         log_lines.append(
@@ -6360,8 +6411,8 @@ def _c3d_metadata(path: Path) -> Dict[str, Any]:
     point_labels = list(c3d["parameters"].get("POINT", {}).get("LABELS", {}).get("value", []))
     if "LABELS2" in c3d["parameters"].get("POINT", {}):
         point_labels += list(c3d["parameters"]["POINT"]["LABELS2"]["value"])
-    analog_rate = float(c3d["parameters"]["ANALOG"]["RATE"]["value"][0])
-    point_rate = float(c3d["parameters"]["POINT"]["RATE"]["value"][0]) if "POINT" in c3d["parameters"] else None
+    analog_rate = _c3d_param_scalar(c3d["parameters"]["ANALOG"]["RATE"]["value"])
+    point_rate = _c3d_param_scalar(c3d["parameters"]["POINT"]["RATE"]["value"]) if "POINT" in c3d["parameters"] else None
     return {
         "c3d": c3d,
         "analog_labels": analog_labels,
@@ -6439,11 +6490,12 @@ def _load_tsv_channel(path: Path, channel_name: str) -> Tuple[np.ndarray, np.nda
         synth = _synth_tsv_performed_values(path, df)
         if synth is not None and np.any(np.isfinite(synth)):
             x = np.asarray(synth, dtype=float)
-    med = np.nanmedian(x) if np.any(np.isfinite(x)) else 0.0
-    x = np.nan_to_num(x, nan=med)
+    x = _fill_tsv_column_gaps(x)
     if "t_rel" in df.columns:
         t = pd.to_numeric(df["t_rel"], errors="coerce").to_numpy(dtype=float)
-        if not np.all(np.isfinite(t)) or len(t) != len(x):
+        if len(t) == len(x):
+            t = _fill_tsv_column_gaps(t)
+        else:
             t = np.arange(len(x), dtype=float)
     else:
         t = np.arange(len(x), dtype=float)
