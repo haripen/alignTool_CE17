@@ -5627,6 +5627,29 @@ def _build_pair_match_from_records(
     }
 
 
+def _build_single_source_match(record: Dict[str, Any], source_key: str, *, match_id: int) -> Dict[str, Any]:
+    """A match with only one surviving source (the other one/two were
+    released -- e.g. a faulty OTB4 dropped, leaving just C3D). There is
+    nothing to cross-validate against, so this always requires a manual
+    accept (see `_auto_accept_match`'s `not match.get("otb4")` branch, which
+    needs `raw_alignment_quality` to auto-accept -- absent here). Export
+    still works: `_build_inner_merge_alignment` degrades to this source's
+    own native range when it's the only one present.
+    """
+    match = {
+        "match_id": int(match_id),
+        "certainty": "manual",
+        "pair_cost": 0.0,
+        "otb4": dict(record) if source_key == "otb4" else None,
+        "c3d": dict(record) if source_key == "c3d" else None,
+        "tsv": dict(record) if source_key == "tsv" else None,
+        "alignment": {"source_mode": f"{source_key}_only", "sync_channel": None},
+    }
+    match["alignment"]["plot_time_shifts_sec"] = _match_plot_shifts(match)
+    match["alignment"]["inner_merge"] = _build_inner_merge_alignment(match)
+    return match
+
+
 def _evaluate_manual_tsv_selection(
     match: Dict[str, Any],
     tsv_record: Dict[str, Any],
@@ -6336,7 +6359,12 @@ def _match_source_keys(match: Dict[str, Any]) -> Tuple[str, ...]:
 
 
 def _mat_export_supported(match: Dict[str, Any]) -> bool:
-    return len(_match_source_keys(match)) >= 2
+    # A single surviving source (e.g. after releasing a faulty OTB4/C3D via
+    # the review UI) still has a valid native time window of its own --
+    # _build_inner_merge_alignment degrades to that source's own full range
+    # when only one source is present, so exporting it alone is safe and
+    # simply skips the per-pair struct builders for the missing sources.
+    return len(_match_source_keys(match)) >= 1
 
 
 def _tracebio_reconstruction_supported(match: Dict[str, Any]) -> bool:
@@ -9338,6 +9366,7 @@ def _ensure_unique_source_assignments(matches: Sequence[Dict[str, Any]]) -> None
 _PICKER_CANCEL = object()
 _PICKER_KEEP_CURRENT = object()
 _PICKER_CLEAR = object()
+_PICKER_RELEASE_ALL = object()
 
 
 class PlotRowWidget:
@@ -9642,6 +9671,12 @@ class ViewerWindow:
         self.add_row_btn = QtWidgets.QPushButton("+ Row")
         self.manual_match_btn = QtWidgets.QPushButton("Create Manual Match")
         self.edit_match_btn = QtWidgets.QPushButton("Set/Change Match Files")
+        self.release_match_btn = QtWidgets.QPushButton("Release Match")
+        self.release_match_btn.setToolTip(
+            "Release all sources of the current match, freeing them for manual re-assignment "
+            "(to this or another match). To release just one faulty source (e.g. OTB4) and keep "
+            "exporting the rest, use Set/Change Match Files and pick the release/None option instead."
+        )
         self.exit_btn = QtWidgets.QPushButton("Exit")
         self.export_mat_btn = QtWidgets.QPushButton("Export accepted MATs + full-rate traceBio")
         self.parallel_export_chk = QtWidgets.QCheckBox("Parallel export")
@@ -9663,6 +9698,7 @@ class ViewerWindow:
         actions_layout.addWidget(self.exit_btn, 3, 0)
         actions_layout.addWidget(self.export_mat_btn, 3, 1)
         actions_layout.addWidget(self.parallel_export_chk, 3, 2)
+        actions_layout.addWidget(self.release_match_btn, 4, 0)
         actions_layout.addWidget(self.worker_spin, 4, 2)
         left_layout.addWidget(self.actions_group, 0)
         self.left_scroll = QtWidgets.QScrollArea()
@@ -9808,6 +9844,7 @@ class ViewerWindow:
         self.add_row_btn.clicked.connect(self.add_plot_row)
         self.manual_match_btn.clicked.connect(self.add_manual_match)
         self.edit_match_btn.clicked.connect(self.edit_current_match)
+        self.release_match_btn.clicked.connect(self.release_current_match)
         self.exit_btn.clicked.connect(self.window.close)
         self.export_mat_btn.clicked.connect(self.export_current_mat)
         self.parallel_export_chk.toggled.connect(self.worker_spin.setEnabled)
@@ -9893,6 +9930,7 @@ class ViewerWindow:
             self.add_row_btn,
             self.manual_match_btn,
             self.edit_match_btn,
+            self.release_match_btn,
             self.exit_btn,
             self.export_mat_btn,
             self.parallel_export_chk,
@@ -10642,20 +10680,77 @@ class ViewerWindow:
         rebuilt["alignment"]["tsv_skip_reason"] = note
         self.matches[row] = rebuilt
 
+    def _detach_otb4_from_match(self, row: int, note: str) -> None:
+        """Release OTB4 from a triplet (e.g. it's faulty), keeping C3D and
+        TSV exactly as already aligned. C3D<->TSV alignment (dedicated
+        3_Sync_50ms bridge or raw CoP correlation) doesn't depend on OTB4 at
+        all, so it's preserved as-is rather than recomputed -- only the
+        OTB4-specific alignment fields are dropped and the shared time
+        window is recomputed for the smaller source set.
+        """
+        old_match = self.matches[row]
+        alignment = dict(old_match.get("alignment") or {})
+        for key in (
+            "otb4_c3d_edge_alignment", "otb4_repair", "otb4_device_repairs",
+            "dedicated_sync_quality", "dedicated_sync_pair_quality", "dedicated_sync_mean_abs_ms",
+            "dedicated_sync_max_abs_ms", "dedicated_sync_spike_count", "dedicated_sync_pairwise",
+            "sync_triplet_quality", "sync_triplet_spike_mean_abs_ms", "sync_triplet_spike_max_abs_ms",
+            "sync_triplet_spike_count", "sync_triplet_pairwise", "sync_triplet_waveform_quality",
+            "sync_triplet_waveform_pairwise", "sync_triplet_raw_corr_c3d_tsv",
+        ):
+            alignment.pop(key, None)
+        alignment["source_mode"] = "c3d_tsv" if old_match.get("tsv") else "c3d_only"
+        skips = dict(alignment.get("sync_edge_skips") or {})
+        skips["otb4"] = 0
+        alignment["sync_edge_skips"] = skips
+        rebuilt = dict(old_match)
+        rebuilt["otb4"] = None
+        rebuilt["alignment"] = alignment
+        alignment["plot_time_shifts_sec"] = _match_plot_shifts(rebuilt)
+        alignment["inner_merge"] = _build_inner_merge_alignment(rebuilt)
+        self._mark_match_for_manual_review(rebuilt, note)
+        self.matches[row] = rebuilt
+
     def _remove_match(self, row: int) -> Dict[str, Any]:
         return self.matches.pop(row)
+
+    def release_current_match(self) -> None:
+        from PySide6 import QtWidgets
+
+        if self._busy or self.current_match is None:
+            return
+        current_row = self._current_match_row()
+        if current_row is None:
+            return
+        label = self._match_brief_label(current_row)
+        result = QtWidgets.QMessageBox.question(
+            self.window,
+            "Release Match",
+            f"Release {label} entirely? Its OTB4/C3D/TSV files become available again for manual "
+            "re-assignment (to this or another match). This can be redone by re-picking the same "
+            "files via Set/Change Match Files or Create Manual Match.",
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.No,
+        )
+        if result != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+        self._remove_match(current_row)
+        self._recompute_source_availability()
+        self.mapping["matches"] = self.matches
+        next_row = min(current_row, len(self.matches) - 1)
+        self._persist_refresh_and_maybe_finish(selected_row=next_row if next_row >= 0 else None)
 
     def _build_manual_reassignment_plan(
         self,
         *,
-        c3d_record: Dict[str, Any],
-        otb4_record: Dict[str, Any],
+        c3d_record: Optional[Dict[str, Any]],
+        otb4_record: Optional[Dict[str, Any]],
         tsv_record: Optional[Dict[str, Any]],
         exclude_rows: Optional[Sequence[int]] = None,
     ) -> Dict[str, Any]:
         excluded = {int(row) for row in (exclude_rows or [])}
-        c3d_path = str(c3d_record.get("path") or "")
-        otb_path = str(otb4_record.get("path") or "")
+        c3d_path = str((c3d_record or {}).get("path") or "")
+        otb_path = str((otb4_record or {}).get("path") or "")
         tsv_path = str((tsv_record or {}).get("path") or "")
 
         c3d_rows = set(self._source_usage_map("c3d", exclude_rows=excluded).get(c3d_path, []))
@@ -10698,8 +10793,8 @@ class ViewerWindow:
         self,
         *,
         context_label: str,
-        c3d_record: Dict[str, Any],
-        otb4_record: Dict[str, Any],
+        c3d_record: Optional[Dict[str, Any]],
+        otb4_record: Optional[Dict[str, Any]],
         tsv_record: Optional[Dict[str, Any]],
         exclude_rows: Optional[Sequence[int]] = None,
         current_match: Optional[Dict[str, Any]] = None,
@@ -10838,25 +10933,67 @@ class ViewerWindow:
     def _build_manual_match(
         self,
         *,
-        c3d_record: Dict[str, Any],
-        otb4_record: Dict[str, Any],
+        c3d_record: Optional[Dict[str, Any]],
+        otb4_record: Optional[Dict[str, Any]],
         tsv_record: Optional[Dict[str, Any]],
         match_id: int,
         note: str,
     ) -> Tuple[Dict[str, Any], bool]:
-        manual_match = _build_pair_match_from_records(otb4_record, c3d_record, match_id=match_id)
-        manual_match["manual_selection"] = True
+        if otb4_record is not None and c3d_record is not None:
+            manual_match = _build_pair_match_from_records(otb4_record, c3d_record, match_id=match_id)
+            manual_match["manual_selection"] = True
+            manual_match.setdefault("alignment", {})["manual_selection"] = True
+            _apply_otb4_repairs([manual_match], [])
+            tsv_ok = True
+            if tsv_record is not None:
+                tsv_ok = _apply_manual_tsv_selection(
+                    manual_match,
+                    tsv_record,
+                    filename_clock_offset_sec=float(self.mapping.get("filename_clock_offset_sec") or 0.0),
+                )
+            self._mark_match_for_manual_review(manual_match, note)
+            return manual_match, bool(tsv_ok)
+
+        # Fewer than two of (otb4, c3d) survived -- e.g. a source was
+        # released down to a single remaining source, or TSV got paired
+        # with C3D while OTB4 was released in the same edit. There's no
+        # OTB4<->TSV alignment path (see _select_match_sources's block on
+        # that specific combo), so with OTB4 absent the only sources left
+        # to combine are C3D and/or TSV.
+        present = [
+            (key, record)
+            for key, record in (("otb4", otb4_record), ("c3d", c3d_record), ("tsv", tsv_record))
+            if record is not None
+        ]
+        if len(present) == 0:
+            raise ValueError("At least one source is required to build a match.")
+        if len(present) == 1 or (c3d_record is None):
+            # Single surviving source, or TSV-without-C3D (can't be aligned
+            # to anything without OTB4 or C3D) -- keep whichever single
+            # source is the most useful one available.
+            only_key, only_record = present[0] if len(present) == 1 else ("tsv", tsv_record)
+            manual_match = _build_single_source_match(only_record, only_key, match_id=match_id)
+            manual_match.setdefault("alignment", {})["manual_selection"] = True
+            self._mark_match_for_manual_review(manual_match, note)
+            return manual_match, len(present) == 1
+
+        # C3D and TSV both present, OTB4 absent, and this isn't a pure
+        # "keep C3D/TSV, only release OTB4" edit (that fast path is handled
+        # in edit_current_match via _detach_otb4_from_match, which preserves
+        # the existing C3D<->TSV alignment instead of rebuilding it). This
+        # branch is reached when a genuinely new C3D/TSV combination is
+        # picked with OTB4 released in the same step -- keep C3D only,
+        # since re-deriving a fresh C3D<->TSV correlation here would need
+        # the original SyncRecord objects that _evaluate_c3d_tsv_candidate
+        # requires, which aren't available from already-scanned match records.
+        manual_match = _build_single_source_match(c3d_record, "c3d", match_id=match_id)
         manual_match.setdefault("alignment", {})["manual_selection"] = True
-        _apply_otb4_repairs([manual_match], [])
-        tsv_ok = True
-        if tsv_record is not None:
-            tsv_ok = _apply_manual_tsv_selection(
-                manual_match,
-                tsv_record,
-                filename_clock_offset_sec=float(self.mapping.get("filename_clock_offset_sec") or 0.0),
-            )
+        manual_match["alignment"]["tsv_skip_reason"] = (
+            "Combining a released OTB4 with a newly picked TSV isn't supported in one step; "
+            "TSV was left unset here. Set TSV in a follow-up edit."
+        )
         self._mark_match_for_manual_review(manual_match, note)
-        return manual_match, bool(tsv_ok)
+        return manual_match, False
 
     def _select_match_sources(self, *, current_row: Optional[int]) -> Any:
         from PySide6 import QtWidgets
@@ -10897,27 +11034,31 @@ class ViewerWindow:
             return {"c3d": c3d_record, "otb4": otb4_record, "tsv": tsv_record}
 
         current_match = self.matches[current_row]
+        c3d_clear_label = "<Keep C3D Released>" if not current_match.get("c3d") else "<Release C3D>"
         c3d_record = self._choose_match_source(
             title="Set C3D",
-            prompt="Choose a C3D file for this match, or keep the current C3D.",
+            prompt="Choose a C3D file for this match, keep the current C3D, or release it.",
             records=self.source_records.get("c3d", []) or [],
             source_key="c3d",
             current_record=current_match.get("c3d"),
             exclude_rows=[current_row],
-            include_keep_current=True,
+            include_keep_current=bool(current_match.get("c3d")),
+            clear_label=c3d_clear_label,
         )
-        if c3d_record is _PICKER_CANCEL or c3d_record is None:
+        if c3d_record is _PICKER_CANCEL:
             return _PICKER_CANCEL
+        otb4_clear_label = "<Keep OTB4 Released>" if not current_match.get("otb4") else "<Release OTB4>"
         otb4_record = self._choose_match_source(
             title="Set OTB4",
-            prompt="Choose an OTB4 file for this match, or keep the current OTB4.",
+            prompt="Choose an OTB4 file for this match, keep the current OTB4, or release it (e.g. a faulty recording).",
             records=self.source_records.get("otb4", []) or [],
             source_key="otb4",
             current_record=current_match.get("otb4"),
             exclude_rows=[current_row],
-            include_keep_current=True,
+            include_keep_current=bool(current_match.get("otb4")),
+            clear_label=otb4_clear_label,
         )
-        if otb4_record is _PICKER_CANCEL or otb4_record is None:
+        if otb4_record is _PICKER_CANCEL:
             return _PICKER_CANCEL
         tsv_clear_label = "<Keep TSV Missing>" if not current_match.get("tsv") else "<Set TSV Missing>"
         tsv_record = self._choose_match_source(
@@ -10932,13 +11073,24 @@ class ViewerWindow:
         )
         if tsv_record is _PICKER_CANCEL:
             return _PICKER_CANCEL
+        if c3d_record is None and otb4_record is None and tsv_record is None:
+            return _PICKER_RELEASE_ALL
+        if c3d_record is None and otb4_record is not None and tsv_record is not None:
+            QtWidgets.QMessageBox.warning(
+                self.window,
+                "Unsupported Combination",
+                "OTB4 and TSV without C3D isn't supported automatically -- there's no direct OTB4<->TSV "
+                "alignment path (TSV is only ever bridged to OTB4 through C3D). Either keep C3D, or release "
+                "OTB4 or TSV too and use the Manual Sync Override panel to align the remaining pair by hand.",
+            )
+            return _PICKER_CANCEL
         return {"c3d": c3d_record, "otb4": otb4_record, "tsv": tsv_record}
 
     def _apply_manual_selection(
         self,
         *,
-        c3d_record: Dict[str, Any],
-        otb4_record: Dict[str, Any],
+        c3d_record: Optional[Dict[str, Any]],
+        otb4_record: Optional[Dict[str, Any]],
         tsv_record: Optional[Dict[str, Any]],
         selected_row: Optional[int],
         note: str,
@@ -11038,17 +11190,40 @@ class ViewerWindow:
         selected = self._select_match_sources(current_row=current_row)
         if selected is _PICKER_CANCEL:
             return
+        if selected is _PICKER_RELEASE_ALL:
+            self.release_current_match()
+            return
         c3d_record = selected["c3d"]
         otb4_record = selected["otb4"]
         tsv_record = selected["tsv"]
         old_c3d = str((current_match.get("c3d") or {}).get("path") or "")
         old_otb4 = str((current_match.get("otb4") or {}).get("path") or "")
         old_tsv = str((current_match.get("tsv") or {}).get("path") or "")
-        new_c3d = str(c3d_record.get("path") or "")
-        new_otb4 = str(otb4_record.get("path") or "")
+        new_c3d = str((c3d_record or {}).get("path") or "")
+        new_otb4 = str((otb4_record or {}).get("path") or "")
         new_tsv = str((tsv_record or {}).get("path") or "")
         if old_c3d == new_c3d and old_otb4 == new_otb4 and old_tsv == new_tsv:
             QtWidgets.QMessageBox.information(self.window, "Edit Match", "No source files were changed.")
+            return
+        if otb4_record is None and old_otb4 and new_c3d == old_c3d and new_tsv == old_tsv:
+            # Pure "release OTB4" -- C3D and TSV are exactly as before, so
+            # their existing alignment (dedicated bridge or raw correlation)
+            # is preserved rather than recomputed.
+            label = self._match_brief_label(current_row)
+            result = QtWidgets.QMessageBox.question(
+                self.window,
+                "Release OTB4",
+                f"Release OTB4 from {label}? The existing C3D{'/TSV' if old_tsv else ''} alignment is kept "
+                "as-is; OTB4 becomes available for manual re-assignment elsewhere.",
+                QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+                QtWidgets.QMessageBox.StandardButton.No,
+            )
+            if result != QtWidgets.QMessageBox.StandardButton.Yes:
+                return
+            self._detach_otb4_from_match(current_row, "OTB4 was manually released from this match.")
+            self._recompute_source_availability()
+            self.mapping["matches"] = self.matches
+            self._persist_refresh_and_maybe_finish(selected_row=current_row)
             return
         if not self._confirm_manual_reassignment(
             context_label=f"Re-matching {self._match_brief_label(current_row)} will update the current triplet.",
