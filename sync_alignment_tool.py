@@ -6780,7 +6780,7 @@ def _load_tsv_channel(path: Path, channel_name: str) -> Tuple[np.ndarray, np.nda
 
 def _channel_list_for_record(record: Dict[str, Any]) -> List[str]:
     names = record.get("channel_names") or []
-    if record["kind"] == "tsv":
+    if record.get("kind") == "tsv":
         return [n for n in names if n.lower() not in {"ts", "t_rel"}]
     return names
 
@@ -8513,20 +8513,133 @@ def _set_c3d_param_blocks(section: Dict[str, Any], base: str, values: Sequence[A
         section[key] = {"type": param_type, "description": "", "is_locked": False, "value": value}
 
 
-def _sync_c3d_emg_hint(text: str) -> Tuple[str, str]:
-    """For an OTB4 HD-EMG channel label, e.g. 'HD10MM0804 HD10MM0408 [MUSCLE:Tibialis
-    Anterior Muscle Right] ch3', returns (muscle_part, ch_number) = ('TA_R', '003')."""
+_MUSCLE_CODE_MAP = {
+    "tibialis anterior": "TA",
+    "soleus": "SOL",
+    "fibularis longus": "PER",
+    "fibularis": "PER",
+    "peroneus longus": "PER",
+    "peroneus": "PER",
+    "medial gastrocnemius": "MG",
+    "lateral gastrocnemius": "LG",
+    "gastrocnemius": "GA",
+}
+_MUSCLE_FILLER_WORDS = {"of", "head", "the"}
+
+
+def _sync_c3d_muscle_code(muscle_text: str) -> Tuple[str, str]:
+    """For a raw '[MUSCLE:...]' payload, e.g. 'Medial Head Of Gastrocnemius Right',
+    returns (side_letter, muscle_code) = ('R', 'MG'). Known muscle names (this
+    project's fixed vocabulary) map to a curated 2-3 letter code via
+    _MUSCLE_CODE_MAP; anything unrecognized falls back to word-initials (multi-word)
+    or a 3-letter abbreviation (single word) so unfamiliar muscle names still get a
+    short, deterministic code instead of crashing."""
+    words = [w for w in re.split(r"[^0-9A-Za-z]+", str(muscle_text)) if w]
+    side = ""
+    if words and words[-1].lower() in ("left", "right"):
+        side = words[-1][0].upper()
+        words = words[:-1]
+    words = [w for w in words if w.lower() not in _MUSCLE_FILLER_WORDS and w.lower() != "muscle"]
+    key = " ".join(w.lower() for w in words)
+    if key in _MUSCLE_CODE_MAP:
+        code = _MUSCLE_CODE_MAP[key]
+    elif len(words) > 1:
+        code = "".join(w[0].upper() for w in words)
+    elif words:
+        code = words[0][:3].upper()
+    else:
+        code = ""
+    return side, code
+
+
+def _otb4_assign_device_numbers(originals: Sequence[str]) -> Tuple[List[Optional[int]], Dict[int, str]]:
+    """Detects physical OTB4 device groups (Muovi/Muovi+ amplifier units) from the
+    raw channel label sequence and assigns each a running 1-based device number, in
+    order of first appearance. Only the IMU/Buffer/Ramp entries carry an explicit
+    'Muovi[+] N' tag in their own text; each preceding HD-EMG muscle block is
+    untagged in isolation, but is immediately followed (in the source device's
+    native channel order) by its own device's tagged IMU/Buffer/Ramp entries, so an
+    EMG block inherits the device number/family of the next tagged entry that
+    follows it before the next EMG block or a Syncstation section begins.
+
+    Returns (device_ids, device_families): device_ids[i] is the 1-based device
+    number for originals[i] (None for entries with no associated physical device,
+    e.g. Syncstation); device_families maps device number -> family text ('Muovi'
+    or 'Muovi+')."""
+    n = len(originals)
+    device_tag_re = re.compile(r"^(Muovi\+?)\s+(\d+)\b", re.IGNORECASE)
+    tags: List[Optional[Tuple[str, str]]] = [None] * n
+    for i, label in enumerate(originals):
+        m = device_tag_re.match(str(label).strip())
+        if m:
+            tags[i] = (m.group(1), m.group(2))
+
+    tag_to_devnum: Dict[Tuple[str, str], int] = {}
+    device_families: Dict[int, str] = {}
+    for tag in tags:
+        if tag and tag not in tag_to_devnum:
+            devnum = len(tag_to_devnum) + 1
+            tag_to_devnum[tag] = devnum
+            device_families[devnum] = tag[0].upper()
+
+    device_ids: List[Optional[int]] = [None] * n
+    for i in range(n):
+        if tags[i] is not None:
+            device_ids[i] = tag_to_devnum[tags[i]]
+            continue
+        if "[muscle:" not in str(originals[i]).lower():
+            continue
+        for j in range(i, n):
+            if tags[j] is not None:
+                device_ids[i] = tag_to_devnum[tags[j]]
+                break
+            if "syncstation" in str(originals[j]).lower():
+                break
+    return device_ids, device_families
+
+
+def _sync_c3d_otb4_label(original: str, device_id: Optional[int], device_family: Optional[str], global_idx: int, max_len: int = 48) -> str:
+    """Builds the C3D-style short label for one raw OTB4 channel, e.g.:
+    HD-EMG channel   -> 'MUOVI+_dev4_EMG064_V_RMG_ch0192'
+    IMU quaternion   -> 'MUOVI+_dev4_IMU1_Quaternion_ch0193'
+    IMU buffer/ramp  -> 'MUOVI+_dev4_Buffer_ch0197' / '..._Ramp_ch0198'
+    Sync station AUX -> 'Sync_Station_AUX2_V_Sync1ms_ch0200'
+    Sync station ctl -> 'Sync_Station_ControlSignal_ch0202'
+    `global_idx` is the 1-based position of this channel within the FULL OTB4
+    channel list (unique across the whole file, guaranteeing label uniqueness even
+    though the device-local EMG electrode number resets per muscle)."""
+    text = str(original)
+    lower = text.lower()
+    family = (device_family or "OTB").upper()
+    dev_part = f"dev{device_id}_" if device_id else ""
+
     muscle_match = re.search(r"\[MUSCLE:\s*([^\]]*)\]", text, re.IGNORECASE)
-    muscle_part = ""
     if muscle_match:
-        words = [w for w in re.split(r"[^0-9A-Za-z]+", muscle_match.group(1)) if w and w.lower() != "muscle"]
-        if len(words) > 1:
-            muscle_part = "".join(w[0].upper() for w in words[:-1]) + "_" + words[-1][0].upper()
-        elif words:
-            muscle_part = words[0][:3].upper()
-    ch_match = re.search(r"\bch\s*(\d+)\b", text, re.IGNORECASE)
-    ch_number = f"{int(ch_match.group(1)):03d}" if ch_match else "000"
-    return muscle_part, ch_number
+        side, code = _sync_c3d_muscle_code(muscle_match.group(1))
+        ch_match = re.search(r"\bch\s*(\d+)\b", text, re.IGNORECASE)
+        local_ch = int(ch_match.group(1)) if ch_match else 0
+        muscle_code = f"{side}{code}" if (side or code) else "UNK"
+        return f"{family}_{dev_part}EMG{local_ch:03d}_V_{muscle_code}_ch{global_idx:04d}"[:max_len]
+
+    if "syncstation" in lower:
+        aux_match = re.search(r"\bAUX\s*(\d+)\b", text, re.IGNORECASE)
+        if aux_match:
+            aux_tag = {"1": "TTL", "2": "Sync1ms", "3": "Sync50ms"}.get(aux_match.group(1), f"AUX{aux_match.group(1)}")
+            return f"Sync_Station_AUX{aux_match.group(1)}_V_{aux_tag}_ch{global_idx:04d}"[:max_len]
+        if "control signal" in lower:
+            return f"Sync_Station_ControlSignal_ch{global_idx:04d}"[:max_len]
+        hint = _sync_c3d_generic_hint(text) or "Signal"
+        return f"Sync_Station_{hint}_ch{global_idx:04d}"[:max_len]
+
+    if "quaternion" in lower:
+        return f"{family}_{dev_part}IMU1_Quaternion_ch{global_idx:04d}"[:max_len]
+    if "buffer" in lower:
+        return f"{family}_{dev_part}Buffer_ch{global_idx:04d}"[:max_len]
+    if "ramp" in lower:
+        return f"{family}_{dev_part}Ramp_ch{global_idx:04d}"[:max_len]
+
+    hint = _sync_c3d_generic_hint(text)
+    return f"{family}_{dev_part}{hint}_ch{global_idx:04d}".rstrip("_")[:max_len]
 
 
 def _sync_c3d_generic_hint(text: str) -> str:
@@ -8545,27 +8658,10 @@ def _sync_c3d_generic_hint(text: str) -> str:
     return hint
 
 
-def _sync_c3d_short_label(original_label: str, kind: str, index: int, used: set[str], max_len: int = 30) -> str:
-    """Short, C3D-idiomatic, collision-free label. The full original text always goes
-    into DESCRIPTIONS unmodified; this is only the mnemonic short display label.
-    Uniqueness is guaranteed by the running index alone (each `kind` has its own
-    counter), so the hint suffix is free-form and best-effort.
-
-    kind='emg'  -> 'EMG_<0000>_<muscle initials>_<side>_<ch number>'   e.g. EMG_0001_TA_R_001
-    kind='tsv'  -> 'TraceBFB_<00>_<hint>'                              e.g. TraceBFB_01_desired
-    kind='otb'  -> 'OTB_<0000>_<hint>'                                 (other OTB4 tracks: sync/control/IMU)
-    """
-    text = str(original_label)
-    if kind == "emg":
-        muscle_part, ch_number = _sync_c3d_emg_hint(text)
-        parts = [p for p in (muscle_part, ch_number) if p]
-        candidate = "_".join([f"EMG_{index:04d}", *parts])
-    elif kind == "tsv":
-        hint = _sync_c3d_generic_hint(text)
-        candidate = f"TraceBFB_{index:02d}_{hint}".rstrip("_")
-    else:
-        hint = _sync_c3d_generic_hint(text)
-        candidate = f"OTB_{index:04d}_{hint}".rstrip("_")
+def _sync_c3d_dedupe_label(candidate: str, used: set[str], max_len: int) -> str:
+    """Appends a numeric suffix if `candidate` collides with an already-used label.
+    Every label produced by this module already embeds a unique running index, so
+    this is a defensive fallback rather than the primary uniqueness mechanism."""
     candidate = candidate[:max_len]
     base = candidate
     suffix = 1
@@ -8575,6 +8671,15 @@ def _sync_c3d_short_label(original_label: str, kind: str, index: int, used: set[
         suffix += 1
     used.add(candidate)
     return candidate
+
+
+def _sync_c3d_tsv_label(original_label: str, index: int, used: set[str], max_len: int = 30) -> str:
+    """'TraceBFB_<00>_<hint>', e.g. TraceBFB_01_desired. The full original text
+    always goes into DESCRIPTIONS unmodified; this is only the mnemonic short
+    display label."""
+    hint = _sync_c3d_generic_hint(str(original_label))
+    candidate = f"TraceBFB_{index:02d}_{hint}".rstrip("_")
+    return _sync_c3d_dedupe_label(candidate, used, max_len)
 
 
 def _sync_c3d_tsv_unit_hint(label: str) -> str:
@@ -8594,22 +8699,19 @@ def _sync_c3d_new_channel_plan(match: Dict[str, Any], bundle: Optional[Dict[str,
 
     otb_map = aligned["otb4"].get("label_map", {})
     otb_fields = [k for k in aligned["otb4"] if k != "label_map"]
-    emg_counter = 0
-    otb_counter = 0
-    for field in otb_fields:
-        original = otb_map.get(field, field)
-        is_emg = "[muscle:" in str(original).lower() or str(original).upper().startswith("HD10MM")
-        if is_emg:
-            emg_counter += 1
-            kind, idx = "emg", emg_counter
-        else:
-            otb_counter += 1
-            kind, idx = "otb", otb_counter
+    otb_originals = [otb_map.get(field, field) for field in otb_fields]
+    device_ids, device_families = _otb4_assign_device_numbers(otb_originals)
+    for global_idx, (field, original) in enumerate(zip(otb_fields, otb_originals), start=1):
+        device_id = device_ids[global_idx - 1]
+        short_label = _sync_c3d_otb4_label(
+            original, device_id, device_families.get(device_id) if device_id else None, global_idx
+        )
+        short_label = _sync_c3d_dedupe_label(short_label, used_labels, max_len=48)
         channels.append({
             "field": field,
             "source": "otb4",
             "original_label": original,
-            "short_label": _sync_c3d_short_label(original, kind, idx, used_labels),
+            "short_label": short_label,
             "description": str(original),
             "unit": "V",
             "data": np.asarray(aligned["otb4"][field], dtype=float),
@@ -8623,7 +8725,7 @@ def _sync_c3d_new_channel_plan(match: Dict[str, Any], bundle: Optional[Dict[str,
             "field": field,
             "source": "tsv",
             "original_label": original,
-            "short_label": _sync_c3d_short_label(original, "tsv", idx + 1, used_labels),
+            "short_label": _sync_c3d_tsv_label(original, idx + 1, used_labels),
             "description": str(original),
             "unit": _sync_c3d_tsv_unit_hint(original),
             "data": np.asarray(aligned["tsv"][field], dtype=float),
@@ -8669,6 +8771,20 @@ def _c3d_frame_aligned_crop(c3d: Any, bundle: Dict[str, Any]) -> Dict[str, Any]:
         c3d["data"]["rotations"] = np.asarray(rotations)[
             :, :, :, point_start * rotation_ratio : point_end_excl * rotation_ratio
         ]
+
+    # TRIAL:ACTUAL_START_FIELD/ACTUAL_END_FIELD are copied verbatim by
+    # ezc3d.c3d.write() (they aren't derived from the data arrays like the header's
+    # own first/last frame are) -- left stale, they still claim the ORIGINAL
+    # uncropped frame range, so software that trusts these fields over the actual
+    # array length will read past the real data and show garbage in every channel
+    # beyond the crop. Update them to the new cropped point-frame range.
+    trial = c3d["parameters"].get("TRIAL")
+    if trial is not None:
+        nb_point_frames = point_end_excl - point_start
+        if "ACTUAL_START_FIELD" in trial:
+            trial["ACTUAL_START_FIELD"]["value"] = np.asarray([1, 0], dtype=np.int64)
+        if "ACTUAL_END_FIELD" in trial:
+            trial["ACTUAL_END_FIELD"]["value"] = np.asarray([nb_point_frames, 0], dtype=np.int64)
 
     return {
         "pad_before": int(pad_before),
