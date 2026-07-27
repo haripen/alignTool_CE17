@@ -8800,10 +8800,6 @@ def _c3d_append_analog_channels(c3d: Any, new_channels: List[Dict[str, Any]]) ->
     descriptions = _flatten_param_blocks(analog, "DESCRIPTIONS") + [ch["description"] for ch in new_channels]
     units = _flatten_param_blocks(analog, "UNITS") + [ch["unit"] for ch in new_channels]
     scale = _flatten_param_blocks(analog, "SCALE") + [1.0 for _ in new_channels]
-    # ANALOG:OFFSET is unconditionally reset to 0 by ezc3d.c3d.write() regardless of
-    # the value stored here (verified against ezc3d 1.6.3) -- harmless for this
-    # project since real capture files already use OFFSET=0 uniformly, but documented
-    # here so it isn't mistaken for a bug in this function if audited later.
     offset = _flatten_param_blocks(analog, "OFFSET") + [0 for _ in new_channels]
 
     _set_c3d_param_blocks(analog, "LABELS", labels, -1)
@@ -8827,6 +8823,116 @@ def _c3d_append_analog_channels(c3d: Any, new_channels: List[Dict[str, Any]]) ->
     c3d["data"]["analogs"] = np.concatenate([old_analogs, new_stack], axis=1)
 
 
+_C3D_LABEL_PARAM_RE = re.compile(r"^LABELS\d*$")
+
+
+def _write_c3d_low_level(c3d: Any, out_path: Path) -> None:
+    """Writes `c3d` (an in-memory ezc3d.c3d wrapper, already cropped/mutated via the
+    high-level dict API) to disk using the low-level ezc3d SWIG API directly,
+    bypassing `ezc3d.c3d.write()`'s Python-level per-parameter copy loop.
+
+    That copy loop has a real, verified bug for ANALOG SCALE/UNITS/DESCRIPTIONS: it
+    only copies the bare (first) parameter block verbatim when its length equals the
+    *total* channel count -- which is structurally impossible once there are more
+    than 255 analog channels, since the bare block is itself capped at 255 by the
+    C3D format. Confirmed against a real project file: writing through the normal
+    `c3d.write(path)` path silently replaced the original 49 channels' real
+    ANALOG:UNITS ('N', 'Nmm', 'V', 'Hz', ...) and ANALOG:DESCRIPTIONS ('G3D forces
+    v1.x [10]', 'Analog EMG::Voltage [1,1]', ...) with blank strings for the entire
+    first 255-channel block (both the original channels AND the first ~200 new
+    ones), while the *2 continuation blocks were unaffected. ANALOG:OFFSET is
+    unconditionally excluded by that same loop regardless of length. Rebuilding the
+    file from scratch here, parameter-by-parameter, avoids all of these exclusions.
+    """
+    from ezc3d import ezc3d as _swig
+
+    storage_params = c3d["parameters"]
+    storage_data = c3d["data"]
+
+    point_labels = _flatten_param_blocks(storage_params["POINT"], "LABELS")
+    analog_labels = _flatten_param_blocks(storage_params["ANALOG"], "LABELS")
+
+    new_c3d = _swig.c3d()
+    new_c3d.header().firstFrame(c3d["header"]["points"]["first_frame"])
+
+    # Registering channels via point()/analog() (rather than writing a POINT/ANALOG
+    # LABELS parameter ourselves) lets the C++ engine auto-split LABELS/LABELS2/...
+    # correctly for >255 channels -- verified working; manually assigning an
+    # oversized single LABELS parameter instead produces a corrupt, unreadable file.
+    for label in point_labels:
+        new_c3d.point(label)
+    for label in analog_labels:
+        new_c3d.analog(label)
+
+    for group_name in storage_params.keys():
+        if group_name == "__METADATA__":
+            continue
+        group = storage_params[group_name]
+        meta = group.get("__METADATA__", {})
+        if not new_c3d.parameters().isGroup(group_name):
+            new_c3d.parameters().group(_swig.Group(group_name))
+        new_c3d.parameters().group(group_name).description(meta.get("DESCRIPTION", ""))
+        if meta.get("IS_LOCKED"):
+            new_c3d.parameters().group(group_name).lock()
+        else:
+            new_c3d.parameters().group(group_name).unlock()
+
+        for param_name in list(group.keys()):
+            if param_name == "__METADATA__":
+                continue
+            if group_name == "POINT" and param_name in ("USED", "FRAMES"):
+                continue  # auto-derived from the point() calls + data array shape
+            if group_name == "ANALOG" and param_name == "USED":
+                continue  # auto-derived from the analog() calls
+            if group_name in ("POINT", "ANALOG") and _C3D_LABEL_PARAM_RE.match(param_name):
+                continue  # LABELS/LABELS2/... handled via point()/analog() above
+
+            param = group[param_name]
+            value = param["value"]
+            ptype = param["type"]
+            new_param = _swig.Parameter(param_name, param.get("description", ""))
+            if ptype in (_swig.BYTE, _swig.INT):
+                if isinstance(value, np.ndarray):
+                    new_param.set(_swig.VecInt([int(x) for x in value.T.ravel()]), list(value.shape))
+                else:
+                    ints = [int(x) for x in value]
+                    new_param.set(_swig.VecInt(ints), [len(ints)])
+            elif ptype == _swig.FLOAT:
+                if isinstance(value, np.ndarray):
+                    new_param.set(_swig.VecDouble([float(x) for x in value.T.ravel()]), list(value.shape))
+                else:
+                    floats = [float(x) for x in value]
+                    new_param.set(_swig.VecDouble(floats), [len(floats)])
+            elif ptype == _swig.CHAR:
+                strings = [str(v) for v in value]
+                new_param.set(_swig.VecString(strings), [len(strings)])
+            else:
+                continue
+            new_c3d.parameter(group_name, new_param)
+            if param.get("is_locked"):
+                new_c3d.parameters().group(group_name).parameter(param_name).lock()
+
+    nb_points = len(point_labels)
+    points = np.asarray(storage_data["points"], dtype=float)
+    meta_points = storage_data.get("meta_points") or {}
+    residuals = meta_points.get("residuals")
+    if residuals is None or np.asarray(residuals).size == 0:
+        residuals = np.zeros((1, nb_points, points.shape[2]))
+    camera_masks = meta_points.get("camera_masks")
+    if camera_masks is None or np.asarray(camera_masks).size == 0:
+        camera_masks = np.zeros((7, nb_points, points.shape[2]), dtype=bool)
+    analogs = np.asarray(storage_data["analogs"], dtype=float)
+    rotations = storage_data.get("rotations")
+    if rotations is not None and np.asarray(rotations).size == 0:
+        rotations = None
+
+    new_c3d.import_numpy_data(
+        points, np.asarray(residuals, dtype=float), np.asarray(camera_masks, dtype=bool), analogs, rotations
+    )
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    new_c3d.write(str(out_path), _swig.WriteOptions(collapseStringMatrices=True, forceZeroBasedOnFrameCount=False))
+
+
 def _write_c3d_with_synced_channels(match: Dict[str, Any], out_path: Path) -> Dict[str, Any]:
     c3d_path = Path((match.get("c3d") or {})["path"])
     # Load a fresh instance -- never mutate the lru_cache'd _c3d_metadata(path)["c3d"]
@@ -8845,8 +8951,7 @@ def _write_c3d_with_synced_channels(match: Dict[str, Any], out_path: Path) -> Di
             ch["data"] = np.pad(np.asarray(ch["data"], dtype=float), (pad_before, pad_after), mode="edge")
 
     _c3d_append_analog_channels(c3d, plan["channels"])
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    c3d.write(str(out_path))
+    _write_c3d_low_level(c3d, out_path)
     return {"crop": crop_info, "channels": plan["channels"]}
 
 
