@@ -1589,10 +1589,186 @@ def _source_sync_offset(record: Dict[str, Any]) -> float:
     return float(edges[0]) if edges else 0.0
 
 
-def _sync_edge_skip_count(match: Dict[str, Any], source: str) -> int:
-    skips = ((match.get("alignment") or {}).get("sync_edge_skips") or {})
+_MANUAL_OVERRIDE_SOURCES = ("otb4", "c3d", "tsv")
+
+
+def _generic_channel_event_time_native(t: np.ndarray, y: np.ndarray) -> Optional[float]:
+    """Best-effort single reference-event time (native seconds, same clock as
+    `t`) for an arbitrary channel -- used to "snap" the manual sync override
+    to a real pulse/edge instead of asking the user to eyeball a raw number.
+    Tries, in order: wide-plateau pulse center (dedicated/cross-machine sync
+    trains), sparse spike/peak detection (pulse trains of >=4), then a single
+    level rise/fall (TTL-style channels). Returns None if none of those find
+    anything (e.g. a channel with no repeatable structure) -- the caller
+    falls back to a plain manually-typed offset in that case.
+    """
+    t = np.asarray(t, dtype=float).reshape(-1)
+    y = np.asarray(y, dtype=float).reshape(-1)
+    n = min(t.size, y.size)
+    if n < 3:
+        return None
+    t = t[:n]
+    y = y[:n]
+    finite = np.isfinite(t) & np.isfinite(y)
+    if int(np.sum(finite)) < 3:
+        return None
+    t = t[finite]
+    y = y[finite]
+    diffs = np.diff(t)
+    diffs = diffs[np.isfinite(diffs) & (diffs > 0)]
+    if diffs.size == 0:
+        return None
+    dt = float(np.median(diffs))
+    fs = 1.0 / dt if dt > 0 else 0.0
+    if fs <= 0:
+        return None
+    t0 = float(t[0])
     try:
-        return max(0, int(skips.get(source) or 0))
+        centers = _detect_pulse_center_edges(y, fs)
+        if centers:
+            return t0 + float(centers[0])
+    except Exception:
+        pass
+    try:
+        sig = _orient_signal(y)
+        amp = float(np.nanmax(sig)) if sig.size else 0.0
+        std = float(np.nanstd(sig))
+        peaks = _detect_sparse_spikes(
+            y,
+            fs,
+            prominence_grid=[max(std * 6.0, 1e-9), max(amp * 0.15, 1e-9), max(amp * 0.25, 1e-9)],
+            distance_grid_sec=[0.05, 0.2, 1.0],
+        )
+        if peaks:
+            return t0 + float(peaks[0])
+    except Exception:
+        pass
+    try:
+        bounds = _level_edge_bounds(y, fs)
+        if bounds.get("rise_sec") is not None:
+            return t0 + float(bounds["rise_sec"])
+        if bounds.get("fall_sec") is not None:
+            return t0 + float(bounds["fall_sec"])
+    except Exception:
+        pass
+    return None
+
+
+def _native_channel_event_time(match: Dict[str, Any], source: str, channel_label: str) -> Optional[float]:
+    """First detected event time (native seconds) for `channel_label` (one of
+    the display labels `_channel_options_for_record` produces) on `source`.
+    Reuses `_load_series_for_spec` in its native-time mode (apply_shift=False)
+    -- the same loader every plot row uses -- instead of re-implementing
+    per-source channel loading here.
+    """
+    record = match.get(source) or {}
+    if not record:
+        return None
+    spec = next(
+        (
+            opt_spec
+            for label, opt_spec in _channel_options_for_record(record)
+            if label == channel_label and opt_spec.get("kind") not in {"probe_buffer", "probe_ramp"}
+        ),
+        None,
+    )
+    if spec is None:
+        return None
+    try:
+        t, y = _load_series_for_spec(match, spec, apply_shift=False)
+    except Exception:
+        return None
+    return _generic_channel_event_time_native(np.asarray(t, dtype=float), np.asarray(y, dtype=float))
+
+
+def _manual_offsets_state(match: Dict[str, Any]) -> Dict[str, Any]:
+    """Read/initialize match["review"]["manual_offsets"] -- the user-facing
+    manual sync override (see the "Manual Sync Override" panel in the review
+    UI). "pair1" pins two sources together with a directional offset at a
+    user-chosen channel each; "pair2" optionally pins the third source
+    relative to one of pair1's two sources. Both default to None (no
+    override, fully automatic alignment).
+    """
+    review = match.setdefault("review", {})
+    state = review.get("manual_offsets")
+    if not isinstance(state, dict):
+        state = {"pair1": None, "pair2": None}
+        review["manual_offsets"] = state
+    state.setdefault("pair1", None)
+    state.setdefault("pair2", None)
+    return state
+
+
+def _manual_override_shifts(match: Dict[str, Any]) -> Optional[Dict[str, float]]:
+    """Explicit per-source aligned-time shifts (native + shift = aligned)
+    implied by the user-configured manual sync override, or None if no
+    override is active or it can't currently be resolved (e.g. a channel's
+    reference event can't be detected). Only returns entries for the
+    source(s) the override actually pins -- `_match_plot_shifts` fills in
+    the rest from the automatic pipeline.
+    """
+    state = (match.get("review") or {}).get("manual_offsets") or {}
+    pair1 = state.get("pair1")
+    if not isinstance(pair1, dict):
+        return None
+    source_a = pair1.get("source_a")
+    source_b = pair1.get("source_b")
+    channel_a = pair1.get("channel_a")
+    channel_b = pair1.get("channel_b")
+    offset_ab = pair1.get("offset_sec")
+    if source_a not in _MANUAL_OVERRIDE_SOURCES or source_b not in _MANUAL_OVERRIDE_SOURCES or source_a == source_b:
+        return None
+    if not channel_a or not channel_b or not isinstance(offset_ab, (int, float)):
+        return None
+    edge_a = _native_channel_event_time(match, str(source_a), str(channel_a))
+    edge_b = _native_channel_event_time(match, str(source_b), str(channel_b))
+    if edge_a is None or edge_b is None:
+        return None
+    shifts: Dict[str, float] = {
+        str(source_a): -float(edge_a),
+        str(source_b): float(offset_ab) - float(edge_b),
+    }
+
+    pair2 = state.get("pair2")
+    if isinstance(pair2, dict):
+        source_c = pair2.get("source_c")
+        reference = pair2.get("reference")
+        channel_c = pair2.get("channel_c")
+        channel_ref = pair2.get("channel_ref")
+        offset_cr = pair2.get("offset_sec")
+        ref_source = source_a if reference == "a" else source_b if reference == "b" else None
+        if (
+            source_c in _MANUAL_OVERRIDE_SOURCES
+            and source_c not in (source_a, source_b)
+            and ref_source is not None
+            and channel_c
+            and channel_ref
+            and isinstance(offset_cr, (int, float))
+        ):
+            edge_c = _native_channel_event_time(match, str(source_c), str(channel_c))
+            edge_ref = _native_channel_event_time(match, str(ref_source), str(channel_ref))
+            if edge_c is not None and edge_ref is not None:
+                aligned_ref_edge = float(edge_ref) + shifts[str(ref_source)]
+                target_aligned_c = aligned_ref_edge + float(offset_cr)
+                shifts[str(source_c)] = target_aligned_c - float(edge_c)
+    return shifts or None
+
+
+def _sync_edge_skip_count(match: Dict[str, Any], source: str) -> int:
+    alignment = match.get("alignment") or {}
+    skips = alignment.get("sync_edge_skips") or {}
+    value = skips.get(source)
+    if value is None and source in ("otb4", "c3d"):
+        # Some code paths (e.g. OTB4/C3D pairs with no TSV attached -- see
+        # the analyze_folder catch-all and _apply_otb4_repairs's "base sync
+        # already good" shortcut) only ever populate otb4_c3d_edge_alignment,
+        # not this dict. Falling back to the skip embedded there means the
+        # two can never silently drift apart (previously this returned 0
+        # regardless of the real skip, misapplying the sync anchor by whole
+        # pulse-cycle intervals for those pairs).
+        value = (alignment.get("otb4_c3d_edge_alignment") or {}).get(f"{source}_skip")
+    try:
+        return max(0, int(value or 0))
     except Exception:
         return 0
 
@@ -1898,6 +2074,17 @@ def _match_plot_shifts(match: Dict[str, Any]) -> Dict[str, float]:
     raw_shift = (match.get("alignment") or {}).get("raw_alignment_lag_sec")
     if raw_shift is not None:
         shifts["tsv"] = float(raw_shift) - c3d_ref
+    manual = _manual_override_shifts(match)
+    if manual:
+        old_c3d_shift = shifts["c3d"]
+        shifts.update(manual)
+        if "c3d" in manual and "tsv" not in manual:
+            # TSV's automatic placement above is always defined relative to
+            # C3D (either the raw-correlation lag or its own bridge edge,
+            # both anchored off c3d_ref) -- if C3D just moved because of a
+            # manual override, keep TSV riding along with it unless the user
+            # is separately pinning TSV via pair2.
+            shifts["tsv"] += shifts["c3d"] - old_c3d_shift
     return shifts
 
 
@@ -6702,7 +6889,7 @@ def _raw_series_specs(match: Dict[str, Any]) -> List[Dict[str, Any]]:
     return specs
 
 
-def _load_series_for_spec(match: Dict[str, Any], spec: Dict[str, Any]) -> Tuple[np.ndarray, np.ndarray]:
+def _load_series_for_spec(match: Dict[str, Any], spec: Dict[str, Any], *, apply_shift: bool = True) -> Tuple[np.ndarray, np.ndarray]:
     source = spec["source"]
     probe_shift_sec = 0.0
     if source == "otb4":
@@ -6737,6 +6924,13 @@ def _load_series_for_spec(match: Dict[str, Any], spec: Dict[str, Any]) -> Tuple[
         t, y = _load_tsv_channel(Path(match[source]["path"]), spec["channel"])
     else:
         raise ValueError(source)
+    if not apply_shift:
+        # Native-time mode (e.g. the manual sync override's snap-to-edge
+        # detection via _native_channel_event_time): callers that need the
+        # source's own local clock, not the aligned/plotted one -- computing
+        # the aligned shift here would recurse back into _match_plot_shifts,
+        # which calls _manual_override_shifts, which calls this function.
+        return t, y
     shift = float(_match_plot_shifts(match).get(source, 0.0))
     channel_num = spec.get("sync_channel_num")
     if isinstance(channel_num, int):
@@ -9566,7 +9760,11 @@ class ViewerWindow:
         self.header.setWordWrap(True)
         self.header.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
         self.header.setStyleSheet("QLabel { background:#FFFFFF; border:1px solid #D6DFE8; border-radius:12px; padding:12px; }")
-        self.detail_layout.addWidget(self.header)
+        header_row = QtWidgets.QHBoxLayout()
+        header_row.setSpacing(10)
+        header_row.addWidget(self.header, 1)
+        header_row.addWidget(self._build_manual_override_panel(), 0)
+        self.detail_layout.addLayout(header_row)
         self.match_files_info = QtWidgets.QLabel("")
         self.match_files_info.setWordWrap(False)
         self.match_files_info.setTextInteractionFlags(QtCore.Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -11052,6 +11250,364 @@ class ViewerWindow:
         row.refresh()
         self._refresh_scroll_geometry()
 
+    # ---------------- Manual sync override panel ----------------
+    # Lets a reviewer force the OTB4/C3D/TSV alignment at a channel/edge they
+    # pick, with a directional offset, for cases where automatic sync
+    # detection locks onto the wrong pulse/cycle (see _manual_override_shifts
+    # for the composition math; _match_plot_shifts is where it's applied).
+    _MO_SOURCE_DISPLAY = {"otb4": "OTB4", "c3d": "C3D", "tsv": "TSV"}
+
+    def _build_manual_override_panel(self):
+        from PySide6 import QtWidgets
+
+        group = QtWidgets.QGroupBox("Manual Sync Override")
+        group.setToolTip(
+            "Force the alignment between two sources at a channel/edge you pick, with a "
+            "directional offset -- use this when automatic sync detection locks onto the "
+            "wrong pulse or cycle. Leave Source A at None to keep the automatic alignment."
+        )
+        group.setMaximumWidth(560)
+        outer = QtWidgets.QVBoxLayout(group)
+        outer.setContentsMargins(10, 10, 10, 8)
+        outer.setSpacing(4)
+
+        row1 = QtWidgets.QHBoxLayout()
+        row1.addWidget(QtWidgets.QLabel("Source A:"))
+        self.mo_pair1_source_a = QtWidgets.QComboBox()
+        row1.addWidget(self.mo_pair1_source_a, 1)
+        row1.addWidget(QtWidgets.QLabel("Source B:"))
+        self.mo_pair1_source_b = QtWidgets.QComboBox()
+        row1.addWidget(self.mo_pair1_source_b, 1)
+        outer.addLayout(row1)
+
+        row2 = QtWidgets.QHBoxLayout()
+        row2.addWidget(QtWidgets.QLabel("Channel A:"))
+        self.mo_pair1_channel_a = QtWidgets.QComboBox()
+        self.mo_pair1_channel_a.setMinimumWidth(150)
+        row2.addWidget(self.mo_pair1_channel_a, 1)
+        row2.addWidget(QtWidgets.QLabel("Channel B:"))
+        self.mo_pair1_channel_b = QtWidgets.QComboBox()
+        self.mo_pair1_channel_b.setMinimumWidth(150)
+        row2.addWidget(self.mo_pair1_channel_b, 1)
+        outer.addLayout(row2)
+
+        row3 = QtWidgets.QHBoxLayout()
+        row3.addWidget(QtWidgets.QLabel("Offset B − A (s):"))
+        self.mo_pair1_offset = QtWidgets.QDoubleSpinBox()
+        self.mo_pair1_offset.setRange(-3600.0, 3600.0)
+        self.mo_pair1_offset.setDecimals(4)
+        self.mo_pair1_offset.setSingleStep(0.001)
+        row3.addWidget(self.mo_pair1_offset)
+        row3.addStretch(1)
+        outer.addLayout(row3)
+        self.mo_pair1_hint = QtWidgets.QLabel("")
+        self.mo_pair1_hint.setWordWrap(True)
+        self.mo_pair1_hint.setStyleSheet("QLabel { color:#5C6B78; font-size:11px; }")
+        outer.addWidget(self.mo_pair1_hint)
+
+        sep = QtWidgets.QFrame()
+        sep.setFrameShape(QtWidgets.QFrame.Shape.HLine)
+        outer.addWidget(sep)
+
+        row4 = QtWidgets.QHBoxLayout()
+        row4.addWidget(QtWidgets.QLabel("Third source:"))
+        self.mo_pair2_source_c = QtWidgets.QComboBox()
+        row4.addWidget(self.mo_pair2_source_c, 1)
+        row4.addWidget(QtWidgets.QLabel("Relative to:"))
+        self.mo_pair2_reference = QtWidgets.QComboBox()
+        row4.addWidget(self.mo_pair2_reference, 1)
+        outer.addLayout(row4)
+
+        row5 = QtWidgets.QHBoxLayout()
+        row5.addWidget(QtWidgets.QLabel("Channel (third):"))
+        self.mo_pair2_channel_c = QtWidgets.QComboBox()
+        self.mo_pair2_channel_c.setMinimumWidth(150)
+        row5.addWidget(self.mo_pair2_channel_c, 1)
+        row5.addWidget(QtWidgets.QLabel("Channel (ref):"))
+        self.mo_pair2_channel_ref = QtWidgets.QComboBox()
+        self.mo_pair2_channel_ref.setMinimumWidth(150)
+        row5.addWidget(self.mo_pair2_channel_ref, 1)
+        outer.addLayout(row5)
+
+        row6 = QtWidgets.QHBoxLayout()
+        row6.addWidget(QtWidgets.QLabel("Offset third − ref (s):"))
+        self.mo_pair2_offset = QtWidgets.QDoubleSpinBox()
+        self.mo_pair2_offset.setRange(-3600.0, 3600.0)
+        self.mo_pair2_offset.setDecimals(4)
+        self.mo_pair2_offset.setSingleStep(0.001)
+        row6.addWidget(self.mo_pair2_offset)
+        row6.addStretch(1)
+        outer.addLayout(row6)
+        self.mo_pair2_hint = QtWidgets.QLabel("")
+        self.mo_pair2_hint.setWordWrap(True)
+        self.mo_pair2_hint.setStyleSheet("QLabel { color:#5C6B78; font-size:11px; }")
+        outer.addWidget(self.mo_pair2_hint)
+
+        self.mo_clear_btn = QtWidgets.QPushButton("Clear Override (Use Automatic)")
+        outer.addWidget(self.mo_clear_btn)
+
+        self.mo_pair1_source_a.currentIndexChanged.connect(self._mo_on_source_a_changed)
+        self.mo_pair1_source_b.currentIndexChanged.connect(self._mo_on_source_b_changed)
+        self.mo_pair1_channel_a.currentIndexChanged.connect(self._mo_on_pair1_channel_changed)
+        self.mo_pair1_channel_b.currentIndexChanged.connect(self._mo_on_pair1_channel_changed)
+        self.mo_pair1_offset.valueChanged.connect(self._mo_commit)
+        self.mo_pair2_source_c.currentIndexChanged.connect(self._mo_on_source_c_changed)
+        self.mo_pair2_reference.currentIndexChanged.connect(self._mo_on_pair2_reference_changed)
+        self.mo_pair2_channel_c.currentIndexChanged.connect(self._mo_on_pair2_channel_changed)
+        self.mo_pair2_channel_ref.currentIndexChanged.connect(self._mo_on_pair2_channel_changed)
+        self.mo_pair2_offset.valueChanged.connect(self._mo_commit)
+        self.mo_clear_btn.clicked.connect(self._mo_clear)
+
+        self._mo_widgets = (
+            self.mo_pair1_source_a, self.mo_pair1_source_b, self.mo_pair1_channel_a, self.mo_pair1_channel_b,
+            self.mo_pair1_offset, self.mo_pair2_source_c, self.mo_pair2_reference,
+            self.mo_pair2_channel_c, self.mo_pair2_channel_ref, self.mo_pair2_offset, self.mo_clear_btn,
+        )
+        return group
+
+    def _mo_source_options(self, match: Dict[str, Any], *, exclude: Optional[str] = None) -> List[Tuple[str, Optional[str]]]:
+        options: List[Tuple[str, Optional[str]]] = [("None", None)]
+        for key in ("otb4", "c3d", "tsv"):
+            if match.get(key) and key != exclude:
+                options.append((self._MO_SOURCE_DISPLAY[key], key))
+        return options
+
+    def _mo_channel_options(self, match: Dict[str, Any], source: Optional[str]) -> List[str]:
+        if not source or not match.get(source):
+            return []
+        return [
+            label
+            for label, spec in _channel_options_for_record(match[source])
+            if spec.get("kind") not in {"probe_buffer", "probe_ramp"}
+        ]
+
+    def _mo_set_combo(self, combo, options: Sequence[Tuple[str, Any]], current_value: Any) -> None:
+        combo.blockSignals(True)
+        combo.clear()
+        current_index = 0
+        for idx, (label, value) in enumerate(options):
+            combo.addItem(label, value)
+            if value == current_value:
+                current_index = idx
+        combo.setCurrentIndex(current_index)
+        combo.blockSignals(False)
+
+    def _mo_set_channel_combo(self, combo, channels: Sequence[str], current_value: Optional[str]) -> None:
+        combo.blockSignals(True)
+        combo.clear()
+        placeholder = "-- pick a channel --"
+        combo.addItem(placeholder, None)
+        current_index = 0
+        for idx, label in enumerate(channels, start=1):
+            combo.addItem(label, label)
+            if label == current_value:
+                current_index = idx
+        combo.setCurrentIndex(current_index)
+        combo.blockSignals(False)
+
+    def _mo_load_from_match(self) -> None:
+        match = self.current_match
+        enabled = match is not None
+        for widget in getattr(self, "_mo_widgets", ()):
+            widget.setEnabled(enabled)
+        if match is None:
+            return
+        state = _manual_offsets_state(match)
+        pair1 = state.get("pair1") or {}
+        source_a = pair1.get("source_a")
+        source_b = pair1.get("source_b")
+
+        self._mo_set_combo(self.mo_pair1_source_a, self._mo_source_options(match), source_a)
+        self._mo_set_combo(self.mo_pair1_source_b, self._mo_source_options(match, exclude=source_a), source_b)
+        self._mo_set_channel_combo(self.mo_pair1_channel_a, self._mo_channel_options(match, source_a), pair1.get("channel_a"))
+        self._mo_set_channel_combo(self.mo_pair1_channel_b, self._mo_channel_options(match, source_b), pair1.get("channel_b"))
+        self.mo_pair1_offset.blockSignals(True)
+        self.mo_pair1_offset.setValue(float(pair1.get("offset_sec") or 0.0))
+        self.mo_pair1_offset.blockSignals(False)
+
+        self._mo_refresh_pair2_options()
+        self._mo_update_hints()
+
+    def _mo_refresh_pair2_options(self) -> None:
+        match = self.current_match
+        if match is None:
+            return
+        state = _manual_offsets_state(match)
+        pair1 = state.get("pair1") or {}
+        pair2 = state.get("pair2") or {}
+        source_a = pair1.get("source_a")
+        source_b = pair1.get("source_b")
+        pair1_active = source_a in ("otb4", "c3d", "tsv") and source_b in ("otb4", "c3d", "tsv") and source_a != source_b
+
+        third_source = None
+        if pair1_active:
+            remaining = [key for key in ("otb4", "c3d", "tsv") if key not in (source_a, source_b) and match.get(key)]
+            third_source = remaining[0] if remaining else None
+        source_c_options: List[Tuple[str, Optional[str]]] = [("None", None)]
+        if third_source:
+            source_c_options.append((self._MO_SOURCE_DISPLAY[third_source], third_source))
+        source_c = pair2.get("source_c") if pair2.get("source_c") == third_source else None
+        self._mo_set_combo(self.mo_pair2_source_c, source_c_options, source_c)
+
+        ref_options: List[Tuple[str, Optional[str]]] = []
+        if pair1_active:
+            ref_options = [
+                (f"A: {self._MO_SOURCE_DISPLAY[source_a]}", "a"),
+                (f"B: {self._MO_SOURCE_DISPLAY[source_b]}", "b"),
+            ]
+        reference = pair2.get("reference") if pair2.get("reference") in ("a", "b") else None
+        self._mo_set_combo(self.mo_pair2_reference, ref_options, reference)
+
+        ref_source = source_a if reference == "a" else source_b if reference == "b" else None
+        self._mo_set_channel_combo(self.mo_pair2_channel_c, self._mo_channel_options(match, source_c), pair2.get("channel_c"))
+        self._mo_set_channel_combo(self.mo_pair2_channel_ref, self._mo_channel_options(match, ref_source), pair2.get("channel_ref"))
+        self.mo_pair2_offset.blockSignals(True)
+        self.mo_pair2_offset.setValue(float(pair2.get("offset_sec") or 0.0))
+        self.mo_pair2_offset.blockSignals(False)
+
+        pair2_available = bool(third_source)
+        for widget in (self.mo_pair2_source_c, self.mo_pair2_reference, self.mo_pair2_channel_c, self.mo_pair2_channel_ref, self.mo_pair2_offset):
+            widget.setEnabled(pair2_available)
+
+    def _mo_update_hints(self) -> None:
+        match = self.current_match
+        if match is None:
+            return
+        state = _manual_offsets_state(match)
+        pair1 = state.get("pair1") or {}
+        source_a, source_b = pair1.get("source_a"), pair1.get("source_b")
+        channel_a, channel_b = pair1.get("channel_a"), pair1.get("channel_b")
+        if source_a and source_b and channel_a and channel_b:
+            edge_a = _native_channel_event_time(match, source_a, channel_a)
+            edge_b = _native_channel_event_time(match, source_b, channel_b)
+            if edge_a is None or edge_b is None:
+                self.mo_pair1_hint.setText(
+                    "Could not auto-detect an edge on one or both channels -- type the offset manually "
+                    "(0 = align the channels' raw time origin; positive = B occurs after A)."
+                )
+            else:
+                self.mo_pair1_hint.setText(
+                    f"Detected native edge: A={edge_a:.4f}s, B={edge_b:.4f}s. "
+                    f"Offset 0 aligns these two edges exactly; nudge from there if the true lag differs."
+                )
+        else:
+            self.mo_pair1_hint.setText("Pick Source A/B and a channel for each to enable snap-to-edge detection.")
+
+        pair2 = state.get("pair2") or {}
+        source_c = pair2.get("source_c")
+        reference = pair2.get("reference")
+        ref_source = source_a if reference == "a" else source_b if reference == "b" else None
+        channel_c, channel_ref = pair2.get("channel_c"), pair2.get("channel_ref")
+        if source_c and ref_source and channel_c and channel_ref:
+            edge_c = _native_channel_event_time(match, source_c, channel_c)
+            edge_ref = _native_channel_event_time(match, ref_source, channel_ref)
+            if edge_c is None or edge_ref is None:
+                self.mo_pair2_hint.setText("Could not auto-detect an edge on one or both channels -- type the offset manually.")
+            else:
+                self.mo_pair2_hint.setText(f"Detected native edge: third={edge_c:.4f}s, ref={edge_ref:.4f}s.")
+        else:
+            self.mo_pair2_hint.setText("")
+
+    def _mo_commit(self) -> None:
+        match = self.current_match
+        if match is None or self._busy:
+            return
+        state = _manual_offsets_state(match)
+        source_a = self.mo_pair1_source_a.currentData()
+        source_b = self.mo_pair1_source_b.currentData()
+        if source_a and source_b and source_a != source_b:
+            state["pair1"] = {
+                "source_a": source_a,
+                "source_b": source_b,
+                "channel_a": self.mo_pair1_channel_a.currentData(),
+                "channel_b": self.mo_pair1_channel_b.currentData(),
+                "offset_sec": float(self.mo_pair1_offset.value()),
+            }
+        else:
+            state["pair1"] = None
+
+        source_c = self.mo_pair2_source_c.currentData()
+        reference = self.mo_pair2_reference.currentData()
+        if state["pair1"] is not None and source_c and reference in ("a", "b"):
+            state["pair2"] = {
+                "source_c": source_c,
+                "reference": reference,
+                "channel_c": self.mo_pair2_channel_c.currentData(),
+                "channel_ref": self.mo_pair2_channel_ref.currentData(),
+                "offset_sec": float(self.mo_pair2_offset.value()),
+            }
+        else:
+            state["pair2"] = None
+
+        self._mo_update_hints()
+        self._refresh_rows()
+        self._update_header()
+        self._queue_save_reviews()
+
+    def _mo_on_source_a_changed(self) -> None:
+        match = self.current_match
+        if match is None:
+            return
+        source_a = self.mo_pair1_source_a.currentData()
+        source_b = self.mo_pair1_source_b.currentData()
+        if source_b == source_a:
+            source_b = None
+        self._mo_set_combo(self.mo_pair1_source_b, self._mo_source_options(match, exclude=source_a), source_b)
+        self._mo_set_channel_combo(self.mo_pair1_channel_a, self._mo_channel_options(match, source_a), None)
+        self._mo_set_channel_combo(self.mo_pair1_channel_b, self._mo_channel_options(match, source_b), None)
+        self._mo_commit()
+        self._mo_refresh_pair2_options()
+        self._mo_update_hints()
+
+    def _mo_on_source_b_changed(self) -> None:
+        match = self.current_match
+        if match is None:
+            return
+        source_b = self.mo_pair1_source_b.currentData()
+        self._mo_set_channel_combo(self.mo_pair1_channel_b, self._mo_channel_options(match, source_b), None)
+        self._mo_commit()
+        self._mo_refresh_pair2_options()
+        self._mo_update_hints()
+
+    def _mo_on_pair1_channel_changed(self) -> None:
+        self._mo_commit()
+        self._mo_update_hints()
+
+    def _mo_on_source_c_changed(self) -> None:
+        match = self.current_match
+        if match is None:
+            return
+        source_c = self.mo_pair2_source_c.currentData()
+        self._mo_set_channel_combo(self.mo_pair2_channel_c, self._mo_channel_options(match, source_c), None)
+        self._mo_commit()
+        self._mo_update_hints()
+
+    def _mo_on_pair2_reference_changed(self) -> None:
+        match = self.current_match
+        if match is None:
+            return
+        state = _manual_offsets_state(match)
+        pair1 = state.get("pair1") or {}
+        reference = self.mo_pair2_reference.currentData()
+        ref_source = pair1.get("source_a") if reference == "a" else pair1.get("source_b") if reference == "b" else None
+        self._mo_set_channel_combo(self.mo_pair2_channel_ref, self._mo_channel_options(match, ref_source), None)
+        self._mo_commit()
+        self._mo_update_hints()
+
+    def _mo_on_pair2_channel_changed(self) -> None:
+        self._mo_commit()
+        self._mo_update_hints()
+
+    def _mo_clear(self) -> None:
+        match = self.current_match
+        if match is None:
+            return
+        match.setdefault("review", {})["manual_offsets"] = {"pair1": None, "pair2": None}
+        self._mo_load_from_match()
+        self._refresh_rows()
+        self._update_header()
+        self._queue_save_reviews()
+
     def _on_select(self, current, previous):
         from PySide6 import QtCore
 
@@ -11065,6 +11621,7 @@ class ViewerWindow:
         _ensure_otb4_repair_applied(self.current_match, [])
         _apply_review_defaults(self.current_match)
         self._apply_list_item_styles()
+        self._mo_load_from_match()
         self._sync_auto_rows()
         self._refresh_rows()
         self._update_header()
