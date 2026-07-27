@@ -871,12 +871,33 @@ def _device_repairs_for_match(match: Dict[str, Any]) -> Dict[str, Dict[str, Any]
 
 
 def _repair_zones_for_match(match: Dict[str, Any], device: Optional[str] = None) -> List[Tuple[int, int]]:
+    """The single validated OTB4<->C3D repair (see `_repair_info_for_match`),
+    applied uniformly to every OTB4 channel regardless of device.
+
+    All of an OTB4 recording's devices (Syncstation plus every Muovi/Muovi+
+    probe) are interleaved into one shared raw sample buffer -- confirmed by
+    inspecting real files: every device's tracks live on the same
+    SignalStreamPath with an identical raw sample count. A genuine
+    acquisition gap therefore lands at the same absolute sample position for
+    every channel; `_detect_otb4_repair_candidates` tries several devices'
+    counter/ramp tracks purely as *alternative estimates* of that one event
+    (some counters reveal it more precisely than others) and
+    `_apply_otb4_repairs` picks/combines whichever estimate fits best against
+    C3D -- that single result is the correct correction for every channel.
+
+    `device` is accepted for API compatibility with existing callers but no
+    longer changes the result. A previous version additionally unioned in
+    that device's own (never-applied) candidate zones on top of the global
+    one -- since those candidates are alternative estimates of the *same*
+    event rather than independent additional ones, that union double-counted
+    it, inflating non-winning devices' inserted gap by up to ~2x and
+    desyncing their real samples from C3D/TSV (and from the winning device)
+    for the remainder of the recording.
+    """
     zones: List[Tuple[int, int]] = []
     repair = _repair_info_for_match(match)
     if repair:
         zones.extend(_repair_entry_zones(repair))
-    if device:
-        zones.extend(_repair_entry_zones(_device_repairs_for_match(match).get(device)))
     return _merge_index_zones(zones)
 
 
@@ -11260,11 +11281,29 @@ class ViewerWindow:
     def _build_manual_override_panel(self):
         from PySide6 import QtWidgets
 
+        commit = self._mo_commit
+
+        class _StepCommitSpinBox(QtWidgets.QDoubleSpinBox):
+            """Typing a new value only stages it -- it's applied by the
+            Update button (an explicit "start the re-alignment from this new
+            initial point"). Once a value is showing, the spin arrows (and
+            keyboard/wheel steps, which also route through stepBy) commit
+            immediately at +/-singleStep, for live fine-tuning without
+            re-clicking Update each time.
+            """
+
+            def stepBy(self, steps: int) -> None:
+                super().stepBy(steps)
+                commit()
+
+        self._StepCommitSpinBox = _StepCommitSpinBox
+
         group = QtWidgets.QGroupBox("Manual Sync Override")
         group.setToolTip(
-            "Force the alignment between two sources at a channel/edge you pick, with a "
-            "directional offset -- use this when automatic sync detection locks onto the "
-            "wrong pulse or cycle. Leave Source A at None to keep the automatic alignment."
+            "Force the alignment between two sources at a channel/edge you pick. Type an "
+            "initial offset and click Update to start the re-alignment from it; after that, "
+            "the spin arrows nudge by 0.1s and apply live. Leave Source A at None to keep "
+            "the automatic alignment."
         )
         group.setMaximumWidth(560)
         outer = QtWidgets.QVBoxLayout(group)
@@ -11293,11 +11332,14 @@ class ViewerWindow:
 
         row3 = QtWidgets.QHBoxLayout()
         row3.addWidget(QtWidgets.QLabel("Offset B − A (s):"))
-        self.mo_pair1_offset = QtWidgets.QDoubleSpinBox()
+        self.mo_pair1_offset = _StepCommitSpinBox()
         self.mo_pair1_offset.setRange(-3600.0, 3600.0)
         self.mo_pair1_offset.setDecimals(4)
-        self.mo_pair1_offset.setSingleStep(0.001)
+        self.mo_pair1_offset.setSingleStep(0.1)
         row3.addWidget(self.mo_pair1_offset)
+        self.mo_pair1_update_btn = QtWidgets.QPushButton("Update")
+        self.mo_pair1_update_btn.setToolTip("Apply the typed offset above and start re-alignment from it.")
+        row3.addWidget(self.mo_pair1_update_btn)
         row3.addStretch(1)
         outer.addLayout(row3)
         self.mo_pair1_hint = QtWidgets.QLabel("")
@@ -11331,11 +11373,14 @@ class ViewerWindow:
 
         row6 = QtWidgets.QHBoxLayout()
         row6.addWidget(QtWidgets.QLabel("Offset third − ref (s):"))
-        self.mo_pair2_offset = QtWidgets.QDoubleSpinBox()
+        self.mo_pair2_offset = _StepCommitSpinBox()
         self.mo_pair2_offset.setRange(-3600.0, 3600.0)
         self.mo_pair2_offset.setDecimals(4)
-        self.mo_pair2_offset.setSingleStep(0.001)
+        self.mo_pair2_offset.setSingleStep(0.1)
         row6.addWidget(self.mo_pair2_offset)
+        self.mo_pair2_update_btn = QtWidgets.QPushButton("Update")
+        self.mo_pair2_update_btn.setToolTip("Apply the typed offset above and start re-alignment from it.")
+        row6.addWidget(self.mo_pair2_update_btn)
         row6.addStretch(1)
         outer.addLayout(row6)
         self.mo_pair2_hint = QtWidgets.QLabel("")
@@ -11350,18 +11395,19 @@ class ViewerWindow:
         self.mo_pair1_source_b.currentIndexChanged.connect(self._mo_on_source_b_changed)
         self.mo_pair1_channel_a.currentIndexChanged.connect(self._mo_on_pair1_channel_changed)
         self.mo_pair1_channel_b.currentIndexChanged.connect(self._mo_on_pair1_channel_changed)
-        self.mo_pair1_offset.valueChanged.connect(self._mo_commit)
+        self.mo_pair1_update_btn.clicked.connect(self._mo_commit)
         self.mo_pair2_source_c.currentIndexChanged.connect(self._mo_on_source_c_changed)
         self.mo_pair2_reference.currentIndexChanged.connect(self._mo_on_pair2_reference_changed)
         self.mo_pair2_channel_c.currentIndexChanged.connect(self._mo_on_pair2_channel_changed)
         self.mo_pair2_channel_ref.currentIndexChanged.connect(self._mo_on_pair2_channel_changed)
-        self.mo_pair2_offset.valueChanged.connect(self._mo_commit)
+        self.mo_pair2_update_btn.clicked.connect(self._mo_commit)
         self.mo_clear_btn.clicked.connect(self._mo_clear)
 
         self._mo_widgets = (
             self.mo_pair1_source_a, self.mo_pair1_source_b, self.mo_pair1_channel_a, self.mo_pair1_channel_b,
-            self.mo_pair1_offset, self.mo_pair2_source_c, self.mo_pair2_reference,
-            self.mo_pair2_channel_c, self.mo_pair2_channel_ref, self.mo_pair2_offset, self.mo_clear_btn,
+            self.mo_pair1_offset, self.mo_pair1_update_btn, self.mo_pair2_source_c, self.mo_pair2_reference,
+            self.mo_pair2_channel_c, self.mo_pair2_channel_ref, self.mo_pair2_offset, self.mo_pair2_update_btn,
+            self.mo_clear_btn,
         )
         return group
 
