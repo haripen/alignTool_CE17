@@ -8275,8 +8275,8 @@ def _build_tracebio_fullrate_struct(match: Dict[str, Any], start_sec: float, end
     }
 
 
-def _build_common_aligned_mat_struct(match: Dict[str, Any]) -> Dict[str, Any]:
-    bundle = _build_common_c3d_target(match)
+def _build_common_aligned_mat_struct(match: Dict[str, Any], bundle: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    bundle = bundle if bundle is not None else _build_common_c3d_target(match)
     target_t = np.asarray(bundle["target_t"], dtype=float)
     out_time = np.asarray(bundle["out_time"], dtype=float)
     fs = float(bundle["fs"])
@@ -8456,6 +8456,310 @@ def export_match_pipe_bundle(match: Dict[str, Any], export_root: Path) -> Tuple[
     )
     pipe_json_path.write_text(json.dumps(json_means, indent=2), encoding="utf-8")
     return pipe_mat_path, pipe_json_path
+
+
+def _sync_c3d_export_supported(match: Dict[str, Any]) -> bool:
+    return bool(match.get("c3d")) and _mat_export_supported(match)
+
+
+def _sync_c3d_export_name(match: Dict[str, Any], saved_stamp: str) -> str:
+    return f"{_match_base_name(match, saved_stamp)}_sync.c3d"
+
+
+def _list_param_blocks(section: Dict[str, Any], base: str) -> List[str]:
+    keys: List[str] = []
+    i = 1
+    while True:
+        key = base if i == 1 else f"{base}{i}"
+        if key not in section:
+            break
+        keys.append(key)
+        i += 1
+    return keys
+
+
+def _flatten_param_blocks(section: Dict[str, Any], base: str) -> List[Any]:
+    out: List[Any] = []
+    for key in _list_param_blocks(section, base):
+        out.extend(list(section[key]["value"]))
+    return out
+
+
+def _set_c3d_param_blocks(section: Dict[str, Any], base: str, values: Sequence[Any], param_type: int, max_block: int = 255) -> None:
+    """Replace every base/base2/base3/... entry in `section` with fresh <=max_block
+    chunks of `values`, using the plain-dict schema ezc3d.c3d.write() reads directly
+    (type -1=CHAR, 2=INT, 4=FLOAT). Callers must invoke this with the SAME max_block
+    and the SAME total item count for every parallel per-channel family (LABELS,
+    DESCRIPTIONS, UNITS, SCALE, OFFSET, GAIN) of a group so the block boundaries land
+    identically across all of them: position i in block n must describe the same
+    physical channel in every family, matching that channel's column index in
+    c3d['data']['analogs'] (or ['points'] for POINT).
+    """
+    i = 2
+    while f"{base}{i}" in section:
+        del section[f"{base}{i}"]
+        i += 1
+    for bi, start in enumerate(range(0, len(values), max_block)):
+        chunk = values[start : start + max_block]
+        key = base if bi == 0 else f"{base}{bi + 1}"
+        if param_type == -1:
+            value: Any = [str(v) for v in chunk]
+        elif param_type == 2:
+            value = np.asarray(chunk, dtype=np.int64)
+        elif param_type == 4:
+            value = np.asarray(chunk, dtype=np.float64)
+        else:
+            raise ValueError(f"Unsupported C3D parameter type {param_type}")
+        section[key] = {"type": param_type, "description": "", "is_locked": False, "value": value}
+
+
+def _sync_c3d_emg_hint(text: str) -> Tuple[str, str]:
+    """For an OTB4 HD-EMG channel label, e.g. 'HD10MM0804 HD10MM0408 [MUSCLE:Tibialis
+    Anterior Muscle Right] ch3', returns (muscle_part, ch_number) = ('TA_R', '003')."""
+    muscle_match = re.search(r"\[MUSCLE:\s*([^\]]*)\]", text, re.IGNORECASE)
+    muscle_part = ""
+    if muscle_match:
+        words = [w for w in re.split(r"[^0-9A-Za-z]+", muscle_match.group(1)) if w and w.lower() != "muscle"]
+        if len(words) > 1:
+            muscle_part = "".join(w[0].upper() for w in words[:-1]) + "_" + words[-1][0].upper()
+        elif words:
+            muscle_part = words[0][:3].upper()
+    ch_match = re.search(r"\bch\s*(\d+)\b", text, re.IGNORECASE)
+    ch_number = f"{int(ch_match.group(1)):03d}" if ch_match else "000"
+    return muscle_part, ch_number
+
+
+def _sync_c3d_generic_hint(text: str) -> str:
+    """Underscore-joined mnemonic hint for non-EMG channels (OTB4 sync/control
+    tracks, TSV columns): last '/'-separated path segment, bracketed provenance
+    stripped except the trailing tag (e.g. '[raw]'/'[sync]'), device-name stop
+    words removed."""
+    tags = re.findall(r"\[([^\]]*)\]", text)
+    stripped = re.sub(r"\[[^\]]*\]", "", text).strip()
+    core = re.sub(r"[^0-9A-Za-z]+", "_", stripped.split("/")[-1]).strip("_")
+    stop_tokens = {"hd10mm0804", "hd10mm0408", "muovi", "due", "syncstation"}
+    core_tokens = [t for t in core.split("_") if t and t.lower() not in stop_tokens]
+    hint = "_".join(core_tokens)
+    if tags:
+        hint = f"{hint}_{tags[-1]}".strip("_")
+    return hint
+
+
+def _sync_c3d_short_label(original_label: str, kind: str, index: int, used: set[str], max_len: int = 30) -> str:
+    """Short, C3D-idiomatic, collision-free label. The full original text always goes
+    into DESCRIPTIONS unmodified; this is only the mnemonic short display label.
+    Uniqueness is guaranteed by the running index alone (each `kind` has its own
+    counter), so the hint suffix is free-form and best-effort.
+
+    kind='emg'  -> 'EMG_<0000>_<muscle initials>_<side>_<ch number>'   e.g. EMG_0001_TA_R_001
+    kind='tsv'  -> 'TraceBFB_<00>_<hint>'                              e.g. TraceBFB_01_desired
+    kind='otb'  -> 'OTB_<0000>_<hint>'                                 (other OTB4 tracks: sync/control/IMU)
+    """
+    text = str(original_label)
+    if kind == "emg":
+        muscle_part, ch_number = _sync_c3d_emg_hint(text)
+        parts = [p for p in (muscle_part, ch_number) if p]
+        candidate = "_".join([f"EMG_{index:04d}", *parts])
+    elif kind == "tsv":
+        hint = _sync_c3d_generic_hint(text)
+        candidate = f"TraceBFB_{index:02d}_{hint}".rstrip("_")
+    else:
+        hint = _sync_c3d_generic_hint(text)
+        candidate = f"OTB_{index:04d}_{hint}".rstrip("_")
+    candidate = candidate[:max_len]
+    base = candidate
+    suffix = 1
+    while candidate in used:
+        suffix_text = f"_{suffix}"
+        candidate = f"{base[: max(1, max_len - len(suffix_text))]}{suffix_text}"
+        suffix += 1
+    used.add(candidate)
+    return candidate
+
+
+def _sync_c3d_tsv_unit_hint(label: str) -> str:
+    m = re.search(r"\[(Meter|Volt|Degree|Percent|Second)\]", str(label), re.IGNORECASE)
+    if not m:
+        return ""
+    return {"meter": "m", "volt": "V", "degree": "deg", "percent": "%", "second": "s"}.get(m.group(1).lower(), "")
+
+
+def _sync_c3d_new_channel_plan(match: Dict[str, Any], bundle: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Reuses _build_common_aligned_mat_struct's already-resampled otb4/tsv arrays
+    (on the C3D's own analog sample grid) as the sole data+label source -- no
+    re-derivation of alignment/resampling here."""
+    aligned = _build_common_aligned_mat_struct(match, bundle=bundle)
+    channels: List[Dict[str, Any]] = []
+    used_labels: set[str] = set()
+
+    otb_map = aligned["otb4"].get("label_map", {})
+    otb_fields = [k for k in aligned["otb4"] if k != "label_map"]
+    emg_counter = 0
+    otb_counter = 0
+    for field in otb_fields:
+        original = otb_map.get(field, field)
+        is_emg = "[muscle:" in str(original).lower() or str(original).upper().startswith("HD10MM")
+        if is_emg:
+            emg_counter += 1
+            kind, idx = "emg", emg_counter
+        else:
+            otb_counter += 1
+            kind, idx = "otb", otb_counter
+        channels.append({
+            "field": field,
+            "source": "otb4",
+            "original_label": original,
+            "short_label": _sync_c3d_short_label(original, kind, idx, used_labels),
+            "description": str(original),
+            "unit": "V",
+            "data": np.asarray(aligned["otb4"][field], dtype=float),
+        })
+
+    tsv_map = aligned["tsv"].get("label_map", {})
+    tsv_fields = [k for k in aligned["tsv"] if k != "label_map"]
+    for idx, field in enumerate(tsv_fields):
+        original = tsv_map.get(field, field)
+        channels.append({
+            "field": field,
+            "source": "tsv",
+            "original_label": original,
+            "short_label": _sync_c3d_short_label(original, "tsv", idx + 1, used_labels),
+            "description": str(original),
+            "unit": _sync_c3d_tsv_unit_hint(original),
+            "data": np.asarray(aligned["tsv"][field], dtype=float),
+        })
+    return {"channels": channels, "aligned": aligned}
+
+
+def _c3d_frame_aligned_crop(c3d: Any, bundle: Dict[str, Any]) -> Dict[str, Any]:
+    """Crops c3d['data']['points'] and c3d['data']['analogs'] IN PLACE to the
+    inner_merge window on point-frame-aligned boundaries, so the analog-samples-
+    per-point-frame ratio stays an exact integer. Returns the extra analog SAMPLES
+    (pad_before/pad_after) that new synced-channel arrays -- already length-matched
+    to bundle['target_t'] -- must be edge-padded by to reach the cropped analog
+    frame count exactly."""
+    point_rate = _c3d_param_scalar(c3d["parameters"]["POINT"]["RATE"]["value"])
+    analog_rate = _c3d_param_scalar(c3d["parameters"]["ANALOG"]["RATE"]["value"])
+    ratio = int(round(analog_rate / point_rate))
+    if abs(ratio - analog_rate / point_rate) > 1e-6:
+        raise ValueError(f"Non-integer analog/point subframe ratio ({analog_rate}/{point_rate}); cannot frame-align crop.")
+
+    mask = np.asarray(bundle["mask"])
+    true_idx = np.flatnonzero(mask)
+    if true_idx.size == 0:
+        raise ValueError("No C3D analog samples in common matched time window.")
+    analog_start, analog_end_excl = int(true_idx[0]), int(true_idx[-1]) + 1
+    aligned_start = (analog_start // ratio) * ratio
+    aligned_end_excl = -(-analog_end_excl // ratio) * ratio
+    pad_before = analog_start - aligned_start
+    pad_after = aligned_end_excl - analog_end_excl
+
+    point_start, point_end_excl = aligned_start // ratio, aligned_end_excl // ratio
+    c3d["data"]["points"] = np.asarray(c3d["data"]["points"])[:, :, point_start:point_end_excl]
+    c3d["data"]["analogs"] = np.asarray(c3d["data"]["analogs"])[:, :, aligned_start:aligned_end_excl]
+    if "meta_points" in c3d["data"]:
+        del c3d["data"]["meta_points"]
+
+    rotations = c3d["data"].get("rotations")
+    if rotations is not None and np.asarray(rotations).size > 0:
+        rotation_ratio = 1
+        rotation_params = c3d["parameters"].get("ROTATION") or {}
+        if "RATIO" in rotation_params:
+            rotation_ratio = int(round(_c3d_param_scalar(rotation_params["RATIO"]["value"])))
+        c3d["data"]["rotations"] = np.asarray(rotations)[
+            :, :, :, point_start * rotation_ratio : point_end_excl * rotation_ratio
+        ]
+
+    return {
+        "pad_before": int(pad_before),
+        "pad_after": int(pad_after),
+        "analog_window": [int(aligned_start), int(aligned_end_excl)],
+        "point_window": [int(point_start), int(point_end_excl)],
+    }
+
+
+def _c3d_append_analog_channels(c3d: Any, new_channels: List[Dict[str, Any]]) -> None:
+    analog = c3d["parameters"]["ANALOG"]
+    labels = _flatten_param_blocks(analog, "LABELS") + [ch["short_label"] for ch in new_channels]
+    descriptions = _flatten_param_blocks(analog, "DESCRIPTIONS") + [ch["description"] for ch in new_channels]
+    units = _flatten_param_blocks(analog, "UNITS") + [ch["unit"] for ch in new_channels]
+    scale = _flatten_param_blocks(analog, "SCALE") + [1.0 for _ in new_channels]
+    # ANALOG:OFFSET is unconditionally reset to 0 by ezc3d.c3d.write() regardless of
+    # the value stored here (verified against ezc3d 1.6.3) -- harmless for this
+    # project since real capture files already use OFFSET=0 uniformly, but documented
+    # here so it isn't mistaken for a bug in this function if audited later.
+    offset = _flatten_param_blocks(analog, "OFFSET") + [0 for _ in new_channels]
+
+    _set_c3d_param_blocks(analog, "LABELS", labels, -1)
+    _set_c3d_param_blocks(analog, "DESCRIPTIONS", descriptions, -1)
+    _set_c3d_param_blocks(analog, "UNITS", units, -1)
+    _set_c3d_param_blocks(analog, "SCALE", scale, 4)
+    _set_c3d_param_blocks(analog, "OFFSET", offset, 2)
+    if "GAIN" in analog:
+        gain = _flatten_param_blocks(analog, "GAIN") + [0 for _ in new_channels]
+        _set_c3d_param_blocks(analog, "GAIN", gain, 2)
+    analog["USED"]["value"] = [len(labels)]
+
+    old_analogs = np.asarray(c3d["data"]["analogs"], dtype=float)
+    n_frames = old_analogs.shape[2]
+    new_stack = np.zeros((1, len(new_channels), n_frames), dtype=float)
+    for i, ch in enumerate(new_channels):
+        data = np.asarray(ch["data"], dtype=float).reshape(-1)
+        if data.size != n_frames:
+            raise ValueError(f"Synced channel '{ch['short_label']}' has {data.size} samples, expected {n_frames}.")
+        new_stack[0, i, :] = data
+    c3d["data"]["analogs"] = np.concatenate([old_analogs, new_stack], axis=1)
+
+
+def _write_c3d_with_synced_channels(match: Dict[str, Any], out_path: Path) -> Dict[str, Any]:
+    c3d_path = Path((match.get("c3d") or {})["path"])
+    # Load a fresh instance -- never mutate the lru_cache'd _c3d_metadata(path)["c3d"]
+    # object, which is shared with every other cached C3D reader in this process.
+    c3d = ezc3d.c3d(str(c3d_path))
+    if "meta_points" in c3d["data"]:
+        del c3d["data"]["meta_points"]
+
+    bundle = _build_common_c3d_target(match)
+    plan = _sync_c3d_new_channel_plan(match, bundle=bundle)
+    crop_info = _c3d_frame_aligned_crop(c3d, bundle)
+
+    pad_before, pad_after = crop_info["pad_before"], crop_info["pad_after"]
+    for ch in plan["channels"]:
+        if pad_before or pad_after:
+            ch["data"] = np.pad(np.asarray(ch["data"], dtype=float), (pad_before, pad_after), mode="edge")
+
+    _c3d_append_analog_channels(c3d, plan["channels"])
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    c3d.write(str(out_path))
+    return {"crop": crop_info, "channels": plan["channels"]}
+
+
+def export_match_sync_c3d(match: Dict[str, Any], export_root: Path) -> Tuple[Path, Path]:
+    if not _sync_c3d_export_supported(match):
+        raise ValueError("Synced C3D export requires a C3D source in the match.")
+    saved_stamp = match.get("saved_at") or _format_file_stamp()
+    out_path = Path(export_root) / _sync_c3d_export_name(match, saved_stamp)
+    result = _write_c3d_with_synced_channels(match, out_path)
+
+    info = {
+        "match_id": int(match["match_id"]),
+        "source_c3d": str((match.get("c3d") or {}).get("path")),
+        "exported_at": _now_iso(),
+        "inner_merge": (match.get("alignment") or {}).get("inner_merge") or {},
+        "crop": result["crop"],
+        "channels": [
+            {
+                "short_label": ch["short_label"],
+                "original_label": ch["original_label"],
+                "source": ch["source"],
+                "field": ch["field"],
+            }
+            for ch in result["channels"]
+        ],
+    }
+    json_path = out_path.with_name(f"{out_path.stem}_c3d_info.json")
+    json_path.write_text(json.dumps(info, indent=2, ensure_ascii=False), encoding="utf-8")
+    return out_path, json_path
 
 
 def _series_label(spec: Dict[str, Any]) -> str:
@@ -9679,6 +9983,12 @@ class ViewerWindow:
         )
         self.exit_btn = QtWidgets.QPushButton("Exit")
         self.export_mat_btn = QtWidgets.QPushButton("Export accepted MATs + full-rate traceBio")
+        self.export_sync_c3d_btn = QtWidgets.QPushButton("Export C3D")
+        self.export_sync_c3d_btn.setToolTip(
+            "Batch-export a .c3d per accepted match with all OTB4 + TSV channels added as new "
+            "ANALOG channels, cropped to the common matched time window. Written to "
+            "matched/<name>_sync.c3d alongside a _sync_c3d_info.json sidecar."
+        )
         self.parallel_export_chk = QtWidgets.QCheckBox("Parallel export")
         self.parallel_export_chk.setChecked(True)
         self.worker_spin = QtWidgets.QSpinBox()
@@ -9699,6 +10009,7 @@ class ViewerWindow:
         actions_layout.addWidget(self.export_mat_btn, 3, 1)
         actions_layout.addWidget(self.parallel_export_chk, 3, 2)
         actions_layout.addWidget(self.release_match_btn, 4, 0)
+        actions_layout.addWidget(self.export_sync_c3d_btn, 4, 1)
         actions_layout.addWidget(self.worker_spin, 4, 2)
         left_layout.addWidget(self.actions_group, 0)
         self.left_scroll = QtWidgets.QScrollArea()
@@ -9847,6 +10158,7 @@ class ViewerWindow:
         self.release_match_btn.clicked.connect(self.release_current_match)
         self.exit_btn.clicked.connect(self.window.close)
         self.export_mat_btn.clicked.connect(self.export_current_mat)
+        self.export_sync_c3d_btn.clicked.connect(self.export_current_sync_c3d)
         self.parallel_export_chk.toggled.connect(self.worker_spin.setEnabled)
         self.reset_btn.clicked.connect(self.reset_rows)
         self.fullscreen_shortcut = QtGui.QShortcut(QtGui.QKeySequence("F12"), self.window)
@@ -9933,6 +10245,7 @@ class ViewerWindow:
             self.release_match_btn,
             self.exit_btn,
             self.export_mat_btn,
+            self.export_sync_c3d_btn,
             self.parallel_export_chk,
             self.worker_spin,
             self.reset_btn,
@@ -11382,6 +11695,68 @@ class ViewerWindow:
                 "_4pipe.mat and _4pipe.json are written only for OTB4+C3D exports.\n"
                 + "\n".join(written),
             )
+        finally:
+            self._set_busy(False)
+            self._update_review_controls()
+
+    def export_current_sync_c3d(self) -> None:
+        from PySide6 import QtWidgets
+
+        if self._busy:
+            return
+        reviewed_count, total_count = _review_progress(self.mapping)
+        if total_count > 0 and reviewed_count < total_count:
+            QtWidgets.QMessageBox.information(
+                self.window,
+                "Review Not Complete",
+                "Complete the review for all matches before exporting synced C3D files.",
+            )
+            return
+        candidate_matches = [
+            match for match in self.matches
+            if (match.get("review") or {}).get("final_accept") and _mat_export_supported(match)
+        ]
+        accepted_matches = [m for m in candidate_matches if _sync_c3d_export_supported(m)]
+        skipped_matches = [m for m in candidate_matches if not _sync_c3d_export_supported(m)]
+        if not accepted_matches:
+            QtWidgets.QMessageBox.information(
+                self.window,
+                "No Accepted Matches",
+                "No accepted matches with a C3D source are available for synced C3D export.",
+            )
+            return
+        export_root = Path(self.mapping.get("export_root") or self.mapping_path.parent) / "matched"
+        export_root.mkdir(parents=True, exist_ok=True)
+        written: List[str] = []
+        self._set_busy(True)
+        try:
+            self._flush_pending_saves(write_review_outputs=False)
+            for match in accepted_matches:
+                _ensure_otb4_repair_applied(match, [])
+            self._set_progress(0, len(accepted_matches), "Exporting synced C3D files %v/%m")
+            for idx, match in enumerate(accepted_matches, start=1):
+                try:
+                    out_path, json_path = export_match_sync_c3d(match, export_root)
+                except Exception as exc:
+                    self._set_progress(0, 1, "Synced C3D export failed")
+                    QtWidgets.QMessageBox.critical(
+                        self.window,
+                        "Synced C3D Export Failed",
+                        f"Failed while exporting match {match['match_id']:03d}:\n{exc}",
+                    )
+                    return
+                review_outputs = match.setdefault("review_outputs", {})
+                review_outputs["sync_c3d_export"] = str(out_path)
+                review_outputs["sync_c3d_info_export"] = str(json_path)
+                written.extend([str(out_path), str(json_path)])
+                self._set_progress(idx, len(accepted_matches), "Exporting synced C3D files %v/%m")
+            self._flush_pending_saves(write_review_outputs=True)
+            self._set_progress(1, 1, "Ready")
+            message = "Wrote _sync.c3d + _sync_c3d_info.json for each accepted match with a C3D source.\n" + "\n".join(written)
+            if skipped_matches:
+                names = ", ".join(f"m{int(m['match_id']):03d}" for m in skipped_matches)
+                message += f"\n\nSkipped (no C3D source): {names}"
+            QtWidgets.QMessageBox.information(self.window, "Synced C3D Exported", message)
         finally:
             self._set_busy(False)
             self._update_review_controls()
